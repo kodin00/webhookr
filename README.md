@@ -13,9 +13,9 @@ Every merge to `master` builds release binaries and publishes them to the
 curl -fsSL https://github.com/kodin00/webhookr/releases/latest/download/install.sh | sh
 ```
 
-The installer detects your OS and architecture (Linux/macOS, x86_64/arm64),
-downloads the matching binary, verifies its checksum, and installs it to
-`/usr/local/bin/webhookr` (override with `WEBHOOKR_INSTALL_DIR`).
+The installer picks the right Linux binary for your architecture (x86_64 /
+aarch64), verifies its checksum, and installs it to `/usr/local/bin/webhookr`
+(override with `WEBHOOKR_INSTALL_DIR`).
 
 ### Updating
 
