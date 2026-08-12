@@ -1,0 +1,18 @@
+[Unit]
+Description=webhookr webhook daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/webhookr serve
+Restart=always
+RestartSec=5
+# adjust to the user that owns the project checkouts
+# User=deploy
+# Group=deploy
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
