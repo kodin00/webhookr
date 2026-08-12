@@ -14,19 +14,15 @@ curl -fsSL https://github.com/kodin00/webhookr/releases/latest/download/install.
 ```
 
 The installer picks the right Linux binary for your architecture (x86_64 /
-aarch64), verifies its checksum, and installs it to `/usr/local/bin/webhookr`
-(override with `WEBHOOKR_INSTALL_DIR`).
+aarch64), verifies its checksum, installs it to `/usr/local/bin/webhookr`
+(override with `WEBHOOKR_INSTALL_DIR`), and sets up a `webhookr` systemd
+service that starts on boot and restarts on failure.
 
 ### Updating
 
 Re-run the same command — it overwrites the installed binary with the latest
-release. Your config (`~/.config/webhookr/`) and run history are left untouched.
-
-If you run the daemon under systemd, restart it to pick up the new binary:
-
-```sh
-sudo systemctl restart webhookr
-```
+release, refreshes the systemd service, and restarts it. Your config
+(`~/.config/webhookr/`) and run history are left untouched.
 
 To build from source instead, see [Build](#build).
 
