@@ -1,12 +1,14 @@
 //! Interactive management TUI for webhookr.
 //!
-//! A single-file, dependency-light terminal UI for browsing, adding, editing,
-//! deleting, triggering, and inspecting the logs of webhook projects. It reads
-//! and writes the shared [`config`] file directly, so changes made here are
-//! picked up by the daemon on the next webhook.
+//! A menu-driven terminal UI for browsing, adding, editing, deleting,
+//! triggering, and inspecting the logs of webhook projects. It reads and
+//! writes the shared [`config`] file directly, so changes made here are picked
+//! up by the daemon on the next webhook.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -19,19 +21,32 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::config::{self, AppConfig, ProjectConfig};
 use crate::state;
 use crate::util;
 
-/// Field labels shown in the add/edit form, in focus order.
-const FIELDS: [&str; 7] = ["Name", "ID", "Path", "Branch", "Command", "Verify mode", "Secret"];
-const FIELD_COUNT: usize = FIELDS.len();
+// ----- palette -----------------------------------------------------------
 
-const FOOTER_MAIN: &str = "j/k or ↑/↓ select · a add · e edit · d delete · r run · l log · q quit";
-const FOOTER_FORM: &str = "Tab/↑/↓ move · ←/→ cursor · type to edit · Enter save · Esc cancel";
+const ACCENT: Color = Color::Cyan;
+const MUTED: Color = Color::DarkGray;
+const GOOD: Color = Color::Green;
+const BAD: Color = Color::Red;
+
+// ----- menu --------------------------------------------------------------
+
+const MENU: [(&str, &str); 7] = [
+    ("➕", "Add project"),
+    ("📋", "List projects"),
+    ("✏️", "Edit project"),
+    ("🔑", "Show webhook secret"),
+    ("▶️", "Run project"),
+    ("🗑️", "Remove project"),
+    ("📄", "View run log"),
+];
 
 /// Launch the interactive management TUI (blocks until the user quits).
 pub fn run() -> Result<()> {
@@ -88,100 +103,301 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
     Ok(())
 }
 
+// ----- screens -----------------------------------------------------------
+
 /// Which screen is currently shown.
 enum Screen {
-    Main,
-    Form {
-        editing: Option<usize>,
-        fields: FormFields,
-        focus: usize,
-        cursor: usize,
-    },
-    ConfirmDelete {
-        index: usize,
-    },
-    Log {
-        text: String,
-        scroll: u16,
-    },
+    Menu,
+    List { mode: ListMode },
+    Wizard(Wizard),
+    ConfirmDelete { index: usize },
+    Key { index: usize },
+    Log { text: String, scroll: u16 },
 }
 
-/// Editable values of the add/edit form.
-struct FormFields {
-    name: String,
-    id: String,
+/// What the project-list screen does when a project is selected.
+#[derive(Clone, Copy)]
+enum ListMode {
+    Browse,
+    Edit,
+    Run,
+    Remove,
+    Key,
+    Log,
+}
+
+// ----- wizard ------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum Step {
+    Name,
+    Path,
+    Branch,
+    Command,
+    Verify,
+    Confirm,
+}
+
+/// Step-by-step add/edit flow. The `id` is never edited by hand: it is derived
+/// from the name on add, and immutable on edit.
+struct Wizard {
+    editing: Option<usize>,
+    step: Step,
+    name: Input,
     path: String,
-    branch: String,
-    command: String,
-    verify_mode: String,
+    branch: Input,
+    command: Input,
+    verify: usize, // 0 = github, 1 = token
+    browser: Option<DirBrowser>,
+    error: Option<String>,
     secret: String,
 }
 
-impl FormFields {
-    fn get(&self, i: usize) -> &str {
-        match i {
-            0 => &self.name,
-            1 => &self.id,
-            2 => &self.path,
-            3 => &self.branch,
-            4 => &self.command,
-            5 => &self.verify_mode,
-            _ => &self.secret,
+impl Wizard {
+    fn new_add() -> Self {
+        Self {
+            editing: None,
+            step: Step::Name,
+            name: Input::new(""),
+            path: String::new(),
+            branch: Input::new("main"),
+            command: Input::new(""),
+            verify: 0,
+            browser: None,
+            error: None,
+            secret: util::generate_secret(),
         }
     }
 
-    fn get_mut(&mut self, i: usize) -> &mut String {
-        match i {
-            0 => &mut self.name,
-            1 => &mut self.id,
-            2 => &mut self.path,
-            3 => &mut self.branch,
-            4 => &mut self.command,
-            5 => &mut self.verify_mode,
-            _ => &mut self.secret,
+    fn new_edit(p: &ProjectConfig, index: usize) -> Self {
+        Self {
+            editing: Some(index),
+            step: Step::Name,
+            name: Input::new(&p.name),
+            path: p.path.clone(),
+            branch: Input::new(&p.branch),
+            command: Input::new(&p.command),
+            verify: if p.verify_mode == "token" { 1 } else { 0 },
+            browser: None,
+            error: None,
+            secret: p.secret.clone(),
         }
-    }
-
-    /// Insert `c` at char index `at` of field `i`.
-    fn insert(&mut self, i: usize, c: char, at: usize) {
-        let field = self.get_mut(i);
-        let mut out = String::with_capacity(field.len() + c.len_utf8());
-        let mut idx = 0;
-        let mut inserted = false;
-        for ch in field.chars() {
-            if idx == at {
-                out.push(c);
-                inserted = true;
-            }
-            out.push(ch);
-            idx += 1;
-        }
-        if !inserted {
-            out.push(c);
-        }
-        *field = out;
-    }
-
-    /// Remove the char at char index `at` of field `i`.
-    fn remove_at(&mut self, i: usize, at: usize) {
-        let field = self.get_mut(i);
-        let mut out = String::with_capacity(field.len());
-        let mut idx = 0;
-        for ch in field.chars() {
-            if idx != at {
-                out.push(ch);
-            }
-            idx += 1;
-        }
-        *field = out;
     }
 }
 
-/// Top-level application state.
+// ----- text input --------------------------------------------------------
+
+struct Input {
+    buf: String,
+    cursor: usize,
+}
+
+impl Input {
+    fn new(s: &str) -> Self {
+        Self { buf: s.to_string(), cursor: s.chars().count() }
+    }
+
+    fn value(&self) -> &str {
+        &self.buf
+    }
+
+    fn insert(&mut self, c: char) {
+        let at = self.cursor;
+        let mut out = String::with_capacity(self.buf.len() + c.len_utf8());
+        let mut i = 0;
+        let mut done = false;
+        for ch in self.buf.chars() {
+            if i == at {
+                out.push(c);
+                done = true;
+            }
+            out.push(ch);
+            i += 1;
+        }
+        if !done {
+            out.push(c);
+        }
+        self.buf = out;
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let at = self.cursor - 1;
+        let mut out = String::new();
+        let mut i = 0;
+        for ch in self.buf.chars() {
+            if i != at {
+                out.push(ch);
+            }
+            i += 1;
+        }
+        self.buf = out;
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        let at = self.cursor;
+        if at >= self.buf.chars().count() {
+            return;
+        }
+        let mut out = String::new();
+        let mut i = 0;
+        for ch in self.buf.chars() {
+            if i != at {
+                out.push(ch);
+            }
+            i += 1;
+        }
+        self.buf = out;
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        let n = self.buf.chars().count();
+        if self.cursor < n {
+            self.cursor += 1;
+        }
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.buf.chars().count();
+    }
+}
+
+// ----- directory browser -------------------------------------------------
+
+enum DirEntry {
+    /// "use this folder" — confirm the current directory.
+    Current,
+    /// ".." — go up one level.
+    Up,
+    /// A subdirectory to descend into.
+    Dir(PathBuf),
+}
+
+enum EnterResult {
+    Stay,
+    Choose,
+}
+
+struct DirBrowser {
+    cwd: PathBuf,
+    entries: Vec<DirEntry>,
+    selected: usize,
+    error: Option<String>,
+}
+
+impl DirBrowser {
+    fn new(start: &str) -> Self {
+        let cwd = if start.is_empty() {
+            home_or_root()
+        } else {
+            let p = PathBuf::from(start);
+            if p.is_dir() { p } else { home_or_root() }
+        };
+        let mut b = Self { cwd, entries: Vec::new(), selected: 0, error: None };
+        b.refresh();
+        b
+    }
+
+    fn refresh(&mut self) {
+        self.entries.clear();
+        self.entries.push(DirEntry::Current);
+        if self.cwd.parent().is_some() {
+            self.entries.push(DirEntry::Up);
+        }
+        let mut dirs: Vec<PathBuf> = match fs::read_dir(&self.cwd) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect(),
+            Err(e) => {
+                self.error = Some(format!("cannot read {}: {e}", self.cwd.display()));
+                self.selected = 0;
+                return;
+            }
+        };
+        dirs.sort_by_key(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        });
+        for d in dirs {
+            self.entries.push(DirEntry::Dir(d));
+        }
+        self.error = None;
+        let first_dir = self
+            .entries
+            .iter()
+            .position(|e| matches!(e, DirEntry::Dir(_)))
+            .unwrap_or(0);
+        self.selected = first_dir;
+    }
+
+    fn up(&mut self) {
+        if let Some(parent) = self.cwd.parent() {
+            let parent = parent.to_path_buf();
+            if parent != self.cwd {
+                self.cwd = parent;
+                self.refresh();
+            }
+        }
+    }
+
+    fn jump(&mut self, p: PathBuf) {
+        if p.is_dir() {
+            self.cwd = p;
+            self.refresh();
+        }
+    }
+
+    fn move_sel(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let n = self.entries.len() as isize;
+        self.selected = ((self.selected as isize + delta).rem_euclid(n)) as usize;
+    }
+
+    fn enter(&mut self) -> EnterResult {
+        match self.entries.get(self.selected) {
+            Some(DirEntry::Current) => EnterResult::Choose,
+            Some(DirEntry::Up) => {
+                self.up();
+                EnterResult::Stay
+            }
+            Some(DirEntry::Dir(d)) => {
+                self.cwd = d.clone();
+                self.refresh();
+                EnterResult::Stay
+            }
+            None => EnterResult::Stay,
+        }
+    }
+}
+
+fn home_or_root() -> PathBuf {
+    dirs::home_dir().filter(|p| p.is_dir()).unwrap_or_else(|| PathBuf::from("/"))
+}
+
+// ----- app ---------------------------------------------------------------
+
 struct App {
     config: AppConfig,
-    list_state: ListState,
     screen: Screen,
+    menu_selected: usize,
+    list_state: ListState,
     last_msg: Option<String>,
     last_runs: HashMap<String, state::RunRecord>,
 }
@@ -190,8 +406,9 @@ impl App {
     fn new(config: AppConfig) -> Self {
         let mut app = Self {
             config,
+            screen: Screen::Menu,
+            menu_selected: 0,
             list_state: ListState::default(),
-            screen: Screen::Main,
             last_msg: None,
             last_runs: HashMap::new(),
         };
@@ -230,42 +447,6 @@ impl App {
         }
     }
 
-    // ----- key dispatch -------------------------------------------------
-
-    /// Returns `Ok(true)` when the app should quit.
-    fn on_key(&mut self, key: KeyCode) -> Result<bool> {
-        match std::mem::replace(&mut self.screen, Screen::Main) {
-            Screen::Main => Ok(self.handle_main(key)),
-            Screen::Form { editing, fields, focus, cursor } => {
-                self.handle_form(key, editing, fields, focus, cursor)?;
-                Ok(false)
-            }
-            Screen::ConfirmDelete { index } => {
-                self.handle_confirm(key, index)?;
-                Ok(false)
-            }
-            Screen::Log { text, scroll } => {
-                self.handle_log(key, text, scroll);
-                Ok(false)
-            }
-        }
-    }
-
-    fn handle_main(&mut self, key: KeyCode) -> bool {
-        match key {
-            KeyCode::Char('q') => return true,
-            KeyCode::Char('j') | KeyCode::Down => self.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
-            KeyCode::Char('a') => self.open_add_form(),
-            KeyCode::Char('e') => self.open_edit_form(),
-            KeyCode::Char('d') => self.open_confirm_delete(),
-            KeyCode::Char('r') => self.trigger_run(),
-            KeyCode::Char('l') => self.open_log(),
-            _ => {}
-        }
-        false
-    }
-
     fn select_next(&mut self) {
         if self.config.projects.is_empty() {
             return;
@@ -289,65 +470,119 @@ impl App {
         self.list_state.select(Some(i));
     }
 
-    fn open_add_form(&mut self) {
-        let fields = FormFields {
-            name: String::new(),
-            id: String::new(),
-            path: String::new(),
-            branch: "main".to_string(),
-            command: String::new(),
-            verify_mode: "github".to_string(),
-            secret: util::generate_secret(),
-        };
-        self.screen = Screen::Form { editing: None, fields, focus: 0, cursor: 0 };
+    // ----- key dispatch -------------------------------------------------
+
+    /// Returns `Ok(true)` when the app should quit.
+    fn on_key(&mut self, key: KeyCode) -> Result<bool> {
+        match std::mem::replace(&mut self.screen, Screen::Menu) {
+            Screen::Menu => Ok(self.handle_menu(key)),
+            Screen::List { mode } => {
+                self.handle_list(key, mode)?;
+                Ok(false)
+            }
+            Screen::Wizard(w) => {
+                self.handle_wizard(key, w)?;
+                Ok(false)
+            }
+            Screen::ConfirmDelete { index } => {
+                self.handle_confirm(key, index)?;
+                Ok(false)
+            }
+            Screen::Key { index } => {
+                self.handle_key(key, index)?;
+                Ok(false)
+            }
+            Screen::Log { text, scroll } => {
+                self.handle_log(key, text, scroll);
+                Ok(false)
+            }
+        }
     }
 
-    fn open_edit_form(&mut self) {
-        let Some(i) = self.selected_index() else {
-            self.last_msg = Some("no project selected".to_string());
-            return;
-        };
-        let p = &self.config.projects[i];
-        let fields = FormFields {
-            name: p.name.clone(),
-            id: p.id.clone(),
-            path: p.path.clone(),
-            branch: p.branch.clone(),
-            command: p.command.clone(),
-            verify_mode: p.verify_mode.clone(),
-            secret: p.secret.clone(),
-        };
-        let cursor = fields.name.chars().count();
-        self.screen = Screen::Form { editing: Some(i), fields, focus: 0, cursor };
+    fn handle_menu(&mut self, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.menu_selected = (self.menu_selected + 1) % MENU.len();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.menu_selected = (self.menu_selected + MENU.len() - 1) % MENU.len();
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                if let Some(n) = c.to_digit(10) {
+                    let n = n as usize;
+                    if (1..=MENU.len()).contains(&n) {
+                        self.menu_selected = n - 1;
+                        self.activate_menu(n - 1);
+                    }
+                }
+            }
+            KeyCode::Enter => self.activate_menu(self.menu_selected),
+            _ => {}
+        }
+        false
     }
 
-    fn open_confirm_delete(&mut self) {
-        let Some(i) = self.selected_index() else {
-            self.last_msg = Some("no project selected".to_string());
-            return;
-        };
-        self.screen = Screen::ConfirmDelete { index: i };
+    fn activate_menu(&mut self, i: usize) {
+        match i {
+            0 => self.screen = Screen::Wizard(Wizard::new_add()),
+            1 => self.open_list(ListMode::Browse),
+            2 => self.open_list(ListMode::Edit),
+            3 => self.open_list(ListMode::Key),
+            4 => self.open_list(ListMode::Run),
+            5 => self.open_list(ListMode::Remove),
+            6 => self.open_list(ListMode::Log),
+            _ => {}
+        }
     }
 
-    fn trigger_run(&mut self) {
-        let Some(i) = self.selected_index() else {
-            self.last_msg = Some("no project selected".to_string());
-            return;
-        };
+    fn open_list(&mut self, mode: ListMode) {
+        if !self.config.projects.is_empty() && self.list_state.selected().is_none() {
+            self.list_state.select(Some(0));
+        }
+        self.screen = Screen::List { mode };
+    }
+
+    fn handle_list(&mut self, key: KeyCode, mode: ListMode) -> Result<()> {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
+            KeyCode::Char('j') | KeyCode::Down => self.select_next(),
+            KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
+            KeyCode::Enter => self.activate_project(mode),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn activate_project(&mut self, mode: ListMode) {
+        let Some(i) = self.selected_index() else { return };
+        match mode {
+            ListMode::Browse => {}
+            ListMode::Edit => {
+                let w = Wizard::new_edit(&self.config.projects[i], i);
+                self.screen = Screen::Wizard(w);
+            }
+            ListMode::Run => {
+                self.trigger_run(i);
+                self.screen = Screen::Menu;
+            }
+            ListMode::Remove => self.screen = Screen::ConfirmDelete { index: i },
+            ListMode::Key => self.screen = Screen::Key { index: i },
+            ListMode::Log => self.open_log(i),
+        }
+    }
+
+    fn trigger_run(&mut self, i: usize) {
         let p = &self.config.projects[i];
         if let Ok(exe) = std::env::current_exe() {
             let _ = std::process::Command::new(exe)
                 .args(["run", "--id", p.id.as_str()])
                 .spawn();
         }
-        self.last_msg = Some(format!("triggered {}", p.id));
+        self.last_msg = Some(format!("triggered {} — check the run log", p.id));
     }
 
-    fn open_log(&mut self) {
-        let Some(i) = self.selected_index() else {
-            self.last_msg = Some("no project selected".to_string());
-            return;
-        };
+    fn open_log(&mut self, i: usize) {
         let p = &self.config.projects[i];
         let text = match state::latest_run(&p.id) {
             Some(run) => state::read_run_log(&run.id),
@@ -361,99 +596,168 @@ impl App {
         self.screen = Screen::Log { text, scroll: 0 };
     }
 
-    // ----- form handling ------------------------------------------------
+    // ----- wizard handling ----------------------------------------------
 
-    fn handle_form(
-        &mut self,
-        key: KeyCode,
-        editing: Option<usize>,
-        mut fields: FormFields,
-        mut focus: usize,
-        mut cursor: usize,
-    ) -> Result<()> {
-        match key {
-            KeyCode::Esc => {
-                self.screen = Screen::Main;
-                return Ok(());
-            }
-            KeyCode::Tab | KeyCode::Down => {
-                focus = (focus + 1) % FIELD_COUNT;
-                cursor = fields.get(focus).chars().count();
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                focus = (focus + FIELD_COUNT - 1) % FIELD_COUNT;
-                cursor = fields.get(focus).chars().count();
-            }
-            KeyCode::Enter => {
-                return self.save_form(editing, fields, focus, cursor);
-            }
-            KeyCode::Char(c) => {
-                fields.insert(focus, c, cursor);
-                cursor += 1;
-            }
-            KeyCode::Backspace => {
-                if cursor > 0 {
-                    fields.remove_at(focus, cursor - 1);
-                    cursor -= 1;
+    fn handle_wizard(&mut self, key: KeyCode, mut w: Wizard) -> Result<()> {
+        // A directory browser is open: it owns the keys.
+        if w.browser.is_some() {
+            match key {
+                KeyCode::Esc => {
+                    w.browser = None;
+                    w.step = Step::Name;
                 }
-            }
-            KeyCode::Left => cursor = cursor.saturating_sub(1),
-            KeyCode::Right => {
-                let len = fields.get(focus).chars().count();
-                if cursor < len {
-                    cursor += 1;
+                KeyCode::Char('c') => self.finish_path(&mut w),
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                    w.browser.as_mut().unwrap().up();
                 }
+                KeyCode::Char('j') | KeyCode::Down => w.browser.as_mut().unwrap().move_sel(1),
+                KeyCode::Char('k') | KeyCode::Up => w.browser.as_mut().unwrap().move_sel(-1),
+                KeyCode::Char('/') => w.browser.as_mut().unwrap().jump(PathBuf::from("/")),
+                KeyCode::Char('~') => {
+                    if let Some(h) = dirs::home_dir() {
+                        w.browser.as_mut().unwrap().jump(h);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let EnterResult::Choose = w.browser.as_mut().unwrap().enter() {
+                        self.finish_path(&mut w);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+            self.screen = Screen::Wizard(w);
+            return Ok(());
         }
-        self.screen = Screen::Form { editing, fields, focus, cursor };
+
+        match w.step {
+            Step::Name => match key {
+                KeyCode::Esc => {
+                    self.screen = Screen::Menu;
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    if w.name.value().trim().is_empty() {
+                        w.error = Some("name is required".to_string());
+                    } else {
+                        w.error = None;
+                        self.open_browser(&mut w);
+                    }
+                }
+                KeyCode::Char(c) => w.name.insert(c),
+                KeyCode::Backspace => w.name.backspace(),
+                KeyCode::Delete => w.name.delete(),
+                KeyCode::Left => w.name.left(),
+                KeyCode::Right => w.name.right(),
+                KeyCode::Home => w.name.home(),
+                KeyCode::End => w.name.end(),
+                _ => {}
+            },
+            Step::Path => self.open_browser(&mut w),
+            Step::Branch => match key {
+                KeyCode::Esc => self.open_browser(&mut w),
+                KeyCode::Enter => {
+                    w.error = None;
+                    w.step = Step::Command;
+                }
+                KeyCode::Char(c) => w.branch.insert(c),
+                KeyCode::Backspace => w.branch.backspace(),
+                KeyCode::Delete => w.branch.delete(),
+                KeyCode::Left => w.branch.left(),
+                KeyCode::Right => w.branch.right(),
+                KeyCode::Home => w.branch.home(),
+                KeyCode::End => w.branch.end(),
+                _ => {}
+            },
+            Step::Command => match key {
+                KeyCode::Esc => w.step = Step::Branch,
+                KeyCode::Enter => {
+                    w.error = None;
+                    w.step = Step::Verify;
+                }
+                KeyCode::Char(c) => w.command.insert(c),
+                KeyCode::Backspace => w.command.backspace(),
+                KeyCode::Delete => w.command.delete(),
+                KeyCode::Left => w.command.left(),
+                KeyCode::Right => w.command.right(),
+                KeyCode::Home => w.command.home(),
+                KeyCode::End => w.command.end(),
+                _ => {}
+            },
+            Step::Verify => match key {
+                KeyCode::Esc => w.step = Step::Command,
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::Right | KeyCode::Char('k')
+                | KeyCode::Up | KeyCode::Left => {
+                    w.verify = (w.verify + 1) % 2;
+                }
+                KeyCode::Enter => {
+                    w.error = None;
+                    w.step = Step::Confirm;
+                }
+                _ => {}
+            },
+            Step::Confirm => match key {
+                KeyCode::Esc => w.step = Step::Verify,
+                KeyCode::Enter => {
+                    let name = w.name.value().trim().to_string();
+                    let id = match w.editing {
+                        Some(i) => self.config.projects[i].id.clone(),
+                        None => slugify(&name),
+                    };
+                    let verify_mode =
+                        if w.verify == 0 { "github".to_string() } else { "token".to_string() };
+                    let project = ProjectConfig {
+                        id,
+                        name,
+                        path: w.path.trim().to_string(),
+                        branch: w.branch.value().trim().to_string(),
+                        command: w.command.value().trim().to_string(),
+                        secret: w.secret.clone(),
+                        verify_mode,
+                    };
+                    match project.validate() {
+                        Ok(()) => {
+                            self.config.upsert(project);
+                            config::save_config(&self.config)?;
+                            self.last_msg = Some(if w.editing.is_some() {
+                                "project saved".to_string()
+                            } else {
+                                "project added".to_string()
+                            });
+                            self.screen = Screen::Menu;
+                        }
+                        Err(e) => {
+                            w.error = Some(format!("{e:#}"));
+                            self.screen = Screen::Wizard(w);
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            },
+        }
+        self.screen = Screen::Wizard(w);
         Ok(())
     }
 
-    fn save_form(
-        &mut self,
-        editing: Option<usize>,
-        fields: FormFields,
-        focus: usize,
-        cursor: usize,
-    ) -> Result<()> {
-        let mut id = fields.id.trim().to_string();
-        if id.is_empty() {
-            id = slugify(&fields.name);
+    /// Open the directory browser for the `path` field and move to `Step::Path`.
+    fn open_browser(&mut self, w: &mut Wizard) {
+        let start = w.path.clone();
+        let mut b = DirBrowser::new(&start);
+        if !start.trim().is_empty() {
+            // Existing path: preselect "use this folder" so Enter keeps it.
+            b.selected = 0;
         }
-        // Regenerate a secret if the field was left (or made) empty.
-        let secret = if fields.secret.is_empty() {
-            util::generate_secret()
-        } else {
-            fields.secret.clone()
-        };
+        w.browser = Some(b);
+        w.step = Step::Path;
+    }
 
-        let project = ProjectConfig {
-            id,
-            name: fields.name.trim().to_string(),
-            path: fields.path.trim().to_string(),
-            branch: fields.branch.trim().to_string(),
-            command: fields.command.trim().to_string(),
-            secret,
-            verify_mode: fields.verify_mode.trim().to_string(),
-        };
-
-        match project.validate() {
-            Ok(()) => {
-                self.config.upsert(project);
-                config::save_config(&self.config)?;
-                self.last_msg = Some(match editing {
-                    Some(_) => "saved".to_string(),
-                    None => "added".to_string(),
-                });
-                self.screen = Screen::Main;
-            }
-            Err(e) => {
-                self.last_msg = Some(format!("error: {e:#}"));
-                self.screen = Screen::Form { editing, fields, focus, cursor };
-            }
+    /// Accept the browser's current directory as the path and advance.
+    fn finish_path(&mut self, w: &mut Wizard) {
+        if let Some(b) = w.browser.take() {
+            w.path = b.cwd.to_string_lossy().to_string();
         }
-        Ok(())
+        w.error = None;
+        w.step = Step::Branch;
     }
 
     // ----- confirm-delete handling --------------------------------------
@@ -464,20 +768,34 @@ impl App {
                 let id = self.config.projects[index].id.clone();
                 self.config.remove(&id);
                 config::save_config(&self.config)?;
-                self.last_msg = Some(format!("deleted {}", id));
+                self.last_msg = Some(format!("deleted {id}"));
                 self.list_state.select(if self.config.projects.is_empty() {
                     None
                 } else {
                     Some(index.min(self.config.projects.len() - 1))
                 });
-                self.screen = Screen::Main;
+                self.screen = Screen::Menu;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.screen = Screen::Main;
+                self.screen = Screen::Menu;
             }
-            _ => {
-                self.screen = Screen::ConfirmDelete { index };
+            _ => self.screen = Screen::ConfirmDelete { index },
+        }
+        Ok(())
+    }
+
+    // ----- key (secret) handling ----------------------------------------
+
+    fn handle_key(&mut self, key: KeyCode, index: usize) -> Result<()> {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.config.projects[index].secret = util::generate_secret();
+                config::save_config(&self.config)?;
+                self.last_msg = Some("secret rotated".to_string());
+                self.screen = Screen::Key { index };
             }
+            _ => self.screen = Screen::Key { index },
         }
         Ok(())
     }
@@ -486,9 +804,7 @@ impl App {
 
     fn handle_log(&mut self, key: KeyCode, text: String, scroll: u16) {
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.screen = Screen::Main;
-            }
+            KeyCode::Char('q') | KeyCode::Esc => self.screen = Screen::Menu,
             KeyCode::Char('j') | KeyCode::Down => {
                 let max = (text.lines().count() as u16).saturating_sub(1);
                 self.screen = Screen::Log { text, scroll: (scroll + 1).min(max) };
@@ -496,27 +812,33 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.screen = Screen::Log { text, scroll: scroll.saturating_sub(1) };
             }
-            _ => {
-                self.screen = Screen::Log { text, scroll };
-            }
+            _ => self.screen = Screen::Log { text, scroll },
         }
     }
 
     // ----- rendering -----------------------------------------------------
 
     fn render(&mut self, f: &mut Frame) {
-        match std::mem::replace(&mut self.screen, Screen::Main) {
-            Screen::Main => {
-                self.render_main(f);
-                self.screen = Screen::Main;
+        match std::mem::replace(&mut self.screen, Screen::Menu) {
+            Screen::Menu => {
+                self.render_menu(f);
+                self.screen = Screen::Menu;
             }
-            Screen::Form { editing, fields, focus, cursor } => {
-                self.render_form(f, &fields, focus, cursor, editing.is_some());
-                self.screen = Screen::Form { editing, fields, focus, cursor };
+            Screen::List { mode } => {
+                self.render_list(f, mode);
+                self.screen = Screen::List { mode };
+            }
+            Screen::Wizard(w) => {
+                self.render_wizard(f, &w);
+                self.screen = Screen::Wizard(w);
             }
             Screen::ConfirmDelete { index } => {
                 self.render_confirm(f, index);
                 self.screen = Screen::ConfirmDelete { index };
+            }
+            Screen::Key { index } => {
+                self.render_key(f, index);
+                self.screen = Screen::Key { index };
             }
             Screen::Log { text, scroll } => {
                 self.render_log(f, &text, scroll);
@@ -525,102 +847,358 @@ impl App {
         }
     }
 
-    fn render_main(&mut self, f: &mut Frame) {
+    fn render_menu(&self, f: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Min(3),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(f.area());
 
+        let subtitle =
+            format!("{} project(s) · self-hosted webhook runner", self.config.projects.len());
+        let banner = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "webhookr",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(subtitle, Style::default().fg(MUTED))),
+        ])
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)));
+        f.render_widget(banner, chunks[0]);
+
+        let items: Vec<ListItem> = MENU
+            .iter()
+            .map(|(icon, label)| {
+                ListItem::new(Line::from(vec![Span::raw(*icon), Span::raw("  "), Span::raw(*label)]))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_style(
+                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("❯ ");
+        let mut state = ListState::default();
+        state.select(Some(self.menu_selected));
+        f.render_stateful_widget(list, chunks[1], &mut state);
+
+        if let Some(m) = &self.last_msg {
+            f.render_widget(
+                Paragraph::new(m.as_str()).style(Style::default().fg(GOOD)),
+                chunks[2],
+            );
+        }
+        f.render_widget(
+            Paragraph::new("j/k or ↑/↓ navigate · Enter select · 1-7 shortcut · q quit")
+                .style(Style::default().fg(MUTED)),
+            chunks[3],
+        );
+    }
+
+    fn render_list(&mut self, f: &mut Frame, mode: ListMode) {
+        let title = match mode {
+            ListMode::Browse => " Projects ",
+            ListMode::Edit => " Select a project to edit ",
+            ListMode::Run => " Select a project to run ",
+            ListMode::Remove => " Select a project to remove ",
+            ListMode::Key => " Select a project for its secret ",
+            ListMode::Log => " Select a project for its log ",
+        };
+
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(f.area());
+        let h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(v[0]);
+
         let items: Vec<ListItem> = if self.config.projects.is_empty() {
-            vec![ListItem::new("No projects yet — press 'a' to add one")]
+            vec![ListItem::new("no projects yet — press Esc to go back")]
         } else {
             self.config
                 .projects
                 .iter()
                 .map(|p| {
-                    let line = format!(
-                        "{}  {}  [branch {}]  {}    {}",
-                        p.id,
-                        p.name,
-                        p.branch,
-                        p.command,
-                        self.status_for(&p.id)
-                    );
-                    ListItem::new(line)
+                    let status = self.status_for(&p.id);
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            p.id.as_str(),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::raw(p.name.as_str()),
+                        Span::raw("  "),
+                        Span::styled(status, Style::default().fg(status_color(status))),
+                    ]))
                 })
                 .collect()
         };
-
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Projects "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(Style::default().fg(ACCENT)),
+            )
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
             .highlight_symbol("❯ ");
+        f.render_stateful_widget(list, h[0], &mut self.list_state);
 
-        f.render_stateful_widget(list, chunks[0], &mut self.list_state);
+        let detail = Paragraph::new(self.detail_text())
+            .block(Block::default().borders(Borders::ALL).title(" Details "))
+            .wrap(Wrap { trim: true });
+        f.render_widget(detail, h[1]);
 
-        if let Some(msg) = &self.last_msg {
-            f.render_widget(Paragraph::new(msg.as_str()), chunks[1]);
+        let hint = match mode {
+            ListMode::Browse => "Esc/← back · j/k navigate",
+            ListMode::Edit => "Enter edit · Esc/← back",
+            ListMode::Run => "Enter run · Esc/← back",
+            ListMode::Remove => "Enter remove · Esc/← back",
+            ListMode::Key => "Enter show secret · Esc/← back",
+            ListMode::Log => "Enter view log · Esc/← back",
+        };
+        f.render_widget(Paragraph::new(hint).style(Style::default().fg(MUTED)), v[1]);
+    }
+
+    fn detail_text(&self) -> Vec<Line<'static>> {
+        let Some(i) = self.selected_index() else {
+            return vec![Line::from(Span::raw("no project selected"))];
+        };
+        let p = &self.config.projects[i];
+        let mut lines = vec![
+            field_line("id", &p.id),
+            field_line("name", &p.name),
+            field_line("path", &p.path),
+            field_line("branch", &p.branch),
+            field_line("command", &p.command),
+            field_line("verify", &p.verify_mode),
+            field_line("webhook", &format!("http://{}/hooks/{}", self.config.listen_addr, p.id)),
+        ];
+        let last_line = match self.last_runs.get(&p.id) {
+            Some(r) => {
+                let s = format!("{} ({}ms) {}", r.status, r.duration_ms, r.message);
+                field_line("last run", &s)
+            }
+            None => field_line("last run", "never"),
+        };
+        lines.push(last_line);
+        lines
+    }
+
+    fn render_wizard(&self, f: &mut Frame, w: &Wizard) {
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Min(3),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(f.area());
+
+        let title = if w.editing.is_some() { "Edit project" } else { "Add project" };
+        let header = Paragraph::new(vec![
+            Line::from(Span::styled(
+                title,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+            step_progress(w),
+        ])
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)));
+        f.render_widget(header, v[0]);
+
+        match w.step {
+            Step::Name => {
+                let id = slugify(w.name.value());
+                self.render_text_body(
+                    f,
+                    v[1],
+                    "Name",
+                    w.name.value(),
+                    w.name.cursor,
+                    Some(format!("id: {id}")),
+                );
+            }
+            Step::Path => {
+                if let Some(b) = &w.browser {
+                    self.render_browser(f, v[1], b);
+                }
+            }
+            Step::Branch => self.render_text_body(
+                f,
+                v[1],
+                "Branch",
+                w.branch.value(),
+                w.branch.cursor,
+                Some("git branch to pull before running the command".to_string()),
+            ),
+            Step::Command => self.render_text_body(
+                f,
+                v[1],
+                "Command",
+                w.command.value(),
+                w.command.cursor,
+                Some("shell command to run after pull, e.g. ./deploy.sh".to_string()),
+            ),
+            Step::Verify => self.render_verify(f, v[1], w),
+            Step::Confirm => self.render_confirm_wizard(f, v[1], w),
         }
 
+        if let Some(e) = &w.error {
+            f.render_widget(Paragraph::new(e.as_str()).style(Style::default().fg(BAD)), v[2]);
+        }
         f.render_widget(
-            Paragraph::new(FOOTER_MAIN).style(Style::default().fg(Color::DarkGray)),
-            chunks[2],
+            Paragraph::new(wizard_footer(w)).style(Style::default().fg(MUTED)),
+            v[3],
         );
     }
 
-    fn render_form(&self, f: &mut Frame, fields: &FormFields, focus: usize, cursor: usize, editing: bool) {
-        let mut constraints = vec![Constraint::Length(1)]; // title
-        for i in 0..FIELD_COUNT {
-            constraints.push(if i == focus {
-                Constraint::Length(3)
-            } else {
-                Constraint::Length(1)
-            });
+    fn render_text_body(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        label: &str,
+        value: &str,
+        cursor: usize,
+        sub: Option<String>,
+    ) {
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(Span::styled(
+                label.to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            input_line(value, cursor),
+        ];
+        if let Some(s) = sub {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(s, Style::default().fg(MUTED))));
         }
-        constraints.push(Constraint::Length(1)); // status line (last_msg)
-        constraints.push(Constraint::Length(1)); // footer hint
+        let para = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {label} "))
+                    .border_style(Style::default().fg(ACCENT)),
+            )
+            .wrap(Wrap { trim: true });
+        f.render_widget(para, area);
+    }
 
+    fn render_verify(&self, f: &mut Frame, area: Rect, w: &Wizard) {
+        let options = [
+            ("github", "verify X-Hub-Signature-256 (GitHub webhooks)"),
+            ("token", "verify X-Webhookr-Key header (any sender)"),
+        ];
+        let items: Vec<ListItem> = options
+            .iter()
+            .enumerate()
+            .map(|(i, (name, desc))| {
+                let mark = if i == w.verify { "● " } else { "○ " };
+                let style = if i == w.verify {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{mark}{name}"), style),
+                    Span::raw("   "),
+                    Span::styled(*desc, Style::default().fg(MUTED)),
+                ]))
+            })
+            .collect();
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" Verify mode "));
+        f.render_widget(list, area);
+    }
+
+    fn render_confirm_wizard(&self, f: &mut Frame, area: Rect, w: &Wizard) {
+        let id = match w.editing {
+            Some(i) => self.config.projects[i].id.clone(),
+            None => slugify(w.name.value()),
+        };
+        let verify = if w.verify == 0 { "github" } else { "token" };
+        let lines = vec![
+            Line::from(Span::styled(
+                "Review and save",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            field_line("id", &id),
+            field_line("name", w.name.value().trim()),
+            field_line("path", w.path.trim()),
+            field_line("branch", w.branch.value().trim()),
+            field_line("command", w.command.value().trim()),
+            field_line("verify", verify),
+        ];
+        let para = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" Confirm "))
+            .wrap(Wrap { trim: true });
+        f.render_widget(para, area);
+    }
+
+    fn render_browser(&self, f: &mut Frame, area: Rect, b: &DirBrowser) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(f.area());
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(area);
 
-        let title = if editing { "Edit project" } else { "Add project" };
-        f.render_widget(
-            Paragraph::new(title).style(Style::default().add_modifier(Modifier::BOLD)),
-            chunks[0],
+        let header = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Path: ", Style::default().fg(MUTED)),
+                Span::styled(
+                    b.cwd.display().to_string(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "pick a folder, then press c to choose it",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Browse folders ")
+                .border_style(Style::default().fg(ACCENT)),
         );
+        f.render_widget(header, chunks[0]);
 
-        for i in 0..FIELD_COUNT {
-            let value = fields.get(i);
-            let text = if i == focus {
-                format!("{}: {}", FIELDS[i], with_cursor(value, cursor))
-            } else {
-                format!("{}: {}", FIELDS[i], value)
-            };
-            let para = if i == focus {
-                Paragraph::new(text).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow)),
-                )
-            } else {
-                Paragraph::new(text).style(Style::default().fg(Color::DarkGray))
-            };
-            f.render_widget(para, chunks[1 + i]);
-        }
-
-        if let Some(msg) = &self.last_msg {
-            f.render_widget(
-                Paragraph::new(msg.as_str()).style(Style::default().fg(Color::Red)),
-                chunks[1 + FIELD_COUNT],
-            );
-        }
-
-        f.render_widget(
-            Paragraph::new(FOOTER_FORM).style(Style::default().fg(Color::DarkGray)),
-            chunks[2 + FIELD_COUNT],
-        );
+        let items: Vec<ListItem> = b
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let (icon, name) = match e {
+                    DirEntry::Current => ("✓", "use this folder".to_string()),
+                    DirEntry::Up => ("⬆", "..".to_string()),
+                    DirEntry::Dir(d) => (
+                        "📁",
+                        d.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| d.display().to_string()),
+                    ),
+                };
+                let style = if i == b.selected {
+                    Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{icon} "), style),
+                    Span::styled(name, style),
+                ]))
+            })
+            .collect();
+        let list = List::new(items);
+        let mut state = ListState::default();
+        state.select(Some(b.selected));
+        f.render_stateful_widget(list, chunks[1], &mut state);
     }
 
     fn render_confirm(&self, f: &mut Frame, index: usize) {
@@ -630,6 +1208,52 @@ impl App {
         let para = Paragraph::new(format!("Delete {name}?\n\n[y/N]"))
             .block(Block::default().borders(Borders::ALL).title(" Confirm "));
         f.render_widget(para, area);
+    }
+
+    fn render_key(&self, f: &mut Frame, index: usize) {
+        let p = &self.config.projects[index];
+        let webhook = format!("http://{}/hooks/{}", self.config.listen_addr, p.id);
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Project ", Style::default().fg(MUTED)),
+                Span::styled(
+                    p.name.clone(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::raw(""),
+            field_line("webhook", &webhook),
+            field_line_hl("secret", &p.secret),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "GitHub: Settings → Webhooks → Add webhook",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "  Payload URL = webhook above · Secret = secret above (application/json)",
+                Style::default().fg(MUTED),
+            )),
+        ];
+        let area = centered_rect(80, 50, f.area());
+        f.render_widget(Clear, area);
+        let para = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Webhook secret ")
+                    .border_style(Style::default().fg(ACCENT)),
+            )
+            .wrap(Wrap { trim: true });
+        f.render_widget(para, area);
+
+        let footer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(f.area());
+        f.render_widget(
+            Paragraph::new("r rotate secret · Esc/← back").style(Style::default().fg(MUTED)),
+            footer[1],
+        );
     }
 
     fn render_log(&self, f: &mut Frame, text: &str, scroll: u16) {
@@ -644,11 +1268,13 @@ impl App {
         f.render_widget(para, chunks[0]);
 
         f.render_widget(
-            Paragraph::new("j/k or ↑/↓ scroll · q/Esc back").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("j/k or ↑/↓ scroll · q/Esc back").style(Style::default().fg(MUTED)),
             chunks[1],
         );
     }
 }
+
+// ----- free helpers ------------------------------------------------------
 
 /// Convert a display name into a URL-friendly slug.
 fn slugify(input: &str) -> String {
@@ -671,21 +1297,91 @@ fn slugify(input: &str) -> String {
     }
 }
 
-/// Insert a `▌` cursor marker into `s` at char index `cursor`.
-fn with_cursor(s: &str, cursor: usize) -> String {
-    let mut out = String::with_capacity(s.len() + "▌".len());
+/// A `label:  value` line with a dim label (aligned to a fixed width).
+fn field_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<9}"), Style::default().fg(MUTED)),
+        Span::raw("  "),
+        Span::raw(value.to_string()),
+    ])
+}
+
+/// Like [`field_line`] but with the value highlighted in the accent color.
+fn field_line_hl(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<9}"), Style::default().fg(MUTED)),
+        Span::raw("  "),
+        Span::styled(value.to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+    ])
+}
+
+fn status_color(s: &str) -> Color {
+    if s.starts_with('✓') {
+        GOOD
+    } else if s.starts_with('✗') {
+        BAD
+    } else {
+        MUTED
+    }
+}
+
+/// Render a value with a `▌` cursor marker at char index `cursor`.
+fn input_line(value: &str, cursor: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
     let mut i = 0;
-    for c in s.chars() {
+    for ch in value.chars() {
         if i == cursor {
-            out.push('▌');
+            spans.push(Span::styled("▌", Style::default().fg(ACCENT)));
         }
-        out.push(c);
+        spans.push(Span::raw(ch.to_string()));
         i += 1;
     }
-    if i == cursor {
-        out.push('▌');
+    if i == cursor || spans.is_empty() {
+        spans.push(Span::styled("▌", Style::default().fg(ACCENT)));
     }
-    out
+    Line::from(spans)
+}
+
+/// Progress breadcrumb across the top of the wizard.
+fn step_progress(w: &Wizard) -> Line<'static> {
+    let steps = ["Name", "Path", "Branch", "Command", "Verify", "Confirm"];
+    let cur = match w.step {
+        Step::Name => 0,
+        Step::Path => 1,
+        Step::Branch => 2,
+        Step::Command => 3,
+        Step::Verify => 4,
+        Step::Confirm => 5,
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, s) in steps.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" → ", Style::default().fg(MUTED)));
+        }
+        if i < cur {
+            spans.push(Span::styled(format!("✓{s}"), Style::default().fg(GOOD)));
+        } else if i == cur {
+            spans.push(Span::styled(*s, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        } else {
+            spans.push(Span::styled(*s, Style::default().fg(MUTED)));
+        }
+    }
+    Line::from(spans)
+}
+
+fn wizard_footer(w: &Wizard) -> &'static str {
+    if w.browser.is_some() {
+        "j/k or ↑/↓ move · Enter open · c choose · h/⌫ up · / root · ~ home · Esc back"
+    } else {
+        match w.step {
+            Step::Name => "type a name (id is auto) · Enter next · Esc cancel",
+            Step::Path => "browse folders · c choose · Esc back",
+            Step::Branch => "type branch · Enter next · Esc back",
+            Step::Command => "type command · Enter next · Esc back",
+            Step::Verify => "j/k or ←/→ toggle · Enter next · Esc back",
+            Step::Confirm => "Enter save · Esc back",
+        }
+    }
 }
 
 /// A popup rectangle centered within `r`, sized by percentages of `r`.
