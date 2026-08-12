@@ -7,11 +7,31 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
-  release:
-    name: build & publish
-    runs-on: ubuntu-latest
+  build:
+    name: build (${{ matrix.os_arch }})
+    runs-on: ${{ matrix.os }}
+    # One platform failing (e.g. a retired macOS runner) must not block the
+    # rest from publishing.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            os_arch: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            os_arch: linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            os_arch: darwin-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            os_arch: darwin-aarch64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,35 +39,64 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
 
-      - name: Install aarch64 cross linker
+      - name: Install aarch64 cross linker (Linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build (x86_64)
-        run: cargo build --release --target x86_64-unknown-linux-gnu
-
-      - name: Build (aarch64)
-        run: cargo build --release --target aarch64-unknown-linux-gnu
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
-      - name: Stage assets
+      - name: Stage binary
+        run: cp target/${{ matrix.target }}/release/webhookr webhookr-${{ matrix.os_arch }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: webhookr-${{ matrix.os_arch }}
+          path: webhookr-${{ matrix.os_arch }}
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Stage installer and checksums
         run: |
-          mkdir -p dist
-          cp target/x86_64-unknown-linux-gnu/release/webhookr dist/webhookr-linux-x86_64
-          cp target/aarch64-unknown-linux-gnu/release/webhookr dist/webhookr-linux-aarch64
+          set -euo pipefail
           sed "s|__REPO__|${{ github.repository }}|g" install.sh > dist/install.sh
           chmod +x dist/install.sh
-          (cd dist && sha256sum webhookr-linux-x86_64 webhookr-linux-aarch64 > SHA256SUMS)
+          shopt -s nullglob
+          bins=(dist/webhookr-*)
+          if [ "${#bins[@]}" -gt 0 ]; then
+            (cd dist && sha256sum webhookr-* > SHA256SUMS)
+          fi
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          bins=(dist/webhookr-*)
+          if [ "${#bins[@]}" -eq 0 ]; then
+            echo "no binaries built; skipping release"
+            exit 0
+          fi
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
           gh release create latest dist/* \
             --title "webhookr latest" \

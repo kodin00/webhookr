@@ -6,22 +6,29 @@ runs your deploy command — logging everything so you can tail it later.
 
 ## Install
 
-Every merge to `master` builds a release binary and publishes it to the
-`latest` GitHub release. Install it in one line (Linux x86_64 / aarch64):
+Every merge to `master` builds release binaries and publishes them to the
+`latest` GitHub release. Install with one line:
 
 ```sh
-curl -fsSL https://github.com/kodin00/webhookr/releases/latest/download/webhookr-linux-$(uname -m) -o webhookr && chmod +x webhookr && sudo mv webhookr /usr/local/bin/webhookr
+curl -fsSL https://github.com/kodin00/webhookr/releases/latest/download/install.sh | sh
 ```
 
-Or use the installer script, which normalizes the architecture and verifies the
-checksum before installing:
+The installer detects your OS and architecture (Linux/macOS, x86_64/arm64),
+downloads the matching binary, verifies its checksum, and installs it to
+`/usr/local/bin/webhookr` (override with `WEBHOOKR_INSTALL_DIR`).
+
+### Updating
+
+Re-run the same command — it overwrites the installed binary with the latest
+release. Your config (`~/.config/webhookr/`) and run history are left untouched.
+
+If you run the daemon under systemd, restart it to pick up the new binary:
 
 ```sh
-curl -fsSL https://github.com/kodin00/webhookr/releases/latest/download/install.sh | bash
+sudo systemctl restart webhookr
 ```
 
-The binary lands in `/usr/local/bin/webhookr` (override with
-`WEBHOOKR_INSTALL_DIR`). To build from source instead, see [Build](#build).
+To build from source instead, see [Build](#build).
 
 ## How it works
 
