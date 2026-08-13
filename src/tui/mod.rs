@@ -25,6 +25,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
+use crate::cloudflare;
 use crate::config::{self, AppConfig, ProjectConfig};
 use crate::state;
 use crate::util;
@@ -40,12 +41,14 @@ const TEXT: Color = Color::Gray;
 
 // ----- menu --------------------------------------------------------------
 
-const MENU: [(&str, &str, &str); 7] = [
+const MENU: [(&str, &str, &str); 9] = [
     ("+", "Add project", "Register a checkout and deploy command"),
+    ("U", "Update app", "Clone or pull source, then deploy"),
+    (">", "Run deployment", "Deploy again without pulling source"),
     ("=", "List projects", "Inspect configured webhook routes"),
-    ("~", "Edit project", "Change a route or deploy command"),
+    ("~", "Edit project", "Change source or deployment settings"),
     ("@", "Show secret", "Reveal or rotate webhook credentials"),
-    (">", "Run project", "Trigger a deployment manually"),
+    ("C", "Cloudflare tunnel", "Publish port 9000 at a hostname"),
     ("-", "Remove project", "Delete a configured route"),
     ("#", "View run log", "Read output from the latest run"),
 ];
@@ -108,10 +111,12 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
 // ----- screens -----------------------------------------------------------
 
 /// Which screen is currently shown.
+#[allow(clippy::large_enum_variant)]
 enum Screen {
     Menu,
     List { mode: ListMode },
     Wizard(Wizard),
+    Cloudflare(CloudflareWizard),
     ConfirmDelete { index: usize },
     Key { index: usize },
     Log { text: String, scroll: u16 },
@@ -123,6 +128,7 @@ enum ListMode {
     Browse,
     Edit,
     Run,
+    Update,
     Remove,
     Key,
     Log,
@@ -133,9 +139,12 @@ enum ListMode {
 #[derive(Clone, Copy, PartialEq)]
 enum Step {
     Name,
+    Repository,
     Path,
     Branch,
-    Command,
+    Preset,
+    Deploy,
+    Profiles,
     Verify,
     Confirm,
 }
@@ -146,9 +155,13 @@ struct Wizard {
     editing: Option<usize>,
     step: Step,
     name: Input,
-    path: String,
+    repository: Input,
+    path: Input,
     branch: Input,
     command: Input,
+    preset: usize,
+    compose_file: Input,
+    compose_profiles: Input,
     verify: usize, // 0 = github, 1 = token
     browser: Option<DirBrowser>,
     error: Option<String>,
@@ -161,9 +174,13 @@ impl Wizard {
             editing: None,
             step: Step::Name,
             name: Input::new(""),
-            path: String::new(),
+            repository: Input::new(""),
+            path: Input::new(""),
             branch: Input::new("main"),
             command: Input::new(""),
+            preset: 0,
+            compose_file: Input::new("compose.yaml"),
+            compose_profiles: Input::new(""),
             verify: 0,
             browser: None,
             error: None,
@@ -176,13 +193,71 @@ impl Wizard {
             editing: Some(index),
             step: Step::Name,
             name: Input::new(&p.name),
-            path: p.path.clone(),
+            repository: Input::new(&p.repository),
+            path: Input::new(&p.path),
             branch: Input::new(&p.branch),
             command: Input::new(&p.command),
+            preset: preset_index(&p.deploy_preset),
+            compose_file: Input::new(&p.compose_file),
+            compose_profiles: Input::new(&p.compose_profiles.join(",")),
             verify: if p.verify_mode == "token" { 1 } else { 0 },
             browser: None,
             error: None,
             secret: p.secret.clone(),
+        }
+    }
+}
+
+const PRESETS: [(&str, &str, &str); 4] = [
+    (
+        "compose_build",
+        "Compose build",
+        "docker compose up -d --build --remove-orphans",
+    ),
+    (
+        "compose_pull",
+        "Compose pull",
+        "pull images, then compose up in detached mode",
+    ),
+    (
+        "compose_up",
+        "Compose up",
+        "start the selected Compose file without build or pull",
+    ),
+    (
+        "custom",
+        "Custom command",
+        "run a shell command after the source is ready",
+    ),
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum CloudflareStep {
+    Hostname,
+    Token,
+    Confirm,
+}
+
+struct CloudflareWizard {
+    step: CloudflareStep,
+    hostname: Input,
+    token: Input,
+    error: Option<String>,
+}
+
+impl CloudflareWizard {
+    fn new(config: &AppConfig) -> Self {
+        Self {
+            step: CloudflareStep::Hostname,
+            hostname: Input::new(
+                config
+                    .cloudflare
+                    .as_ref()
+                    .map(|c| c.hostname.as_str())
+                    .unwrap_or(""),
+            ),
+            token: Input::new(""),
+            error: None,
         }
     }
 }
@@ -209,15 +284,13 @@ impl Input {
     fn insert(&mut self, c: char) {
         let at = self.cursor;
         let mut out = String::with_capacity(self.buf.len() + c.len_utf8());
-        let mut i = 0;
         let mut done = false;
-        for ch in self.buf.chars() {
+        for (i, ch) in self.buf.chars().enumerate() {
             if i == at {
                 out.push(c);
                 done = true;
             }
             out.push(ch);
-            i += 1;
         }
         if !done {
             out.push(c);
@@ -232,12 +305,10 @@ impl Input {
         }
         let at = self.cursor - 1;
         let mut out = String::new();
-        let mut i = 0;
-        for ch in self.buf.chars() {
+        for (i, ch) in self.buf.chars().enumerate() {
             if i != at {
                 out.push(ch);
             }
-            i += 1;
         }
         self.buf = out;
         self.cursor -= 1;
@@ -249,12 +320,10 @@ impl Input {
             return;
         }
         let mut out = String::new();
-        let mut i = 0;
-        for ch in self.buf.chars() {
+        for (i, ch) in self.buf.chars().enumerate() {
             if i != at {
                 out.push(ch);
             }
-            i += 1;
         }
         self.buf = out;
     }
@@ -500,6 +569,10 @@ impl App {
                 self.handle_wizard(key, w)?;
                 Ok(false)
             }
+            Screen::Cloudflare(w) => {
+                self.handle_cloudflare(key, w)?;
+                Ok(false)
+            }
             Screen::ConfirmDelete { index } => {
                 self.handle_confirm(key, index)?;
                 Ok(false)
@@ -518,6 +591,15 @@ impl App {
     fn handle_menu(&mut self, key: KeyCode) -> bool {
         match key {
             KeyCode::Char('q') => return true,
+            KeyCode::Char('a') => self.activate_menu(0),
+            KeyCode::Char('u') => self.activate_menu(1),
+            KeyCode::Char('r') => self.activate_menu(2),
+            KeyCode::Char('p') => self.activate_menu(3),
+            KeyCode::Char('e') => self.activate_menu(4),
+            KeyCode::Char('s') => self.activate_menu(5),
+            KeyCode::Char('c') => self.activate_menu(6),
+            KeyCode::Char('d') => self.activate_menu(7),
+            KeyCode::Char('l') => self.activate_menu(8),
             KeyCode::Char('j') | KeyCode::Down => {
                 self.menu_selected = (self.menu_selected + 1) % MENU.len();
             }
@@ -542,12 +624,14 @@ impl App {
     fn activate_menu(&mut self, i: usize) {
         match i {
             0 => self.screen = Screen::Wizard(Wizard::new_add()),
-            1 => self.open_list(ListMode::Browse),
-            2 => self.open_list(ListMode::Edit),
-            3 => self.open_list(ListMode::Key),
-            4 => self.open_list(ListMode::Run),
-            5 => self.open_list(ListMode::Remove),
-            6 => self.open_list(ListMode::Log),
+            1 => self.open_list(ListMode::Update),
+            2 => self.open_list(ListMode::Run),
+            3 => self.open_list(ListMode::Browse),
+            4 => self.open_list(ListMode::Edit),
+            5 => self.open_list(ListMode::Key),
+            6 => self.screen = Screen::Cloudflare(CloudflareWizard::new(&self.config)),
+            7 => self.open_list(ListMode::Remove),
+            8 => self.open_list(ListMode::Log),
             _ => {}
         }
     }
@@ -581,7 +665,11 @@ impl App {
                 self.screen = Screen::Wizard(w);
             }
             ListMode::Run => {
-                self.trigger_run(i);
+                self.trigger_project(i, "run");
+                self.screen = Screen::Menu;
+            }
+            ListMode::Update => {
+                self.trigger_project(i, "update");
                 self.screen = Screen::Menu;
             }
             ListMode::Remove => self.screen = Screen::ConfirmDelete { index: i },
@@ -590,14 +678,17 @@ impl App {
         }
     }
 
-    fn trigger_run(&mut self, i: usize) {
+    fn trigger_project(&mut self, i: usize, action: &str) {
         let p = &self.config.projects[i];
         if let Ok(exe) = std::env::current_exe() {
             let _ = std::process::Command::new(exe)
-                .args(["run", "--id", p.id.as_str()])
+                .args([action, "--id", p.id.as_str()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn();
         }
-        self.last_msg = Some(format!("triggered {} — check the run log", p.id));
+        self.last_msg = Some(format!("{action} started for {} — check the run log", p.id));
     }
 
     fn open_log(&mut self, i: usize) {
@@ -622,7 +713,7 @@ impl App {
             match key {
                 KeyCode::Esc => {
                     w.browser = None;
-                    w.step = Step::Name;
+                    w.step = Step::Path;
                 }
                 KeyCode::Char('c') => self.finish_path(&mut w),
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
@@ -658,7 +749,7 @@ impl App {
                         w.error = Some("name is required".to_string());
                     } else {
                         w.error = None;
-                        self.open_browser(&mut w);
+                        w.step = Step::Repository;
                     }
                 }
                 KeyCode::Char(c) => w.name.insert(c),
@@ -670,39 +761,84 @@ impl App {
                 KeyCode::End => w.name.end(),
                 _ => {}
             },
-            Step::Path => self.open_browser(&mut w),
-            Step::Branch => match key {
-                KeyCode::Esc => self.open_browser(&mut w),
+            Step::Repository => match key {
+                KeyCode::Esc => w.step = Step::Name,
                 KeyCode::Enter => {
                     w.error = None;
-                    w.step = Step::Command;
+                    w.step = Step::Path;
                 }
-                KeyCode::Char(c) => w.branch.insert(c),
-                KeyCode::Backspace => w.branch.backspace(),
-                KeyCode::Delete => w.branch.delete(),
-                KeyCode::Left => w.branch.left(),
-                KeyCode::Right => w.branch.right(),
-                KeyCode::Home => w.branch.home(),
-                KeyCode::End => w.branch.end(),
+                key => edit_input(key, &mut w.repository),
+            },
+            Step::Path => match key {
+                KeyCode::Esc => w.step = Step::Repository,
+                KeyCode::Enter => {
+                    if w.path.value().trim().is_empty() {
+                        w.error = Some("absolute checkout path is required".to_string());
+                    } else {
+                        w.error = None;
+                        w.step = Step::Branch;
+                    }
+                }
+                KeyCode::Tab => self.open_browser(&mut w),
+                key => edit_input(key, &mut w.path),
+            },
+            Step::Branch => match key {
+                KeyCode::Esc => w.step = Step::Path,
+                KeyCode::Enter => {
+                    w.error = None;
+                    w.step = Step::Preset;
+                }
+                key => edit_input(key, &mut w.branch),
+            },
+            Step::Preset => match key {
+                KeyCode::Esc => w.step = Step::Branch,
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::Right => {
+                    w.preset = (w.preset + 1) % PRESETS.len();
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::Left => {
+                    w.preset = (w.preset + PRESETS.len() - 1) % PRESETS.len();
+                }
+                KeyCode::Enter => {
+                    w.error = None;
+                    w.step = Step::Deploy;
+                }
                 _ => {}
             },
-            Step::Command => match key {
-                KeyCode::Esc => w.step = Step::Branch,
+            Step::Deploy => {
+                let input = if PRESETS[w.preset].0 == "custom" {
+                    &mut w.command
+                } else {
+                    &mut w.compose_file
+                };
+                match key {
+                    KeyCode::Esc => w.step = Step::Preset,
+                    KeyCode::Enter => {
+                        w.error = None;
+                        w.step = if PRESETS[w.preset].0 == "custom" {
+                            Step::Verify
+                        } else {
+                            Step::Profiles
+                        };
+                    }
+                    key => edit_input(key, input),
+                }
+            }
+            Step::Profiles => match key {
+                KeyCode::Esc => w.step = Step::Deploy,
                 KeyCode::Enter => {
                     w.error = None;
                     w.step = Step::Verify;
                 }
-                KeyCode::Char(c) => w.command.insert(c),
-                KeyCode::Backspace => w.command.backspace(),
-                KeyCode::Delete => w.command.delete(),
-                KeyCode::Left => w.command.left(),
-                KeyCode::Right => w.command.right(),
-                KeyCode::Home => w.command.home(),
-                KeyCode::End => w.command.end(),
-                _ => {}
+                key => edit_input(key, &mut w.compose_profiles),
             },
             Step::Verify => match key {
-                KeyCode::Esc => w.step = Step::Command,
+                KeyCode::Esc => {
+                    w.step = if PRESETS[w.preset].0 == "custom" {
+                        Step::Deploy
+                    } else {
+                        Step::Profiles
+                    }
+                }
                 KeyCode::Char('j')
                 | KeyCode::Down
                 | KeyCode::Right
@@ -733,11 +869,15 @@ impl App {
                     let project = ProjectConfig {
                         id,
                         name,
-                        path: w.path.trim().to_string(),
+                        path: w.path.value().trim().to_string(),
                         branch: w.branch.value().trim().to_string(),
                         command: w.command.value().trim().to_string(),
                         secret: w.secret.clone(),
                         verify_mode,
+                        repository: w.repository.value().trim().to_string(),
+                        deploy_preset: PRESETS[w.preset].0.to_string(),
+                        compose_file: w.compose_file.value().trim().to_string(),
+                        compose_profiles: parse_profiles(w.compose_profiles.value()),
                     };
                     match project.validate() {
                         Ok(()) => {
@@ -766,7 +906,7 @@ impl App {
 
     /// Open the directory browser for the `path` field and move to `Step::Path`.
     fn open_browser(&mut self, w: &mut Wizard) {
-        let start = w.path.clone();
+        let start = w.path.value().to_string();
         let mut b = DirBrowser::new(&start);
         if !start.trim().is_empty() {
             // Existing path: preselect "use this folder" so Enter keeps it.
@@ -779,10 +919,65 @@ impl App {
     /// Accept the browser's current directory as the path and advance.
     fn finish_path(&mut self, w: &mut Wizard) {
         if let Some(b) = w.browser.take() {
-            w.path = b.cwd.to_string_lossy().to_string();
+            w.path = Input::new(&b.cwd.to_string_lossy());
         }
         w.error = None;
         w.step = Step::Branch;
+    }
+
+    fn handle_cloudflare(&mut self, key: KeyCode, mut w: CloudflareWizard) -> Result<()> {
+        match w.step {
+            CloudflareStep::Hostname => match key {
+                KeyCode::Esc => {
+                    self.screen = Screen::Menu;
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    if w.hostname.value().trim().is_empty() {
+                        w.error = Some("public hostname is required".to_string());
+                    } else {
+                        w.error = None;
+                        w.step = CloudflareStep::Token;
+                    }
+                }
+                key => edit_input(key, &mut w.hostname),
+            },
+            CloudflareStep::Token => match key {
+                KeyCode::Esc => w.step = CloudflareStep::Hostname,
+                KeyCode::Enter => {
+                    if w.token.value().trim().is_empty() {
+                        w.error = Some("scoped API token is required".to_string());
+                    } else {
+                        w.error = None;
+                        w.step = CloudflareStep::Confirm;
+                    }
+                }
+                key => edit_input(key, &mut w.token),
+            },
+            CloudflareStep::Confirm => match key {
+                KeyCode::Esc => w.step = CloudflareStep::Token,
+                KeyCode::Enter => {
+                    match cloudflare::provision(w.token.value(), w.hostname.value(), &self.config) {
+                        Ok(provisioned) => {
+                            let hostname = provisioned.config.hostname.clone();
+                            cloudflare::save(provisioned, &mut self.config)?;
+                            self.last_msg = Some(format!(
+                                "https://{hostname} configured — restart the daemon to connect"
+                            ));
+                            self.screen = Screen::Menu;
+                        }
+                        Err(error) => {
+                            w.error = Some(format!("{error:#}"));
+                            self.screen = Screen::Cloudflare(w);
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            },
+        }
+        self.screen = Screen::Cloudflare(w);
+        Ok(())
     }
 
     // ----- confirm-delete handling --------------------------------------
@@ -863,6 +1058,10 @@ impl App {
                 self.render_wizard(f, &w);
                 self.screen = Screen::Wizard(w);
             }
+            Screen::Cloudflare(w) => {
+                self.render_cloudflare(f, &w);
+                self.screen = Screen::Cloudflare(w);
+            }
             Screen::ConfirmDelete { index } => {
                 self.render_confirm(f, index);
                 self.screen = Screen::ConfirmDelete { index };
@@ -908,6 +1107,19 @@ impl App {
                 Span::styled(
                     format!("{:02}", self.config.projects.len()),
                     Style::default().fg(GOOD).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("    public  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    self.config
+                        .cloudflare
+                        .as_ref()
+                        .map(|c| c.hostname.as_str())
+                        .unwrap_or("not configured"),
+                    Style::default().fg(if self.config.cloudflare.is_some() {
+                        GOOD
+                    } else {
+                        MUTED
+                    }),
                 ),
             ]),
         ])
@@ -968,7 +1180,7 @@ impl App {
             Paragraph::new(key_hints(&[
                 ("j/k", "move"),
                 ("enter", "select"),
-                ("1-7", "jump"),
+                ("1-9/u/c", "jump"),
                 ("q", "quit"),
             ])),
             chunks[3],
@@ -980,6 +1192,7 @@ impl App {
             ListMode::Browse => " routes // inspect ",
             ListMode::Edit => " routes // select to edit ",
             ListMode::Run => " routes // select to run ",
+            ListMode::Update => " routes // select to update ",
             ListMode::Remove => " routes // select to remove ",
             ListMode::Key => " routes // select for secret ",
             ListMode::Log => " routes // select for log ",
@@ -1054,6 +1267,7 @@ impl App {
             ListMode::Browse => vec![("j/k", "move"), ("esc", "back")],
             ListMode::Edit => vec![("enter", "edit"), ("esc", "back")],
             ListMode::Run => vec![("enter", "run"), ("esc", "back")],
+            ListMode::Update => vec![("enter", "update"), ("esc", "back")],
             ListMode::Remove => vec![("enter", "remove"), ("esc", "back")],
             ListMode::Key => vec![("enter", "show secret"), ("esc", "back")],
             ListMode::Log => vec![("enter", "view log"), ("esc", "back")],
@@ -1073,13 +1287,16 @@ impl App {
             field_line("id", &p.id),
             field_line("name", &p.name),
             field_line("path", &p.path),
+            field_line("source", display_or_dash(&p.repository)),
             field_line("branch", &p.branch),
-            field_line("command", &p.command),
+            field_line("deploy", p.preset_label()),
+            if p.uses_compose() {
+                field_line("compose", &p.compose_file)
+            } else {
+                field_line("command", &p.command)
+            },
             field_line("verify", &p.verify_mode),
-            field_line(
-                "webhook",
-                &format!("http://{}/hooks/{}", self.config.listen_addr, p.id),
-            ),
+            field_line("webhook", &webhook_url(&self.config, &p.id)),
         ];
         let last_line = match self.last_runs.get(&p.id) {
             Some(r) => {
@@ -1142,9 +1359,31 @@ impl App {
                     Some(format!("id: {id}")),
                 );
             }
+            Step::Repository => self.render_text_body(
+                f,
+                v[1],
+                "Repository",
+                w.repository.value(),
+                w.repository.cursor,
+                Some(
+                    "optional Git URL; used to clone when the checkout path is absent".to_string(),
+                ),
+            ),
             Step::Path => {
                 if let Some(b) = &w.browser {
                     self.render_browser(f, v[1], b);
+                } else {
+                    self.render_text_body(
+                        f,
+                        v[1],
+                        "Checkout path",
+                        w.path.value(),
+                        w.path.cursor,
+                        Some(
+                            "absolute destination path; press Tab to browse existing folders"
+                                .to_string(),
+                        ),
+                    );
                 }
             }
             Step::Branch => self.render_text_body(
@@ -1155,13 +1394,37 @@ impl App {
                 w.branch.cursor,
                 Some("git branch to pull before running the command".to_string()),
             ),
-            Step::Command => self.render_text_body(
+            Step::Preset => self.render_presets(f, v[1], w),
+            Step::Deploy => {
+                if PRESETS[w.preset].0 == "custom" {
+                    self.render_text_body(
+                        f,
+                        v[1],
+                        "Command",
+                        w.command.value(),
+                        w.command.cursor,
+                        Some("shell command to run from the checkout directory".to_string()),
+                    );
+                } else {
+                    self.render_text_body(
+                        f,
+                        v[1],
+                        "Compose file",
+                        w.compose_file.value(),
+                        w.compose_file.cursor,
+                        Some(
+                            "relative path, e.g. compose.yaml or deploy/production.yml".to_string(),
+                        ),
+                    );
+                }
+            }
+            Step::Profiles => self.render_text_body(
                 f,
                 v[1],
-                "Command",
-                w.command.value(),
-                w.command.cursor,
-                Some("shell command to run after pull, e.g. ./deploy.sh".to_string()),
+                "Compose profiles",
+                w.compose_profiles.value(),
+                w.compose_profiles.cursor,
+                Some("optional comma-separated profiles, e.g. web,worker".to_string()),
             ),
             Step::Verify => self.render_verify(f, v[1], w),
             Step::Confirm => self.render_confirm_wizard(f, v[1], w),
@@ -1243,6 +1506,45 @@ impl App {
         f.render_widget(list, area);
     }
 
+    fn render_presets(&self, f: &mut Frame, area: Rect, w: &Wizard) {
+        let items = PRESETS
+            .iter()
+            .enumerate()
+            .map(|(i, (_, name, description))| {
+                let selected = i == w.preset;
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if selected { "[x] " } else { "[ ] " },
+                        Style::default().fg(if selected { ACCENT } else { MUTED }),
+                    ),
+                    Span::styled(
+                        format!("{name:<18}"),
+                        Style::default()
+                            .fg(if selected { ACCENT } else { TEXT })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(*description, Style::default().fg(MUTED)),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        f.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(
+                        " deployment // preset ",
+                        Style::default().fg(ACCENT),
+                    ))
+                    .border_style(Style::default().fg(MUTED)),
+            ),
+            area,
+        );
+    }
+
     fn render_confirm_wizard(&self, f: &mut Frame, area: Rect, w: &Wizard) {
         let id = match w.editing {
             Some(i) => self.config.projects[i].id.clone(),
@@ -1257,9 +1559,15 @@ impl App {
             Line::raw(""),
             field_line("id", &id),
             field_line("name", w.name.value().trim()),
-            field_line("path", w.path.trim()),
+            field_line("source", display_or_dash(w.repository.value().trim())),
+            field_line("path", w.path.value().trim()),
             field_line("branch", w.branch.value().trim()),
-            field_line("command", w.command.value().trim()),
+            field_line("deploy", PRESETS[w.preset].1),
+            if PRESETS[w.preset].0 == "custom" {
+                field_line("command", w.command.value().trim())
+            } else {
+                field_line("compose", w.compose_file.value().trim())
+            },
             field_line("verify", verify),
         ];
         let para = Paragraph::new(lines)
@@ -1349,6 +1657,121 @@ impl App {
         f.render_stateful_widget(list, chunks[1], &mut state);
     }
 
+    fn render_cloudflare(&self, f: &mut Frame, w: &CloudflareWizard) {
+        let area = f.area().inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Min(5),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let header = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "CLOUDFLARE TUNNEL",
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            )),
+            cloudflare_progress(w.step),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    " public ingress // port 9000 ",
+                    Style::default().fg(MUTED),
+                ))
+                .border_style(Style::default().fg(MUTED)),
+        );
+        f.render_widget(header, chunks[0]);
+
+        match w.step {
+            CloudflareStep::Hostname => self.render_text_body(
+                f,
+                chunks[1],
+                "Public hostname",
+                w.hostname.value(),
+                w.hostname.cursor,
+                Some(
+                    "example: hooks.example.com; the domain must already use Cloudflare DNS".into(),
+                ),
+            ),
+            CloudflareStep::Token => {
+                let masked = "*".repeat(w.token.value().chars().count());
+                self.render_text_body(
+                    f,
+                    chunks[1],
+                    "Scoped API token",
+                    &masked,
+                    w.token.cursor,
+                    Some(
+                        "needs Zone Read, DNS Write, and Cloudflare Tunnel Write; never retained"
+                            .into(),
+                    ),
+                );
+            }
+            CloudflareStep::Confirm => {
+                let lines = vec![
+                    Line::from(Span::styled(
+                        "Provision public ingress",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(""),
+                    field_line("public", &format!("https://{}", w.hostname.value().trim())),
+                    field_line(
+                        "origin",
+                        &format!("http://127.0.0.1:{}", listen_port(&self.config.listen_addr)),
+                    ),
+                    field_line("runtime", cloudflare::connector_label()),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        "This creates a remote-managed tunnel and proxied CNAME record.",
+                        Style::default().fg(MUTED),
+                    )),
+                ];
+                f.render_widget(
+                    Paragraph::new(lines).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(Span::styled(
+                                " confirm // Cloudflare API ",
+                                Style::default().fg(WARN),
+                            ))
+                            .border_style(Style::default().fg(MUTED)),
+                    ),
+                    chunks[1],
+                );
+            }
+        }
+        if let Some(error) = &w.error {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("! ", Style::default().fg(BAD).add_modifier(Modifier::BOLD)),
+                    Span::styled(error.as_str(), Style::default().fg(BAD)),
+                ])),
+                chunks[2],
+            );
+        }
+        f.render_widget(
+            Paragraph::new(key_hints(&[
+                (
+                    "enter",
+                    if w.step == CloudflareStep::Confirm {
+                        "provision"
+                    } else {
+                        "next"
+                    },
+                ),
+                ("esc", "back"),
+            ])),
+            chunks[3],
+        );
+    }
+
     fn render_confirm(&self, f: &mut Frame, index: usize) {
         let area = centered_rect(60, 25, f.area());
         f.render_widget(Clear, area);
@@ -1393,7 +1816,7 @@ impl App {
 
     fn render_key(&self, f: &mut Frame, index: usize) {
         let p = &self.config.projects[index];
-        let webhook = format!("http://{}/hooks/{}", self.config.listen_addr, p.id);
+        let webhook = webhook_url(&self.config, &p.id);
         let lines = vec![
             Line::from(vec![
                 Span::styled("Project ", Style::default().fg(MUTED)),
@@ -1548,14 +1971,17 @@ fn input_line(value: &str, cursor: usize) -> Line<'static> {
 
 /// Progress breadcrumb across the top of the wizard.
 fn step_progress(w: &Wizard) -> Line<'static> {
-    let steps = ["Name", "Path", "Branch", "Command", "Verify", "Confirm"];
+    let steps = [
+        "Name", "Source", "Path", "Branch", "Deploy", "Verify", "Confirm",
+    ];
     let cur = match w.step {
         Step::Name => 0,
-        Step::Path => 1,
-        Step::Branch => 2,
-        Step::Command => 3,
-        Step::Verify => 4,
-        Step::Confirm => 5,
+        Step::Repository => 1,
+        Step::Path => 2,
+        Step::Branch => 3,
+        Step::Preset | Step::Deploy | Step::Profiles => 4,
+        Step::Verify => 5,
+        Step::Confirm => 6,
     };
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, s) in steps.iter().enumerate() {
@@ -1590,11 +2016,100 @@ fn wizard_hints(w: &Wizard) -> Line<'static> {
     } else {
         match w.step {
             Step::Name => key_hints(&[("enter", "next"), ("esc", "cancel")]),
-            Step::Path => key_hints(&[("c", "choose"), ("esc", "back")]),
-            Step::Branch | Step::Command => key_hints(&[("enter", "next"), ("esc", "back")]),
+            Step::Repository | Step::Branch | Step::Deploy | Step::Profiles => {
+                key_hints(&[("enter", "next"), ("esc", "back")])
+            }
+            Step::Path => key_hints(&[("tab", "browse"), ("enter", "next"), ("esc", "back")]),
+            Step::Preset => key_hints(&[("j/k", "choose"), ("enter", "next"), ("esc", "back")]),
             Step::Verify => key_hints(&[("j/k", "toggle"), ("enter", "next"), ("esc", "back")]),
             Step::Confirm => key_hints(&[("enter", "save"), ("esc", "back")]),
         }
+    }
+}
+
+fn cloudflare_progress(current: CloudflareStep) -> Line<'static> {
+    let names = ["Hostname", "Token", "Provision"];
+    let active = match current {
+        CloudflareStep::Hostname => 0,
+        CloudflareStep::Token => 1,
+        CloudflareStep::Confirm => 2,
+    };
+    progress_line(&names, active)
+}
+
+fn progress_line(names: &[&str], active: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" > ", Style::default().fg(MUTED)));
+        }
+        let (mark, color) = if index < active {
+            ("x", GOOD)
+        } else if index == active {
+            (">", ACCENT)
+        } else {
+            (" ", MUTED)
+        };
+        spans.push(Span::styled(
+            format!("[{mark}] {name}"),
+            Style::default().fg(color).add_modifier(if index == active {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn edit_input(key: KeyCode, input: &mut Input) {
+    match key {
+        KeyCode::Char(c) => input.insert(c),
+        KeyCode::Backspace => input.backspace(),
+        KeyCode::Delete => input.delete(),
+        KeyCode::Left => input.left(),
+        KeyCode::Right => input.right(),
+        KeyCode::Home => input.home(),
+        KeyCode::End => input.end(),
+        _ => {}
+    }
+}
+
+fn parse_profiles(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn preset_index(value: &str) -> usize {
+    PRESETS
+        .iter()
+        .position(|preset| preset.0 == value)
+        .unwrap_or(3)
+}
+
+fn display_or_dash(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "-"
+    } else {
+        value
+    }
+}
+
+fn listen_port(address: &str) -> u16 {
+    address
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or(9000)
+}
+
+fn webhook_url(config: &AppConfig, project_id: &str) -> String {
+    match &config.cloudflare {
+        Some(tunnel) => format!("https://{}/hooks/{project_id}", tunnel.hostname),
+        None => format!("http://{}/hooks/{project_id}", config.listen_addr),
     }
 }
 

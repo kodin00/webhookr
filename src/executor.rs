@@ -1,7 +1,8 @@
-//! Runs a project's deploy: `git fetch`/`checkout`/`pull`, then a shell command.
+//! Synchronizes project sources and runs deployment presets.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::io::Write;
+use std::path::Path;
 use std::time::Instant;
 use tokio::process::Command;
 
@@ -11,10 +12,17 @@ use crate::state::RunRecord;
 /// Rough cap for the summary line derived from command output.
 const MAX_MESSAGE_CHARS: usize = 200;
 
-/// Run `git fetch/checkout/pull` then the project command, logging output and
-/// recording a [`RunRecord`]. Returns the final record on success; returns an
-/// `Err` only for infrastructure errors (bad path, log write failure, ...).
+/// Clone or fast-forward the source, then deploy it.
 pub async fn run_project(p: &ProjectConfig) -> Result<RunRecord> {
+    run(p, true).await
+}
+
+/// Re-run the configured deployment without touching the Git checkout.
+pub async fn deploy_project(p: &ProjectConfig) -> Result<RunRecord> {
+    run(p, false).await
+}
+
+async fn run(p: &ProjectConfig, sync_source: bool) -> Result<RunRecord> {
     p.validate()?;
     crate::config::ensure_dirs()?;
 
@@ -33,49 +41,179 @@ pub async fn run_project(p: &ProjectConfig) -> Result<RunRecord> {
         .append(true)
         .open(&log_path)
         .with_context(|| format!("failed to open log {}", log_path.display()))?;
-    writeln!(log, "# webhookr run {id} for {} started {started_at}", p.name)?;
+    let action = if sync_source { "update" } else { "deploy" };
+    writeln!(
+        log,
+        "# webhookr {action} {id} for {} started {started_at}",
+        p.name
+    )?;
 
     // Everything printed by any command, so the summary can pick the last line.
     let mut combined = String::new();
 
-    // Git steps, in order. `--ff-only` turns a dirty tree into a clean failure
-    // instead of a merge.
-    let git_steps: [(&str, Vec<&str>); 3] = [
-        ("fetch", vec!["fetch", "origin"]),
-        ("checkout", vec!["checkout", p.branch.as_str()]),
-        ("pull", vec!["pull", "--ff-only", "origin", p.branch.as_str()]),
-    ];
-    for (step, args) in git_steps.iter() {
-        let output = Command::new("git")
-            .args(args.as_slice())
-            .current_dir(&p.path)
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn git {step}"))?;
-        record_output(&mut log, &mut combined, &format!("git {step}"), &output)?;
-
-        if !output.status.success() {
-            let message = match last_line(&combined) {
-                Some(line) => format!("git pull failed: {line}"),
-                None => "git pull failed".to_string(),
-            };
-            return finalize(&mut log, &id, &p.id, &started_at, started, "failed", message);
+    if sync_source {
+        if let Err(message) = sync_project(p, &mut log, &mut combined).await {
+            return finalize(
+                &mut log,
+                &id,
+                &p.id,
+                &started_at,
+                started,
+                "failed",
+                message,
+            );
         }
     }
 
-    // Deploy command through a shell so pipes/redirects behave as written.
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(&p.command)
-        .current_dir(&p.path)
-        .output()
-        .await
-        .context("failed to spawn deploy command")?;
-    record_output(&mut log, &mut combined, "command", &output)?;
-
-    let status = if output.status.success() { "success" } else { "failed" };
+    let deploy_ok = match deploy(p, &mut log, &mut combined).await {
+        Ok(ok) => ok,
+        Err(error) => {
+            writeln!(log, "--- deployment error ---\n{error:#}")?;
+            combined.push_str(&format!("deployment failed: {error:#}\n"));
+            false
+        }
+    };
+    let status = if deploy_ok { "success" } else { "failed" };
     let message = last_line(&combined).unwrap_or_else(|| "no output".to_string());
     finalize(&mut log, &id, &p.id, &started_at, started, status, message)
+}
+
+async fn sync_project(
+    p: &ProjectConfig,
+    log: &mut std::fs::File,
+    combined: &mut String,
+) -> std::result::Result<(), String> {
+    let path = Path::new(&p.path);
+    if !path.exists() {
+        if p.repository.trim().is_empty() {
+            return Err(format!("project path does not exist: {}", p.path));
+        }
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                return Err(format!("could not create {}: {error}", parent.display()));
+            }
+        }
+        let output = Command::new("git")
+            .args([
+                "clone",
+                "--branch",
+                p.branch.as_str(),
+                "--single-branch",
+                p.repository.as_str(),
+                p.path.as_str(),
+            ])
+            .output()
+            .await
+            .map_err(|error| format!("failed to spawn git clone: {error}"))?;
+        record_output(log, combined, "git clone", &output)
+            .map_err(|error| format!("failed to record git clone: {error}"))?;
+        return output
+            .status
+            .success()
+            .then_some(())
+            .ok_or_else(|| last_error("git clone failed", combined));
+    }
+
+    if !path.join(".git").exists() {
+        return Err(format!("project path is not a Git checkout: {}", p.path));
+    }
+
+    let git_steps: [(&str, Vec<&str>); 3] = [
+        ("fetch", vec!["fetch", "origin", p.branch.as_str()]),
+        ("checkout", vec!["checkout", p.branch.as_str()]),
+        (
+            "pull",
+            vec!["pull", "--ff-only", "origin", p.branch.as_str()],
+        ),
+    ];
+    for (step, args) in git_steps {
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(path)
+            .output()
+            .await
+            .map_err(|error| format!("failed to spawn git {step}: {error}"))?;
+        record_output(log, combined, &format!("git {step}"), &output)
+            .map_err(|error| format!("failed to record git {step}: {error}"))?;
+        if !output.status.success() {
+            return Err(last_error(&format!("git {step} failed"), combined));
+        }
+    }
+    Ok(())
+}
+
+async fn deploy(p: &ProjectConfig, log: &mut std::fs::File, combined: &mut String) -> Result<bool> {
+    if !Path::new(&p.path).exists() {
+        bail!("project path does not exist: {}", p.path);
+    }
+    if p.uses_compose() {
+        let compose_path = Path::new(&p.path).join(&p.compose_file);
+        if !compose_path.is_file() {
+            bail!("compose file does not exist: {}", compose_path.display());
+        }
+        let mut base = vec!["compose", "-f", p.compose_file.as_str()];
+        for profile in &p.compose_profiles {
+            base.extend(["--profile", profile.as_str()]);
+        }
+        if p.deploy_preset == "compose_pull" {
+            let mut pull = base.clone();
+            pull.push("pull");
+            if !run_command(
+                "docker",
+                &pull,
+                &p.path,
+                "docker compose pull",
+                log,
+                combined,
+            )
+            .await?
+            {
+                return Ok(false);
+            }
+        }
+        let mut up = base;
+        up.extend(["up", "-d"]);
+        if p.deploy_preset == "compose_build" {
+            up.push("--build");
+        }
+        up.push("--remove-orphans");
+        run_command("docker", &up, &p.path, "docker compose up", log, combined).await
+    } else {
+        run_command(
+            "sh",
+            &["-c", p.command.as_str()],
+            &p.path,
+            "custom command",
+            log,
+            combined,
+        )
+        .await
+    }
+}
+
+async fn run_command(
+    program: &str,
+    args: &[&str],
+    cwd: &str,
+    label: &str,
+    log: &mut std::fs::File,
+    combined: &mut String,
+) -> Result<bool> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn {label}"))?;
+    record_output(log, combined, label, &output)?;
+    Ok(output.status.success())
+}
+
+fn last_error(prefix: &str, output: &str) -> String {
+    match last_line(output) {
+        Some(line) => format!("{prefix}: {line}"),
+        None => prefix.to_string(),
+    }
 }
 
 /// Append one command's stdout and stderr (labeled) to the log and to the
@@ -129,7 +267,10 @@ fn finalize(
         message,
     };
 
-    writeln!(log, "# webhookr run {id} finished ({status}) in {duration_ms}ms")?;
+    writeln!(
+        log,
+        "# webhookr run {id} finished ({status}) in {duration_ms}ms"
+    )?;
     crate::state::append_run(record.clone())?;
     Ok(record)
 }
@@ -138,8 +279,7 @@ fn finalize(
 fn last_line(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .next_back()
+        .rfind(|l| !l.is_empty())
         .map(truncate)
 }
 
@@ -151,5 +291,79 @@ fn truncate(s: &str) -> String {
         let mut out: String = s.chars().take(MAX_MESSAGE_CHARS).collect();
         out.push_str("...");
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::process::Command as StdCommand;
+
+    use super::sync_project;
+    use crate::config::ProjectConfig;
+
+    #[tokio::test]
+    async fn clones_missing_checkout_and_fast_forwards_existing_checkout() {
+        let root =
+            std::env::temp_dir().join(format!("webhookr-executor-{}", crate::util::new_run_id()));
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let checkout = root.join("checkout");
+        fs::create_dir_all(&seed).unwrap();
+        git(&root, &["init", "--bare", remote.to_str().unwrap()]);
+        git(&seed, &["init", "-b", "main"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        git(&seed, &["config", "user.name", "Webhookr Test"]);
+        fs::write(seed.join("version.txt"), "one").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-m", "initial"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "main"]);
+
+        let mut project = ProjectConfig::new(
+            "site".into(),
+            "Site".into(),
+            checkout.to_string_lossy().into_owned(),
+            "main".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        project.repository = remote.to_string_lossy().into_owned();
+        let log_path = root.join("test.log");
+        let mut log = fs::File::create(&log_path).unwrap();
+        let mut combined = String::new();
+        sync_project(&project, &mut log, &mut combined)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "one"
+        );
+
+        fs::write(seed.join("version.txt"), "two").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-m", "update"]);
+        git(&seed, &["push"]);
+        sync_project(&project, &mut log, &mut combined)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "two"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn git(cwd: &std::path::Path, args: &[&str]) {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
     }
 }

@@ -10,6 +10,7 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::cloudflare;
 use crate::config::{self, ProjectConfig};
 use crate::executor;
 use crate::util;
@@ -23,11 +24,30 @@ pub async fn serve(port: Option<u16>) -> Result<()> {
     }
     config::ensure_dirs()?;
 
+    let _tunnel = match cloudflare::spawn_connector(&cfg) {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("webhookr: Cloudflare Tunnel is not running: {error:#}");
+            None
+        }
+    };
+
     println!("webhookr listening on http://{}", cfg.listen_addr);
     for project in &cfg.projects {
         println!(
             "  POST /hooks/{}  ->  {}  (branch {})",
             project.id, project.name, project.branch
+        );
+    }
+    if let Some(tunnel) = &cfg.cloudflare {
+        println!(
+            "  PUBLIC https://{}  ->  http://127.0.0.1:{}  ({})",
+            tunnel.hostname,
+            cfg.listen_addr
+                .rsplit_once(':')
+                .map(|(_, port)| port)
+                .unwrap_or("9000"),
+            cloudflare::connector_label()
         );
     }
 
@@ -88,9 +108,9 @@ async fn webhook(
         );
     }
 
-    let _ = tokio::spawn(async move {
+    std::mem::drop(tokio::spawn(async move {
         let _ = executor::run_project(&project).await;
-    });
+    }));
 
     (
         StatusCode::ACCEPTED,
