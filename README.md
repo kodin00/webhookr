@@ -8,6 +8,8 @@ Projects can also be cloned automatically from a repository URL and deployed
 with built-in Docker Compose presets. An optional Cloudflare Tunnel can publish
 the webhook listener at a real HTTPS hostname without opening port 9000.
 
+Manage it from a terminal UI, a CLI, or an optional browser dashboard.
+
 ## Install
 
 Every merge to `master` builds release binaries and publishes them to the
@@ -38,7 +40,12 @@ To build from source instead, see [Build](#build).
   `git fetch` / `checkout` / `pull` runs before the command.
 - Projects and the listen address live in one JSON config file, shared between
   the daemon and the management CLI/TUI.
-- Run history and per-run logs are written to a separate state directory.
+- Run history and per-run logs are written to a separate state directory. Logs
+  stream to disk as commands produce them, so a long `docker compose build` can
+  be followed while it runs rather than only after it finishes.
+- Only one run per project happens at a time; a trigger arriving while that
+  project is already deploying is refused rather than queued, so two pushes
+  cannot race `git pull` on the same checkout.
 
 ## Prerequisites
 
@@ -86,7 +93,9 @@ Run `webhookr --help` for the same list.
 | Command | Description |
 | --- | --- |
 | `webhookr` | Launch the interactive TUI (blocks until you quit). |
-| `webhookr serve [-p, --port <PORT>]` | Run the daemon in the foreground; `--port` overrides the configured port. |
+| `webhookr serve [-p, --port <PORT>] [--web] [--no-web] [--web-port <PORT>]` | Run the daemon in the foreground; `--port` overrides the configured port. `--web` starts the admin UI for this run only. |
+| `webhookr web enable [--addr <ADDR>] [--hostname <HOST>]` | Turn the browser admin UI on (persisted). |
+| `webhookr web disable` / `webhookr web status` | Turn it off / show its status. |
 | `webhookr status` | Show the listen address, whether the daemon is up, and every project with its webhook URL and last-run status. |
 | `webhookr list` | Table of configured projects, deployment presets, and last-run state. |
 | `webhookr add [...]` | Add a project from a local checkout or repository URL. |
@@ -94,9 +103,9 @@ Run `webhookr --help` for the same list.
 | `webhookr remove --id <ID> [--yes]` | Remove a project (prompts for confirmation unless `--yes`). |
 | `webhookr key --id <ID> [--rotate]` | Show the project's secret (and webhook URL); `--rotate` generates a new one. |
 | `webhookr logs --id <ID> [--lines <N>]` | Tail the latest run's log (default 50 lines). |
-| `webhookr run --id <ID>` | Re-run deployment without touching the Git checkout. |
+| `webhookr run --id <ID> [--no-pull]` | Pull the latest source, then run the deployment; `--no-pull` deploys the checkout as-is. |
 | `webhookr update --id <ID>` | Clone or fast-forward the source, then deploy it. |
-| `webhookr cloudflare --hostname hooks.example.com` | Provision a Cloudflare Tunnel; reads `CLOUDFLARE_API_TOKEN` or `--api-token`. |
+| `webhookr cloudflare --hostname hooks.example.com [--admin-hostname deploy.example.com]` | Provision a Cloudflare Tunnel; reads `CLOUDFLARE_API_TOKEN` or `--api-token`. |
 
 ## Deployment presets
 
@@ -116,6 +125,71 @@ If `--repository` is set and the project path does not exist, the first update
 clones that branch into the path. Later updates fetch, check out, and fast-forward
 the same branch. Existing configs continue to use the `custom` preset.
 
+## Web admin UI
+
+An optional browser dashboard that does everything the TUI does — add, edit and
+remove projects, reveal and rotate secrets, trigger deploys, watch run logs
+stream live, and configure the Cloudflare Tunnel — with ordinary web forms
+instead of a nine-step terminal wizard.
+
+> **It has no login.** Anyone who can reach it can set a project's deploy
+> command and run it as the daemon's user. Put Cloudflare Access (or an
+> equivalent) in front of it before exposing it, and set `User=` in the systemd
+> unit so that user is not root.
+
+It is **off by default**. Turn it on with:
+
+```sh
+webhookr web enable --addr 127.0.0.1:9010
+sudo systemctl restart webhookr
+```
+
+The UI then runs inside the same `webhookr serve` process as the webhook
+listener, on its own port — no second service to manage.
+
+### Reaching it
+
+The default bind is `127.0.0.1`, which is deliberate and still works through a
+Cloudflare Tunnel: `cloudflared` runs on the same host and connects to
+`http://127.0.0.1:<port>`. Binding to `0.0.0.0` would additionally expose the
+panel on the LAN and the server's public IP, where Access cannot protect it.
+
+To publish it, give it its own hostname:
+
+```sh
+export CLOUDFLARE_API_TOKEN='scoped-token'
+webhookr cloudflare --hostname hooks.example.com --admin-hostname deploy.example.com
+sudo systemctl restart webhookr
+```
+
+The admin UI **must** use a hostname separate from the webhook listener: an
+Access policy on the webhook hostname would break GitHub, which cannot complete
+an Access login. Then add an Access policy on `deploy.example.com`.
+
+For a quick look without persisting anything, and without exposing it at all:
+
+```sh
+webhookr serve --web --web-port 9010    # then browse http://127.0.0.1:9010
+```
+
+### What's in it
+
+| Page | What it does |
+| --- | --- |
+| `/` | Project cards with live status badges, and one-click deploy buttons. |
+| `/projects/new`, `/projects/{id}/edit` | The whole project form on one page, with a server-side directory picker for the checkout path. |
+| `/projects/{id}` | Config, webhook URL, reveal-on-click secret, recent runs. |
+| `/runs`, `/runs/{id}` | Run history and a log view that streams while a deploy is running, then stops polling by itself. |
+| `/settings`, `/settings/cloudflare` | Listen addresses and tunnel provisioning. |
+
+Requests that change anything are rejected unless the browser reports them as
+same-origin, so a page on another site cannot drive the panel using your Access
+session. Set `require_access_header` in the config to additionally reject any
+request that did not arrive through Cloudflare Access.
+
+There is no build step and no CDN: the UI is server-rendered HTML, and htmx plus
+the stylesheet are compiled into the binary.
+
 ## TUI key bindings
 
 | Key | Action |
@@ -130,6 +204,7 @@ the same branch. Existing configs continue to use the `custom` preset.
 | `l` | View the selected project's log |
 | `q` | Quit |
 | `c` | Configure Cloudflare Tunnel |
+| `w` | Toggle the web admin UI on or off |
 
 ## Configuring a GitHub webhook
 

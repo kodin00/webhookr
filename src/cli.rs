@@ -26,6 +26,20 @@ pub enum Commands {
         /// Override the listen port
         #[arg(long, short)]
         port: Option<u16>,
+        /// Start the web admin UI for this run only (not persisted)
+        #[arg(long)]
+        web: bool,
+        /// Do not start the web admin UI, even if it is enabled in config
+        #[arg(long, conflicts_with = "web")]
+        no_web: bool,
+        /// Override the admin UI port for this run only
+        #[arg(long)]
+        web_port: Option<u16>,
+    },
+    /// Manage the web admin UI
+    Web {
+        #[command(subcommand)]
+        action: WebAction,
     },
     /// Show daemon + project status
     Status,
@@ -102,10 +116,13 @@ pub enum Commands {
         #[arg(long, default_value_t = 50)]
         lines: usize,
     },
-    /// Re-run a project's deployment without updating its source
+    /// Pull the latest source, then run the project's deployment
     Run {
         #[arg(long)]
         id: String,
+        /// Skip the Git update and deploy the checkout as-is
+        #[arg(long)]
+        no_pull: bool,
     },
     /// Clone or pull the latest source, then deploy it
     Update {
@@ -120,7 +137,27 @@ pub enum Commands {
         /// Public hostname, for example hooks.example.com
         #[arg(long)]
         hostname: String,
+        /// Separate public hostname for the web admin UI
+        #[arg(long)]
+        admin_hostname: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum WebAction {
+    /// Turn the admin UI on (persisted to config.json)
+    Enable {
+        /// Bind address. Loopback still works through a Cloudflare Tunnel.
+        #[arg(long, default_value = "127.0.0.1:9010")]
+        addr: String,
+        /// Public hostname to route to the admin UI through the tunnel
+        #[arg(long)]
+        hostname: Option<String>,
+    },
+    /// Turn the admin UI off
+    Disable,
+    /// Show admin UI status and URLs
+    Status,
 }
 
 /// Parse args and dispatch to the appropriate module.
@@ -128,7 +165,22 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => tui::run(),
-        Some(Commands::Serve { port }) => server::serve(port).await,
+        Some(Commands::Serve {
+            port,
+            web,
+            no_web,
+            web_port,
+        }) => {
+            server::serve(
+                port,
+                server::WebOverride {
+                    enable: web,
+                    disable: no_web,
+                    port: web_port,
+                },
+            )
+            .await
+        }
         Some(cmd) => handle(cmd).await,
     }
 }
@@ -137,6 +189,7 @@ pub async fn run() -> Result<()> {
 async fn handle(cmd: Commands) -> Result<()> {
     match cmd {
         Commands::Serve { .. } => unreachable!("serve is handled in run()"),
+        Commands::Web { action } => cmd_web(action),
         Commands::Status => cmd_status(),
         Commands::List => cmd_list(),
         Commands::Add {
@@ -188,12 +241,13 @@ async fn handle(cmd: Commands) -> Result<()> {
         Commands::Remove { id, yes } => cmd_remove(id, yes),
         Commands::Key { id, rotate } => cmd_key(id, rotate),
         Commands::Logs { id, lines } => cmd_logs(id, lines),
-        Commands::Run { id } => cmd_run(id).await,
+        Commands::Run { id, no_pull } => cmd_run(id, no_pull).await,
         Commands::Update { id } => cmd_update(id).await,
         Commands::Cloudflare {
             api_token,
             hostname,
-        } => cmd_cloudflare(api_token, hostname),
+            admin_hostname,
+        } => cmd_cloudflare(api_token, hostname, admin_hostname),
     }
 }
 
@@ -228,7 +282,7 @@ fn required(value: Option<String>, label: &str) -> Result<String> {
 
 /// Derive a URL slug from a name: lowercase, spaces to `-`, strip everything
 /// that isn't alphanumeric, `-`, or `_`.
-fn slugify(name: &str) -> String {
+pub(crate) fn slugify(name: &str) -> String {
     let mut out = String::new();
     for c in name.trim().to_lowercase().chars() {
         if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -499,10 +553,14 @@ fn cmd_logs(id: String, lines: usize) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_run(id: String) -> Result<()> {
+async fn cmd_run(id: String, no_pull: bool) -> Result<()> {
     let cfg = config::load_config()?;
     let p = cfg.get(&id).context(format!("unknown project id: {id}"))?;
-    let record = executor::deploy_project(p).await?;
+    let record = if no_pull {
+        executor::deploy_project(p).await?
+    } else {
+        executor::run_project(p).await?
+    };
 
     print_run_result(record);
     Ok(())
@@ -526,19 +584,84 @@ fn print_run_result(record: state::RunRecord) {
     println!("log: {}", state::run_log_path(&record.id).display());
 }
 
-fn cmd_cloudflare(api_token: String, hostname: String) -> Result<()> {
+fn cmd_web(action: WebAction) -> Result<()> {
+    match action {
+        WebAction::Enable { addr, hostname } => {
+            config::update_config(|cfg| {
+                cfg.web.enabled = true;
+                cfg.web.listen_addr = addr.clone();
+                if let Some(hostname) = &hostname {
+                    cfg.web.hostname = Some(hostname.clone());
+                }
+                cfg.web.validate(&cfg.listen_addr)
+            })?;
+
+            println!("web admin UI enabled on http://{addr}");
+            if let Some(hostname) = &hostname {
+                println!("public hostname: https://{hostname}");
+                println!("run 'webhookr cloudflare --hostname <webhook-host> --admin-hostname {hostname}' to route it");
+            }
+            println!();
+            println!("!! The admin UI has NO authentication. Anyone who can reach it can set a");
+            println!("   project's deploy command and run it as this user. Put Cloudflare Access");
+            println!("   (or equivalent) in front of it before exposing it.");
+            println!();
+            println!("restart 'webhookr serve' to start the UI");
+        }
+        WebAction::Disable => {
+            config::update_config(|cfg| {
+                cfg.web.enabled = false;
+                Ok(())
+            })?;
+            println!("web admin UI disabled; restart 'webhookr serve' to stop it");
+        }
+        WebAction::Status => {
+            let cfg = config::load_config()?;
+            if cfg.web.enabled {
+                println!("web admin UI: enabled on http://{}", cfg.web.listen_addr);
+            } else {
+                println!("web admin UI: disabled");
+            }
+            match cfg
+                .cloudflare
+                .as_ref()
+                .and_then(|tunnel| tunnel.admin_hostname.as_deref())
+                .or(cfg.web.hostname.as_deref())
+            {
+                Some(hostname) => println!("public hostname: https://{hostname}"),
+                None => println!("public hostname: (none)"),
+            }
+            println!(
+                "access header required: {}",
+                if cfg.web.require_access_header {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_cloudflare(api_token: String, hostname: String, admin_hostname: Option<String>) -> Result<()> {
     let mut cfg = config::load_config()?;
-    let provisioned = cloudflare::provision(&api_token, &hostname, &cfg)?;
+    // Fall back to the hostname already recorded for the admin UI, so a plain
+    // re-run does not silently drop the admin ingress rule.
+    let admin = admin_hostname.or_else(|| cfg.web.hostname.clone());
+    let provisioned = cloudflare::provision(&api_token, &hostname, admin.as_deref(), &cfg)?;
     let public_hostname = provisioned.config.hostname.clone();
+    let admin_public = provisioned.config.admin_hostname.clone();
+    cfg.web.hostname = admin_public.clone();
     cloudflare::save(provisioned, &mut cfg)?;
+
     println!("Cloudflare Tunnel configured: https://{public_hostname}");
+    if let Some(admin_public) = &admin_public {
+        println!("admin UI: https://{admin_public}");
+        println!("!! add a Cloudflare Access policy on that hostname — the UI has no login");
+    }
     println!("restart 'webhookr serve' to start the connector");
     Ok(())
 }
 
-fn webhook_url(config: &config::AppConfig, project_id: &str) -> String {
-    match &config.cloudflare {
-        Some(tunnel) => format!("https://{}/hooks/{project_id}", tunnel.hostname),
-        None => format!("http://{}/hooks/{project_id}", config.listen_addr),
-    }
-}
+use crate::config::webhook_url;

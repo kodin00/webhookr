@@ -1,8 +1,11 @@
 //! Synchronizes project sources and runs deployment presets.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+use std::process::Stdio;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 use tokio::process::Command;
 
@@ -12,12 +15,31 @@ use crate::state::RunRecord;
 /// Rough cap for the summary line derived from command output.
 const MAX_MESSAGE_CHARS: usize = 200;
 
+/// One lock per project id, so concurrent triggers for the *same* project
+/// serialize while different projects still deploy in parallel.
+///
+/// The outer `std::sync::Mutex` only guards map lookup and is never held across
+/// an `.await`; the inner lock is a `tokio::sync::Mutex` because it is held for
+/// the entire run.
+static PROJECT_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn project_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    PROJECT_LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(project_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Clone or fast-forward the source, then deploy it.
 pub async fn run_project(p: &ProjectConfig) -> Result<RunRecord> {
     run(p, true).await
 }
 
 /// Re-run the configured deployment without touching the Git checkout.
+/// Used only as an explicit escape hatch (`run --no-pull`, TUI "Run deployment").
 pub async fn deploy_project(p: &ProjectConfig) -> Result<RunRecord> {
     run(p, false).await
 }
@@ -25,6 +47,15 @@ pub async fn deploy_project(p: &ProjectConfig) -> Result<RunRecord> {
 async fn run(p: &ProjectConfig, sync_source: bool) -> Result<RunRecord> {
     p.validate()?;
     crate::config::ensure_dirs()?;
+
+    // Single-flight per project: a webhook and a manual trigger must not race
+    // `git pull` and `docker compose up` on the same checkout. `try_lock`
+    // rather than `lock().await`, so a run that hangs (there is no timeout yet)
+    // cannot wedge the project behind an invisible queue.
+    let lock = project_lock(&p.id);
+    let Ok(_guard) = lock.try_lock() else {
+        bail!("a run for {} is already in progress", p.id);
+    };
 
     let id = crate::util::new_run_id();
     let started_at = crate::util::now_iso();
@@ -48,11 +79,23 @@ async fn run(p: &ProjectConfig, sync_source: bool) -> Result<RunRecord> {
         p.name
     )?;
 
-    // Everything printed by any command, so the summary can pick the last line.
-    let mut combined = String::new();
+    // Publish a `running` record up front so the daemon, CLI and web UI can all
+    // see an in-flight deploy. `finalize` replaces it by id when the run ends.
+    // Best-effort: failing to write history must not abort the deployment.
+    if let Err(error) = crate::state::append_run(RunRecord {
+        id: id.clone(),
+        project_id: p.id.clone(),
+        started_at: started_at.clone(),
+        finished_at: None,
+        status: "running".to_string(),
+        duration_ms: 0,
+        message: format!("{action} in progress"),
+    }) {
+        eprintln!("webhookr: could not record run start: {error:#}");
+    }
 
     if sync_source {
-        if let Err(message) = sync_project(p, &mut log, &mut combined).await {
+        if let Err(message) = sync_project(p, &mut log, &log_path).await {
             return finalize(
                 &mut log,
                 &id,
@@ -65,23 +108,22 @@ async fn run(p: &ProjectConfig, sync_source: bool) -> Result<RunRecord> {
         }
     }
 
-    let deploy_ok = match deploy(p, &mut log, &mut combined).await {
+    let deploy_ok = match deploy(p, &mut log).await {
         Ok(ok) => ok,
         Err(error) => {
             writeln!(log, "--- deployment error ---\n{error:#}")?;
-            combined.push_str(&format!("deployment failed: {error:#}\n"));
             false
         }
     };
     let status = if deploy_ok { "success" } else { "failed" };
-    let message = last_line(&combined).unwrap_or_else(|| "no output".to_string());
+    let message = summary_line(&log_path).unwrap_or_else(|| "no output".to_string());
     finalize(&mut log, &id, &p.id, &started_at, started, status, message)
 }
 
 async fn sync_project(
     p: &ProjectConfig,
     log: &mut std::fs::File,
-    combined: &mut String,
+    log_path: &Path,
 ) -> std::result::Result<(), String> {
     let path = Path::new(&p.path);
     if !path.exists() {
@@ -93,25 +135,30 @@ async fn sync_project(
                 return Err(format!("could not create {}: {error}", parent.display()));
             }
         }
-        let output = Command::new("git")
-            .args([
+        // Clone runs from the parent: the target directory does not exist yet.
+        let cwd = path
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let ok = run_command(
+            "git",
+            &[
                 "clone",
                 "--branch",
                 p.branch.as_str(),
                 "--single-branch",
                 p.repository.as_str(),
                 p.path.as_str(),
-            ])
-            .output()
-            .await
-            .map_err(|error| format!("failed to spawn git clone: {error}"))?;
-        record_output(log, combined, "git clone", &output)
-            .map_err(|error| format!("failed to record git clone: {error}"))?;
-        return output
-            .status
-            .success()
+            ],
+            &cwd,
+            "git clone",
+            log,
+        )
+        .await
+        .map_err(|error| format!("failed to run git clone: {error:#}"))?;
+        return ok
             .then_some(())
-            .ok_or_else(|| last_error("git clone failed", combined));
+            .ok_or_else(|| last_error("git clone failed", log_path));
     }
 
     if !path.join(".git").exists() {
@@ -127,22 +174,18 @@ async fn sync_project(
         ),
     ];
     for (step, args) in git_steps {
-        let output = Command::new("git")
-            .args(&args)
-            .current_dir(path)
-            .output()
+        let label = format!("git {step}");
+        let ok = run_command("git", &args, &p.path, &label, log)
             .await
-            .map_err(|error| format!("failed to spawn git {step}: {error}"))?;
-        record_output(log, combined, &format!("git {step}"), &output)
-            .map_err(|error| format!("failed to record git {step}: {error}"))?;
-        if !output.status.success() {
-            return Err(last_error(&format!("git {step} failed"), combined));
+            .map_err(|error| format!("failed to run {label}: {error:#}"))?;
+        if !ok {
+            return Err(last_error(&format!("{label} failed"), log_path));
         }
     }
     Ok(())
 }
 
-async fn deploy(p: &ProjectConfig, log: &mut std::fs::File, combined: &mut String) -> Result<bool> {
+async fn deploy(p: &ProjectConfig, log: &mut std::fs::File) -> Result<bool> {
     if !Path::new(&p.path).exists() {
         bail!("project path does not exist: {}", p.path);
     }
@@ -158,16 +201,7 @@ async fn deploy(p: &ProjectConfig, log: &mut std::fs::File, combined: &mut Strin
         if p.deploy_preset == "compose_pull" {
             let mut pull = base.clone();
             pull.push("pull");
-            if !run_command(
-                "docker",
-                &pull,
-                &p.path,
-                "docker compose pull",
-                log,
-                combined,
-            )
-            .await?
-            {
+            if !run_command("docker", &pull, &p.path, "docker compose pull", log).await? {
                 return Ok(false);
             }
         }
@@ -177,7 +211,7 @@ async fn deploy(p: &ProjectConfig, log: &mut std::fs::File, combined: &mut Strin
             up.push("--build");
         }
         up.push("--remove-orphans");
-        run_command("docker", &up, &p.path, "docker compose up", log, combined).await
+        run_command("docker", &up, &p.path, "docker compose up", log).await
     } else {
         run_command(
             "sh",
@@ -185,63 +219,89 @@ async fn deploy(p: &ProjectConfig, log: &mut std::fs::File, combined: &mut Strin
             &p.path,
             "custom command",
             log,
-            combined,
         )
         .await
     }
 }
 
+/// Run one command, streaming its output straight into the run log.
+///
+/// The child inherits duplicated descriptors of the log file, which was opened
+/// with `O_APPEND`. Every write from the child therefore appends atomically and
+/// lands in the file *as it is produced*, which is what makes live tailing work
+/// — `.output()` would buffer a ten-minute `docker compose up --build` until it
+/// exited. Sharing one append-mode description also means stdout and stderr
+/// interleave chronologically without a drain task or a pipe-buffer deadlock.
 async fn run_command(
     program: &str,
     args: &[&str],
     cwd: &str,
     label: &str,
     log: &mut std::fs::File,
-    combined: &mut String,
 ) -> Result<bool> {
-    let output = Command::new(program)
+    writeln!(log, "--- {label} ---")?;
+    let stdout = log
+        .try_clone()
+        .with_context(|| format!("failed to attach log to {label}"))?;
+    let stderr = log
+        .try_clone()
+        .with_context(|| format!("failed to attach log to {label}"))?;
+
+    let status = Command::new(program)
         .args(args)
         .current_dir(cwd)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        // Turn credential/host-key prompts into fast failures instead of hangs.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true)
+        .status()
         .await
         .with_context(|| format!("failed to spawn {label}"))?;
-    record_output(log, combined, label, &output)?;
-    Ok(output.status.success())
+    Ok(status.success())
 }
 
-fn last_error(prefix: &str, output: &str) -> String {
-    match last_line(output) {
+fn last_error(prefix: &str, log_path: &Path) -> String {
+    match summary_line(log_path) {
         Some(line) => format!("{prefix}: {line}"),
         None => prefix.to_string(),
     }
 }
 
-/// Append one command's stdout and stderr (labeled) to the log and to the
-/// shared buffer used to derive the summary line.
-fn record_output(
-    log: &mut std::fs::File,
-    combined: &mut String,
-    step: &str,
-    output: &std::process::Output,
-) -> Result<()> {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+/// Last meaningful line of the run log, used for the history summary.
+///
+/// Reads only the tail: a build log can be megabytes and we want one line.
+fn summary_line(log_path: &Path) -> Option<String> {
+    let text = read_tail(log_path, 8 * 1024);
+    text.lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty() && !line.starts_with("--- ") && !line.starts_with('#'))
+        .map(truncate)
+}
 
-    writeln!(log, "--- {step} stdout ---")?;
-    write!(log, "{stdout}")?;
-    if !stdout.is_empty() && !stdout.ends_with('\n') {
-        writeln!(log)?;
+/// Read at most the last `max_bytes` of a file, starting at a line boundary.
+fn read_tail(path: &Path, max_bytes: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(max_bytes);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
     }
-
-    writeln!(log, "--- {step} stderr ---")?;
-    write!(log, "{stderr}")?;
-    if !stderr.is_empty() && !stderr.ends_with('\n') {
-        writeln!(log)?;
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return String::new();
     }
-
-    combined.push_str(&stdout);
-    combined.push_str(&stderr);
-    Ok(())
+    let from = if start == 0 {
+        0
+    } else {
+        buf.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1)
+    };
+    String::from_utf8_lossy(&buf[from..]).into_owned()
 }
 
 /// Build the [`RunRecord`], write the tail line, persist it, and return it.
@@ -273,14 +333,6 @@ fn finalize(
     )?;
     crate::state::append_run(record.clone())?;
     Ok(record)
-}
-
-/// Last non-empty, whitespace-trimmed line of `text`, truncated for the summary.
-fn last_line(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .map(truncate)
 }
 
 /// Truncate to roughly [`MAX_MESSAGE_CHARS`] characters, marking cuts with `...`.
@@ -334,11 +386,12 @@ mod tests {
         );
         project.repository = remote.to_string_lossy().into_owned();
         let log_path = root.join("test.log");
-        let mut log = fs::File::create(&log_path).unwrap();
-        let mut combined = String::new();
-        sync_project(&project, &mut log, &mut combined)
-            .await
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
             .unwrap();
+        sync_project(&project, &mut log, &log_path).await.unwrap();
         assert_eq!(
             fs::read_to_string(checkout.join("version.txt")).unwrap(),
             "one"
@@ -348,14 +401,39 @@ mod tests {
         git(&seed, &["add", "."]);
         git(&seed, &["commit", "-m", "update"]);
         git(&seed, &["push"]);
-        sync_project(&project, &mut log, &mut combined)
-            .await
-            .unwrap();
+        sync_project(&project, &mut log, &log_path).await.unwrap();
         assert_eq!(
             fs::read_to_string(checkout.join("version.txt")).unwrap(),
             "two"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_tail_starts_on_a_line_boundary() {
+        let path = std::env::temp_dir().join(format!("webhookr-tail-{}", crate::util::new_run_id()));
+        fs::write(&path, "alpha\nbravo\ncharlie\n").unwrap();
+
+        // Whole file when it fits.
+        assert_eq!(super::read_tail(&path, 1024), "alpha\nbravo\ncharlie\n");
+
+        // Truncated reads drop the partial first line rather than splitting it.
+        let tail = super::read_tail(&path, 12);
+        assert!(!tail.contains("alpha"), "partial line leaked: {tail:?}");
+        assert!(tail.ends_with("charlie\n"), "unexpected tail: {tail:?}");
+
+        assert_eq!(super::summary_line(&path).as_deref(), Some("charlie"));
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn summary_line_skips_step_headers_and_run_banner() {
+        let path = std::env::temp_dir().join(format!("webhookr-sum-{}", crate::util::new_run_id()));
+        // A command that produced no output leaves only the banner and header.
+        fs::write(&path, "# webhookr deploy abc for Site started now\n--- custom command ---\n")
+            .unwrap();
+        assert_eq!(super::summary_line(&path), None);
+        fs::remove_file(&path).unwrap();
     }
 
     fn git(cwd: &std::path::Path, args: &[&str]) {

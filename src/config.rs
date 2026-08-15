@@ -8,7 +8,13 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Serializes in-process config mutations. Held only across synchronous file
+/// I/O, never across an `.await`.
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 /// Directory that holds the config file.
 pub fn config_dir() -> PathBuf {
@@ -47,6 +53,48 @@ pub fn state_dir() -> PathBuf {
 /// Directory where per-run logs are written.
 pub fn log_dir() -> PathBuf {
     state_dir().join("logs")
+}
+
+/// Deployment presets: `(id, label, description)`. Single source of truth for
+/// the CLI, the TUI radio list, and the web form.
+pub const PRESETS: [(&str, &str, &str); 4] = [
+    (
+        "compose_build",
+        "Compose build",
+        "docker compose up -d --build --remove-orphans",
+    ),
+    (
+        "compose_pull",
+        "Compose pull",
+        "pull images, then compose up in detached mode",
+    ),
+    (
+        "compose_up",
+        "Compose up",
+        "start the selected Compose file without build or pull",
+    ),
+    (
+        "custom",
+        "Custom command",
+        "run a shell command after the source is ready",
+    ),
+];
+
+/// Port portion of a `host:port` listen address, defaulting to 9000.
+pub fn listen_port(address: &str) -> u16 {
+    address
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or(9000)
+}
+
+/// Public webhook URL for a project: the tunnel hostname when one is
+/// configured, otherwise the raw listen address.
+pub fn webhook_url(config: &AppConfig, project_id: &str) -> String {
+    match &config.cloudflare {
+        Some(tunnel) => format!("https://{}/hooks/{project_id}", tunnel.hostname),
+        None => format!("http://{}/hooks/{project_id}", config.listen_addr),
+    }
 }
 
 /// One webhook-triggered deploy target.
@@ -128,6 +176,19 @@ impl ProjectConfig {
         if self.secret.is_empty() {
             bail!("project secret must not be empty");
         }
+        // `branch` and `repository` are passed to git positionally, so a value
+        // starting with '-' would be read as a flag (e.g. --upload-pack=...).
+        //
+        // An empty branch is deliberately *not* rejected here: it is broken for
+        // anything that pulls, and git says so plainly, but a custom-command
+        // project that only ever redeploys works fine without one. Failing it
+        // in validate would break such a config on upgrade for no security gain.
+        if self.branch.starts_with('-') {
+            bail!("branch may not start with '-'");
+        }
+        if self.repository.starts_with('-') {
+            bail!("repository URL may not start with '-'");
+        }
         if self.verify_mode != "github" && self.verify_mode != "token" {
             bail!("verify_mode must be 'github' or 'token'");
         }
@@ -191,16 +252,87 @@ fn validate_relative_file(value: &str) -> Result<()> {
 /// Remotely-managed Cloudflare Tunnel attached to the webhook listener.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CloudflareConfig {
+    /// Public hostname for the webhook listener.
     pub hostname: String,
     pub account_id: String,
+    /// Zone of [`Self::hostname`].
     pub zone_id: String,
     pub tunnel_id: String,
     pub tunnel_name: String,
+    /// Public hostname routed to the admin UI port, when one is configured.
+    /// The admin UI needs its own hostname: putting Access on the webhook
+    /// hostname would break GitHub, which cannot complete an Access login.
+    #[serde(default)]
+    pub admin_hostname: Option<String>,
+    /// Zone of [`Self::admin_hostname`] when it differs from [`Self::zone_id`].
+    #[serde(default)]
+    pub admin_zone_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudflareCredentials {
     pub tunnel_token: String,
+}
+
+/// Browser admin UI.
+///
+/// Disabled unless explicitly turned on: the UI has no login of its own, so an
+/// upgrade or a stray config edit must never bring it up by accident.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebConfig {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address. Loopback by default — `cloudflared` connects from the same
+    /// host, so the tunnel still works while the port stays off the LAN and off
+    /// the public interface, where it would bypass Cloudflare Access entirely.
+    #[serde(default = "default_web_addr")]
+    pub listen_addr: String,
+    /// Public hostname routed to the admin port through `cloudflared`.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Reject requests without a `Cf-Access-Jwt-Assertion` header. A presence
+    /// check only — it does not validate the JWT — so it is defence in depth
+    /// behind Access, never a substitute for it.
+    #[serde(default)]
+    pub require_access_header: bool,
+}
+
+fn default_web_addr() -> String {
+    "127.0.0.1:9010".to_string()
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: default_web_addr(),
+            hostname: None,
+            require_access_header: false,
+        }
+    }
+}
+
+impl WebConfig {
+    /// Check the admin listener can coexist with the webhook listener.
+    pub fn validate(&self, webhook_addr: &str) -> Result<()> {
+        if self.listen_addr.trim().is_empty() {
+            bail!("web listen address is required");
+        }
+        if self.listen_addr.rsplit_once(':').is_none() {
+            bail!(
+                "web listen address must be host:port, got {}",
+                self.listen_addr
+            );
+        }
+        if listen_port(&self.listen_addr) == listen_port(webhook_addr) {
+            bail!(
+                "web admin UI port {} collides with the webhook listener; pick another",
+                listen_port(&self.listen_addr)
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Top-level application configuration.
@@ -213,6 +345,9 @@ pub struct AppConfig {
     /// Public hostname routed to the local listener through `cloudflared`.
     #[serde(default)]
     pub cloudflare: Option<CloudflareConfig>,
+    /// Browser admin UI settings.
+    #[serde(default)]
+    pub web: WebConfig,
 }
 
 impl Default for AppConfig {
@@ -222,6 +357,7 @@ impl Default for AppConfig {
             listen_addr: format!("0.0.0.0:{port}"),
             projects: Vec::new(),
             cloudflare: None,
+            web: WebConfig::default(),
         }
     }
 }
@@ -264,17 +400,73 @@ pub fn load_config() -> Result<AppConfig> {
     Ok(cfg)
 }
 
-/// Persist config to disk, creating parent directories as needed.
-pub fn save_config(cfg: &AppConfig) -> Result<()> {
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config dir {}", parent.display()))?;
+/// Write `text` to `path` atomically: fill a temp file in the same directory,
+/// fsync it, then rename over the target. A concurrent reader therefore sees
+/// either the old file or the new one, never a truncated one.
+///
+/// When `owner_only`, the mode is set on the temp file *before* the rename so
+/// the contents are never briefly world-readable.
+pub(crate) fn write_atomic(path: &Path, text: &str, owner_only: bool) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".to_string());
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+
+    let write = |tmp: &Path| -> Result<()> {
+        let mut file = fs::File::create(tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush {}", tmp.display()))?;
+        Ok(())
+    };
+
+    if let Err(error) = write(&tmp).and_then(|()| {
+        if owner_only {
+            set_owner_only(&tmp)?;
+        }
+        fs::rename(&tmp, path)
+            .with_context(|| format!("failed to replace {}", path.display()))
+    }) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
-    let text = serde_json::to_string_pretty(cfg)?;
-    fs::write(&path, text)
-        .with_context(|| format!("failed to write config at {}", path.display()))?;
     Ok(())
+}
+
+/// Persist config to disk. Takes [`CONFIG_LOCK`]; see [`save_config_inner`].
+pub fn save_config(cfg: &AppConfig) -> Result<()> {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_config_inner(cfg)
+}
+
+/// Persist config **without** taking [`CONFIG_LOCK`].
+///
+/// `std::sync::Mutex` is not reentrant, so every caller that already holds the
+/// lock (i.e. [`update_config`]) must come through here instead of
+/// [`save_config`], or it deadlocks immediately.
+fn save_config_inner(cfg: &AppConfig) -> Result<()> {
+    let text = serde_json::to_string_pretty(cfg)?;
+    // Owner-only: this file stores every project's webhook secret in plaintext.
+    write_atomic(&config_path(), &text, true)
+}
+
+/// Load, mutate and persist the config while holding [`CONFIG_LOCK`], so two
+/// concurrent callers cannot interleave a read-modify-write and lose an edit.
+///
+/// If `f` returns `Err`, nothing is written — validation failures roll back for
+/// free. `f` is synchronous by design: never hold this guard across an `.await`.
+pub fn update_config<T>(f: impl FnOnce(&mut AppConfig) -> Result<T>) -> Result<T> {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cfg = load_config()?;
+    let out = f(&mut cfg)?;
+    save_config_inner(&cfg)?;
+    Ok(out)
 }
 
 pub fn load_cloudflare_credentials() -> Result<CloudflareCredentials> {
@@ -294,20 +486,8 @@ pub fn load_cloudflare_credentials() -> Result<CloudflareCredentials> {
 }
 
 pub fn save_cloudflare_credentials(credentials: &CloudflareCredentials) -> Result<()> {
-    let path = cloudflare_credentials_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config dir {}", parent.display()))?;
-    }
     let text = serde_json::to_string_pretty(credentials)?;
-    fs::write(&path, text).with_context(|| {
-        format!(
-            "failed to write Cloudflare credentials at {}",
-            path.display()
-        )
-    })?;
-    set_owner_only(&path)?;
-    Ok(())
+    write_atomic(&cloudflare_credentials_path(), &text, true)
 }
 
 #[cfg(unix)]
@@ -352,6 +532,31 @@ mod tests {
         assert_eq!(project.compose_file, "compose.yaml");
         assert!(project.repository.is_empty());
         assert!(config.cloudflare.is_none());
+        // A config written before the web UI existed must not switch it on.
+        assert!(!config.web.enabled);
+        assert_eq!(config.web.listen_addr, "127.0.0.1:9010");
+    }
+
+    #[test]
+    fn web_ui_is_off_by_default() {
+        assert!(!AppConfig::default().web.enabled);
+        assert!(!super::WebConfig::default().enabled);
+        // A hand-edited partial block still loads, and still binds loopback.
+        let partial: AppConfig =
+            serde_json::from_str(r#"{"listen_addr":"0.0.0.0:9000","projects":[],"web":{"enabled":true}}"#)
+                .unwrap();
+        assert!(partial.web.enabled);
+        assert_eq!(partial.web.listen_addr, "127.0.0.1:9010");
+    }
+
+    #[test]
+    fn web_port_may_not_collide_with_the_webhook_port() {
+        let collides = super::WebConfig {
+            listen_addr: "127.0.0.1:9000".into(),
+            ..Default::default()
+        };
+        assert!(collides.validate("0.0.0.0:9000").is_err());
+        assert!(super::WebConfig::default().validate("0.0.0.0:9000").is_ok());
     }
 
     #[test]
@@ -370,6 +575,39 @@ mod tests {
             compose_profiles: vec!["web".into()],
         };
         project.validate().unwrap();
+    }
+
+    #[test]
+    fn git_arguments_cannot_be_read_as_flags() {
+        let base = || {
+            let mut p = ProjectConfig::new(
+                "site".into(),
+                "Site".into(),
+                "/tmp".into(),
+                "main".into(),
+                "true".into(),
+                "secret".into(),
+                "github".into(),
+            );
+            p.repository = "https://example.com/site.git".into();
+            p
+        };
+
+        let mut leading_dash_branch = base();
+        leading_dash_branch.branch = "--upload-pack=touch /tmp/x".into();
+        assert!(leading_dash_branch.validate().is_err());
+
+        // An empty branch stays valid on purpose: rejecting it would break
+        // existing custom-command projects that never pull.
+        let mut empty_branch = base();
+        empty_branch.branch = String::new();
+        assert!(empty_branch.validate().is_ok());
+
+        let mut leading_dash_repo = base();
+        leading_dash_repo.repository = "--upload-pack=touch /tmp/x".into();
+        assert!(leading_dash_repo.validate().is_err());
+
+        assert!(base().validate().is_ok());
     }
 
     #[test]

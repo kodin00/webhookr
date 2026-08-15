@@ -6,6 +6,7 @@ mod server;
 mod state;
 mod tui;
 mod util;
+mod web;
 
 #[tokio::main]
 async fn main() {

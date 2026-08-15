@@ -62,8 +62,27 @@ struct TunnelCreate<'a> {
 
 /// Create or update a remotely-managed tunnel and its proxied DNS record.
 /// The broad API token is deliberately not returned or persisted.
-pub fn provision(api_token: &str, hostname: &str, app: &AppConfig) -> Result<ProvisionedTunnel> {
+pub fn provision(
+    api_token: &str,
+    hostname: &str,
+    admin_hostname: Option<&str>,
+    app: &AppConfig,
+) -> Result<ProvisionedTunnel> {
     let hostname = normalize_hostname(hostname)?;
+    let admin_hostname = admin_hostname
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_hostname)
+        .transpose()?;
+
+    if let Some(admin) = &admin_hostname {
+        if admin == &hostname {
+            bail!(
+                "the admin hostname must differ from the webhook hostname: an Access policy on \
+                 {hostname} would block GitHub, which cannot complete an Access login"
+            );
+        }
+    }
     if api_token.trim().is_empty() {
         bail!("Cloudflare API token is required");
     }
@@ -73,6 +92,17 @@ pub fn provision(api_token: &str, hostname: &str, app: &AppConfig) -> Result<Pro
         .context("failed to create Cloudflare API client")?;
 
     let zone = find_zone(&client, api_token, &hostname)?;
+    let admin_zone = admin_hostname
+        .as_deref()
+        .map(|admin| find_zone(&client, api_token, admin))
+        .transpose()?;
+
+    if let Some(admin_zone) = &admin_zone {
+        if admin_zone.account.id != zone.account.id {
+            bail!("both hostnames must belong to the same Cloudflare account");
+        }
+    }
+
     let tunnel_name = tunnel_name(&hostname);
     let reusable = app
         .cloudflare
@@ -84,16 +114,24 @@ pub fn provision(api_token: &str, hostname: &str, app: &AppConfig) -> Result<Pro
         None => create_tunnel(&client, api_token, &zone.account.id, &tunnel_name)?,
     };
 
-    let origin = format!("http://127.0.0.1:{}", listen_port(&app.listen_addr));
-    put_tunnel_config(
-        &client,
-        api_token,
-        &zone.account.id,
-        &tunnel_id,
-        &hostname,
-        &origin,
-    )?;
+    // A remotely-managed tunnel replaces its whole ingress list on every PUT,
+    // so always rebuild every route rather than appending one.
+    let mut routes = vec![(
+        hostname.clone(),
+        format!("http://127.0.0.1:{}", listen_port(&app.listen_addr)),
+    )];
+    if let Some(admin) = &admin_hostname {
+        routes.push((
+            admin.clone(),
+            format!("http://127.0.0.1:{}", listen_port(&app.web.listen_addr)),
+        ));
+    }
+
+    put_tunnel_config(&client, api_token, &zone.account.id, &tunnel_id, &routes)?;
     upsert_dns(&client, api_token, &zone.id, &hostname, &tunnel_id)?;
+    if let (Some(admin), Some(admin_zone)) = (&admin_hostname, &admin_zone) {
+        upsert_dns(&client, api_token, &admin_zone.id, admin, &tunnel_id)?;
+    }
     let tunnel_token = get_tunnel_token(&client, api_token, &zone.account.id, &tunnel_id)?;
 
     Ok(ProvisionedTunnel {
@@ -103,6 +141,8 @@ pub fn provision(api_token: &str, hostname: &str, app: &AppConfig) -> Result<Pro
             zone_id: zone.id,
             tunnel_id,
             tunnel_name,
+            admin_hostname,
+            admin_zone_id: admin_zone.map(|zone| zone.id),
         },
         credentials: CloudflareCredentials { tunnel_token },
     })
@@ -141,17 +181,19 @@ fn put_tunnel_config(
     token: &str,
     account: &str,
     tunnel: &str,
-    hostname: &str,
-    origin: &str,
+    routes: &[(String, String)],
 ) -> Result<()> {
-    let body = serde_json::json!({
-        "config": {
-            "ingress": [
-                { "hostname": hostname, "service": origin, "originRequest": {} },
-                { "service": "http_status:404" }
-            ]
-        }
-    });
+    // Webhook route first: if anything is misconfigured, degrade toward
+    // webhooks still working rather than the admin UI still being reachable.
+    let mut ingress: Vec<serde_json::Value> = routes
+        .iter()
+        .map(|(hostname, origin)| {
+            serde_json::json!({ "hostname": hostname, "service": origin, "originRequest": {} })
+        })
+        .collect();
+    ingress.push(serde_json::json!({ "service": "http_status:404" }));
+
+    let body = serde_json::json!({ "config": { "ingress": ingress } });
     let _: serde_json::Value = api(client
         .put(format!(
             "{API_BASE}/accounts/{account}/cfd_tunnel/{tunnel}/configurations"
@@ -231,6 +273,17 @@ fn decode<T: DeserializeOwned>(response: Response) -> Result<T> {
     envelope
         .result
         .context("Cloudflare API response had no result")
+}
+
+/// Persist the runtime credentials and record the tunnel on `app`.
+///
+/// Split from [`save`] so callers already inside
+/// [`crate::config::update_config`] can apply the result without a nested
+/// (and therefore deadlocking) config write.
+pub fn apply(provisioned: ProvisionedTunnel, app: &mut AppConfig) -> Result<()> {
+    config::save_cloudflare_credentials(&provisioned.credentials)?;
+    app.cloudflare = Some(provisioned.config);
+    Ok(())
 }
 
 pub fn save(provisioned: ProvisionedTunnel, app: &mut AppConfig) -> Result<()> {

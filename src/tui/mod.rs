@@ -41,7 +41,7 @@ const TEXT: Color = Color::Gray;
 
 // ----- menu --------------------------------------------------------------
 
-const MENU: [(&str, &str, &str); 9] = [
+const MENU: [(&str, &str, &str); 10] = [
     ("+", "Add project", "Register a checkout and deploy command"),
     ("U", "Update app", "Clone or pull source, then deploy"),
     (">", "Run deployment", "Deploy again without pulling source"),
@@ -51,6 +51,7 @@ const MENU: [(&str, &str, &str); 9] = [
     ("C", "Cloudflare tunnel", "Publish port 9000 at a hostname"),
     ("-", "Remove project", "Delete a configured route"),
     ("#", "View run log", "Read output from the latest run"),
+    ("W", "Web admin UI", "Toggle the browser dashboard on or off"),
 ];
 
 /// Launch the interactive management TUI (blocks until the user quits).
@@ -208,28 +209,7 @@ impl Wizard {
     }
 }
 
-const PRESETS: [(&str, &str, &str); 4] = [
-    (
-        "compose_build",
-        "Compose build",
-        "docker compose up -d --build --remove-orphans",
-    ),
-    (
-        "compose_pull",
-        "Compose pull",
-        "pull images, then compose up in detached mode",
-    ),
-    (
-        "compose_up",
-        "Compose up",
-        "start the selected Compose file without build or pull",
-    ),
-    (
-        "custom",
-        "Custom command",
-        "run a shell command after the source is ready",
-    ),
-];
+use crate::config::PRESETS;
 
 #[derive(Clone, Copy, PartialEq)]
 enum CloudflareStep {
@@ -600,6 +580,7 @@ impl App {
             KeyCode::Char('c') => self.activate_menu(6),
             KeyCode::Char('d') => self.activate_menu(7),
             KeyCode::Char('l') => self.activate_menu(8),
+            KeyCode::Char('w') => self.activate_menu(9),
             KeyCode::Char('j') | KeyCode::Down => {
                 self.menu_selected = (self.menu_selected + 1) % MENU.len();
             }
@@ -632,7 +613,41 @@ impl App {
             6 => self.screen = Screen::Cloudflare(CloudflareWizard::new(&self.config)),
             7 => self.open_list(ListMode::Remove),
             8 => self.open_list(ListMode::Log),
+            9 => self.toggle_web_ui(),
             _ => {}
+        }
+    }
+
+    /// Flip the web admin UI on or off and persist it.
+    ///
+    /// Deliberately a toggle rather than a screen: everything else the UI needs
+    /// is configurable from the UI itself, so the TUI only has to make it
+    /// discoverable and reachable.
+    fn toggle_web_ui(&mut self) {
+        let enabling = !self.config.web.enabled;
+        if enabling {
+            if let Err(error) = self.config.web.validate(&self.config.listen_addr) {
+                self.last_msg = Some(format!("cannot enable web UI: {error:#}"));
+                return;
+            }
+        }
+        self.config.web.enabled = enabling;
+
+        match config::save_config(&self.config) {
+            Ok(()) if enabling => {
+                self.last_msg = Some(format!(
+                    "web UI enabled on http://{} — no login; put Access in front. Restart the daemon.",
+                    self.config.web.listen_addr
+                ));
+            }
+            Ok(()) => {
+                self.last_msg =
+                    Some("web UI disabled — restart the daemon to stop it".to_string());
+            }
+            Err(error) => {
+                self.config.web.enabled = !enabling;
+                self.last_msg = Some(format!("could not save: {error:#}"));
+            }
         }
     }
 
@@ -665,11 +680,11 @@ impl App {
                 self.screen = Screen::Wizard(w);
             }
             ListMode::Run => {
-                self.trigger_project(i, "run");
+                self.trigger_project(i, &["run", "--no-pull"]);
                 self.screen = Screen::Menu;
             }
             ListMode::Update => {
-                self.trigger_project(i, "update");
+                self.trigger_project(i, &["update"]);
                 self.screen = Screen::Menu;
             }
             ListMode::Remove => self.screen = Screen::ConfirmDelete { index: i },
@@ -678,17 +693,20 @@ impl App {
         }
     }
 
-    fn trigger_project(&mut self, i: usize, action: &str) {
+    fn trigger_project(&mut self, i: usize, args: &[&str]) {
         let p = &self.config.projects[i];
         if let Ok(exe) = std::env::current_exe() {
             let _ = std::process::Command::new(exe)
-                .args([action, "--id", p.id.as_str()])
+                .args(args.iter().copied().chain(["--id", p.id.as_str()]))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();
         }
-        self.last_msg = Some(format!("{action} started for {} — check the run log", p.id));
+        self.last_msg = Some(format!(
+            "{} started for {} — check the run log",
+            args[0], p.id
+        ));
     }
 
     fn open_log(&mut self, i: usize) {
@@ -957,7 +975,15 @@ impl App {
             CloudflareStep::Confirm => match key {
                 KeyCode::Esc => w.step = CloudflareStep::Token,
                 KeyCode::Enter => {
-                    match cloudflare::provision(w.token.value(), w.hostname.value(), &self.config) {
+                    // Carry forward any admin hostname already configured, so
+                    // re-running the wizard does not drop that ingress rule.
+                    let admin = self.config.web.hostname.clone();
+                    match cloudflare::provision(
+                        w.token.value(),
+                        w.hostname.value(),
+                        admin.as_deref(),
+                        &self.config,
+                    ) {
                         Ok(provisioned) => {
                             let hostname = provisioned.config.hostname.clone();
                             cloudflare::save(provisioned, &mut self.config)?;
@@ -2099,19 +2125,7 @@ fn display_or_dash(value: &str) -> &str {
     }
 }
 
-fn listen_port(address: &str) -> u16 {
-    address
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse().ok())
-        .unwrap_or(9000)
-}
-
-fn webhook_url(config: &AppConfig, project_id: &str) -> String {
-    match &config.cloudflare {
-        Some(tunnel) => format!("https://{}/hooks/{project_id}", tunnel.hostname),
-        None => format!("http://{}/hooks/{project_id}", config.listen_addr),
-    }
-}
+use crate::config::{listen_port, webhook_url};
 
 /// Consistent footer hints with colored key names and quiet descriptions.
 fn key_hints(hints: &[(&str, &str)]) -> Line<'static> {
