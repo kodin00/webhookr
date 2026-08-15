@@ -140,7 +140,7 @@ instead of a nine-step terminal wizard.
 It is **off by default**. Turn it on with:
 
 ```sh
-webhookr web enable --addr 127.0.0.1:9010
+webhookr web enable --addr 127.0.0.1:9001
 sudo systemctl restart webhookr
 ```
 
@@ -169,7 +169,7 @@ an Access login. Then add an Access policy on `deploy.example.com`.
 For a quick look without persisting anything, and without exposing it at all:
 
 ```sh
-webhookr serve --web --web-port 9010    # then browse http://127.0.0.1:9010
+webhookr serve --web --web-port 9001    # then browse http://127.0.0.1:9001
 ```
 
 ### What's in it

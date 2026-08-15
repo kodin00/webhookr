@@ -299,7 +299,7 @@ pub struct WebConfig {
 }
 
 fn default_web_addr() -> String {
-    "127.0.0.1:9010".to_string()
+    "127.0.0.1:9001".to_string()
 }
 
 impl Default for WebConfig {
@@ -534,7 +534,7 @@ mod tests {
         assert!(config.cloudflare.is_none());
         // A config written before the web UI existed must not switch it on.
         assert!(!config.web.enabled);
-        assert_eq!(config.web.listen_addr, "127.0.0.1:9010");
+        assert_eq!(config.web.listen_addr, "127.0.0.1:9001");
     }
 
     #[test]
@@ -546,7 +546,7 @@ mod tests {
             serde_json::from_str(r#"{"listen_addr":"0.0.0.0:9000","projects":[],"web":{"enabled":true}}"#)
                 .unwrap();
         assert!(partial.web.enabled);
-        assert_eq!(partial.web.listen_addr, "127.0.0.1:9010");
+        assert_eq!(partial.web.listen_addr, "127.0.0.1:9001");
     }
 
     #[test]

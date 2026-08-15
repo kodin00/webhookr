@@ -148,7 +148,7 @@ pub enum WebAction {
     /// Turn the admin UI on (persisted to config.json)
     Enable {
         /// Bind address. Loopback still works through a Cloudflare Tunnel.
-        #[arg(long, default_value = "127.0.0.1:9010")]
+        #[arg(long, default_value = "127.0.0.1:9001")]
         addr: String,
         /// Public hostname to route to the admin UI through the tunnel
         #[arg(long)]
