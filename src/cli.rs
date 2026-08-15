@@ -134,10 +134,12 @@ pub enum Commands {
         /// Scoped API token (or set CLOUDFLARE_API_TOKEN)
         #[arg(long, env = "CLOUDFLARE_API_TOKEN", hide_env_values = true)]
         api_token: String,
-        /// Public hostname, for example hooks.example.com
+        /// Public hostname for the webhook listener, e.g. hooks.example.com.
+        /// Omit it to serve everything from --admin-hostname instead.
         #[arg(long)]
-        hostname: String,
-        /// Separate public hostname for the web admin UI
+        hostname: Option<String>,
+        /// Public hostname for the web admin UI. On its own it also serves
+        /// webhooks at /webhook/<id>.
         #[arg(long)]
         admin_hostname: Option<String>,
     },
@@ -644,18 +646,24 @@ fn cmd_web(action: WebAction) -> Result<()> {
     Ok(())
 }
 
-fn cmd_cloudflare(api_token: String, hostname: String, admin_hostname: Option<String>) -> Result<()> {
+fn cmd_cloudflare(
+    api_token: String,
+    hostname: Option<String>,
+    admin_hostname: Option<String>,
+) -> Result<()> {
     let mut cfg = config::load_config()?;
     // Fall back to the hostname already recorded for the admin UI, so a plain
     // re-run does not silently drop the admin ingress rule.
     let admin = admin_hostname.or_else(|| cfg.web.hostname.clone());
-    let provisioned = cloudflare::provision(&api_token, &hostname, admin.as_deref(), &cfg)?;
+    let provisioned = cloudflare::provision(&api_token, hostname.as_deref(), admin.as_deref(), &cfg)?;
     let public_hostname = provisioned.config.hostname.clone();
     let admin_public = provisioned.config.admin_hostname.clone();
     cfg.web.hostname = admin_public.clone();
     cloudflare::save(provisioned, &mut cfg)?;
 
-    println!("Cloudflare Tunnel configured: https://{public_hostname}");
+    if !public_hostname.is_empty() {
+        println!("Cloudflare Tunnel configured: https://{public_hostname}");
+    }
     if let Some(admin_public) = &admin_public {
         println!("admin UI: https://{admin_public}");
         println!("!! add a Cloudflare Access policy on that hostname — the UI has no login");

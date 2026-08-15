@@ -332,3 +332,15 @@ td a:hover { text-decoration: underline; }
 .browser-list li { padding: 0.1rem 0; }
 
 details summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; margin: 0.5rem 0; }
+
+/* ----- htmx indicators -------------------------------------------------- */
+/* htmx normally injects these as an inline <style>; we ship them here so the
+   CSP can keep style-src at 'self'. */
+.htmx-indicator { opacity: 0; transition: opacity 200ms ease-in; }
+.htmx-request .htmx-indicator { opacity: 1; }
+.htmx-request.htmx-indicator { opacity: 1; }
+.htmx-request button, .htmx-request.button { opacity: 0.6; }
+
+.cmd-preview { max-height: none; margin: 0; white-space: pre-wrap; }
+#cmd-preview-wrap { margin-top: 0.75rem; }
+#cmd-preview-wrap .field-label { display: block; margin-bottom: 0.3rem; font-size: 0.85rem; }

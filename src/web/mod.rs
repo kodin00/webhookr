@@ -35,9 +35,14 @@ pub use error::WebError;
 /// uses htmx's `hx-on:*` attributes — they evaluate inline JavaScript. Every
 /// interaction here is expressible with `hx-get`/`hx-post`/`hx-target`/
 /// `hx-swap`/`hx-confirm`/`hx-trigger` plus out-of-band swaps.
+///
+/// `connect-src 'self'` is load-bearing: htmx issues its swaps over XHR, and
+/// `default-src 'none'` would otherwise block every one of them. That failure
+/// is invisible to `curl`, which does not enforce CSP — it only shows up in a
+/// real browser, where the entire UI silently stops updating.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-                   img-src 'self' data:; form-action 'self'; base-uri 'none'; \
-                   frame-ancestors 'none'";
+                   connect-src 'self'; img-src 'self' data:; form-action 'self'; \
+                   base-uri 'none'; frame-ancestors 'none'";
 
 /// Whether an unauthenticated Access header check is required, captured once at
 /// startup so handlers don't re-read config just to answer it.
@@ -50,16 +55,24 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let require_access = state.require_access_header;
 
-    Router::new()
+    // The admin surface is gated; the webhook surface is not, and must not be.
+    // GitHub sends no `Sec-Fetch-Site` header and cannot complete a Cloudflare
+    // Access login, so putting either guard in front of `/webhook` would reject
+    // every real delivery. Those routes carry their own HMAC/token check.
+    let admin = Router::new()
         .merge(routes::pages())
         .merge(routes::fragments())
         .route("/static/{file}", axum::routing::get(assets::asset))
         .fallback(routes::not_found)
-        .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(same_origin_only))
         .layer(middleware::from_fn(move |req, next| {
             access_header_gate(require_access, req, next)
-        }))
+        }));
+
+    Router::new()
+        .merge(admin)
+        .merge(crate::server::webhook_router())
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
 

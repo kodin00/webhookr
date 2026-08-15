@@ -23,6 +23,13 @@ pub struct ProjectForm {
     pub id: String,
     #[serde(default)]
     pub repository: String,
+    /// Blank on edit means "leave the stored token alone", so the form never
+    /// has to round-trip the secret back through the browser.
+    #[serde(default)]
+    pub git_token: String,
+    /// Set by a checkbox to explicitly clear a stored token.
+    #[serde(default)]
+    pub clear_git_token: Option<String>,
     #[serde(default)]
     pub path: String,
     #[serde(default = "default_branch")]
@@ -64,6 +71,15 @@ impl ProjectForm {
             None => util::generate_secret(),
         };
 
+        let submitted_token = self.git_token.trim();
+        let git_token = if self.clear_git_token.is_some() {
+            String::new()
+        } else if submitted_token.is_empty() {
+            existing.map(|p| p.git_token.clone()).unwrap_or_default()
+        } else {
+            submitted_token.to_string()
+        };
+
         let compose_file = if self.compose_file.trim().is_empty() {
             "compose.yaml".to_string()
         } else {
@@ -91,6 +107,7 @@ impl ProjectForm {
             secret,
             verify_mode,
             repository: self.repository.trim().to_string(),
+            git_token,
             deploy_preset,
             compose_file,
             compose_profiles: split_profiles(&self.compose_profiles),
@@ -106,6 +123,9 @@ impl ProjectForm {
             name: project.name.clone(),
             id: project.id.clone(),
             repository: project.repository.clone(),
+            // Never echo the stored token back into the page.
+            git_token: String::new(),
+            clear_git_token: None,
             path: project.path.clone(),
             branch: project.branch.clone(),
             command: project.command.clone(),
@@ -152,6 +172,8 @@ mod tests {
             name: "My Site".into(),
             id: String::new(),
             repository: "https://example.com/site.git".into(),
+            git_token: String::new(),
+            clear_git_token: None,
             path: "/tmp/webhookr-form-test".into(),
             branch: "main".into(),
             command: "./deploy.sh".into(),

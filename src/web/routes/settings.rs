@@ -148,10 +148,18 @@ pub async fn cloudflare_save(Form(form): Form<CloudflareForm>) -> Result<Respons
     let token = form.api_token.trim().to_string();
     let hostname = form.hostname.trim().to_string();
     let admin = form.admin_hostname.trim().to_string();
+    let hostname_opt = (!hostname.is_empty()).then(|| hostname.clone());
     let admin_opt = (!admin.is_empty()).then(|| admin.clone());
 
     if token.is_empty() {
         return Ok(render_cloudflare_error(&cfg, "An API token is required."));
+    }
+    if hostname_opt.is_none() && admin_opt.is_none() {
+        return Ok(render_cloudflare_error(
+            &cfg,
+            "Enter at least one hostname. Using only the admin hostname serves \
+             the dashboard and webhooks from that single host.",
+        ));
     }
 
     // `cloudflare::provision` uses the blocking reqwest client and makes
@@ -159,7 +167,7 @@ pub async fn cloudflare_save(Form(form): Form<CloudflareForm>) -> Result<Respons
     // for minutes, stalling the webhook listener sharing this process.
     let probe = cfg.clone();
     let provisioned = tokio::task::spawn_blocking(move || {
-        cloudflare::provision(&token, &hostname, admin_opt.as_deref(), &probe)
+        cloudflare::provision(&token, hostname_opt.as_deref(), admin_opt.as_deref(), &probe)
     })
     .await
     .map_err(|error| WebError::new(StatusCode::INTERNAL_SERVER_ERROR, error.into()))?;

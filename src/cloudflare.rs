@@ -32,14 +32,14 @@ struct ApiMessage {
     message: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Zone {
     id: String,
     name: String,
     account: ZoneAccount,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ZoneAccount {
     id: String,
 }
@@ -62,24 +62,36 @@ struct TunnelCreate<'a> {
 
 /// Create or update a remotely-managed tunnel and its proxied DNS record.
 /// The broad API token is deliberately not returned or persisted.
+/// Provision the tunnel.
+///
+/// At least one hostname is required. Passing only `admin_hostname` is the
+/// single-hostname setup: everything routes to the admin port, which serves the
+/// dashboard at `/` and webhooks at `/webhook/{id}`.
 pub fn provision(
     api_token: &str,
-    hostname: &str,
+    hostname: Option<&str>,
     admin_hostname: Option<&str>,
     app: &AppConfig,
 ) -> Result<ProvisionedTunnel> {
-    let hostname = normalize_hostname(hostname)?;
-    let admin_hostname = admin_hostname
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(normalize_hostname)
-        .transpose()?;
+    let clean = |value: Option<&str>| -> Result<Option<String>> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(normalize_hostname)
+            .transpose()
+    };
+    let hostname = clean(hostname)?;
+    let admin_hostname = clean(admin_hostname)?;
 
-    if let Some(admin) = &admin_hostname {
-        if admin == &hostname {
+    let Some(primary) = hostname.clone().or_else(|| admin_hostname.clone()) else {
+        bail!("a hostname is required (--hostname, --admin-hostname, or both)");
+    };
+
+    if let (Some(webhook), Some(admin)) = (&hostname, &admin_hostname) {
+        if webhook == admin {
             bail!(
-                "the admin hostname must differ from the webhook hostname: an Access policy on \
-                 {hostname} would block GitHub, which cannot complete an Access login"
+                "the admin hostname must differ from the webhook hostname; to serve both from \
+                 one hostname, pass only --admin-hostname (webhooks are then at /webhook/<id>)"
             );
         }
     }
@@ -91,19 +103,22 @@ pub fn provision(
         .build()
         .context("failed to create Cloudflare API client")?;
 
-    let zone = find_zone(&client, api_token, &hostname)?;
-    let admin_zone = admin_hostname
-        .as_deref()
-        .map(|admin| find_zone(&client, api_token, admin))
-        .transpose()?;
-
-    if let Some(admin_zone) = &admin_zone {
-        if admin_zone.account.id != zone.account.id {
-            bail!("both hostnames must belong to the same Cloudflare account");
+    let zone = find_zone(&client, api_token, &primary)?;
+    let admin_zone = match &admin_hostname {
+        // When there is no separate webhook hostname, the admin hostname *is*
+        // the primary and its zone is already resolved.
+        Some(_) if hostname.is_none() => zone.clone(),
+        Some(admin) => {
+            let found = find_zone(&client, api_token, admin)?;
+            if found.account.id != zone.account.id {
+                bail!("both hostnames must belong to the same Cloudflare account");
+            }
+            found
         }
-    }
+        None => zone.clone(),
+    };
 
-    let tunnel_name = tunnel_name(&hostname);
+    let tunnel_name = tunnel_name(&primary);
     let reusable = app
         .cloudflare
         .as_ref()
@@ -116,10 +131,13 @@ pub fn provision(
 
     // A remotely-managed tunnel replaces its whole ingress list on every PUT,
     // so always rebuild every route rather than appending one.
-    let mut routes = vec![(
-        hostname.clone(),
-        format!("http://127.0.0.1:{}", listen_port(&app.listen_addr)),
-    )];
+    let mut routes = Vec::new();
+    if let Some(webhook) = &hostname {
+        routes.push((
+            webhook.clone(),
+            format!("http://127.0.0.1:{}", listen_port(&app.listen_addr)),
+        ));
+    }
     if let Some(admin) = &admin_hostname {
         routes.push((
             admin.clone(),
@@ -128,21 +146,23 @@ pub fn provision(
     }
 
     put_tunnel_config(&client, api_token, &zone.account.id, &tunnel_id, &routes)?;
-    upsert_dns(&client, api_token, &zone.id, &hostname, &tunnel_id)?;
-    if let (Some(admin), Some(admin_zone)) = (&admin_hostname, &admin_zone) {
+    if let Some(webhook) = &hostname {
+        upsert_dns(&client, api_token, &zone.id, webhook, &tunnel_id)?;
+    }
+    if let Some(admin) = &admin_hostname {
         upsert_dns(&client, api_token, &admin_zone.id, admin, &tunnel_id)?;
     }
     let tunnel_token = get_tunnel_token(&client, api_token, &zone.account.id, &tunnel_id)?;
 
     Ok(ProvisionedTunnel {
         config: CloudflareConfig {
-            hostname,
+            hostname: hostname.unwrap_or_default(),
             account_id: zone.account.id,
             zone_id: zone.id,
             tunnel_id,
             tunnel_name,
+            admin_zone_id: admin_hostname.as_ref().map(|_| admin_zone.id),
             admin_hostname,
-            admin_zone_id: admin_zone.map(|zone| zone.id),
         },
         credentials: CloudflareCredentials { tunnel_token },
     })

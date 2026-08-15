@@ -103,6 +103,12 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
             @if !project.repository.is_empty() {
                 (views::code_field("Repository", &project.repository))
             }
+            @if !project.repository.is_empty() {
+                (views::field(
+                    "Access token",
+                    if project.git_token.is_empty() { "none (public repo)" } else { "stored" },
+                ))
+            }
             (views::code_field("Branch", &project.branch))
             (views::field("Deployment", project.preset_label()))
             @if project.uses_compose() {
@@ -110,8 +116,12 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
                 @if !project.compose_profiles.is_empty() {
                     (views::code_field("Profiles", &project.compose_profiles.join(", ")))
                 }
-            } @else {
-                (views::code_field("Command", &project.command))
+            }
+            div class="field" {
+                span class="field-label" { "Runs" }
+                span class="field-value" {
+                    pre class="log cmd-preview" { (config::deploy_command_preview(&project)) }
+                }
             }
         }
 
@@ -197,6 +207,8 @@ pub async fn new_form() -> Result<Markup, WebError> {
         name: String::new(),
         id: String::new(),
         repository: String::new(),
+        git_token: String::new(),
+        clear_git_token: None,
         path: String::new(),
         branch: "main".to_string(),
         command: String::new(),
@@ -207,7 +219,7 @@ pub async fn new_form() -> Result<Markup, WebError> {
     };
     Ok(views::page(
         "Add project",
-        project_form("Add project", "/projects", &blank, None, None),
+        project_form("Add project", "/projects", &blank, None, None, false),
     ))
 }
 
@@ -222,6 +234,7 @@ pub async fn edit_form(Path(id): Path<String>) -> Result<Markup, WebError> {
             &form,
             Some(&project.id),
             None,
+            !project.git_token.is_empty(),
         ),
     ))
 }
@@ -241,6 +254,7 @@ pub async fn create(Form(form): Form<ProjectForm>) -> Result<Response, WebError>
                         &form,
                         None,
                         Some(&forms::explain(&error)),
+                        false,
                     ),
                 ),
             )
@@ -269,6 +283,7 @@ pub async fn create(Form(form): Form<ProjectForm>) -> Result<Response, WebError>
                     &form,
                     None,
                     Some(&forms::explain(&error)),
+                    false,
                 ),
             ),
         )
@@ -295,6 +310,7 @@ pub async fn update(
                         &form,
                         Some(&id),
                         Some(&forms::explain(&error)),
+                        !existing.git_token.is_empty(),
                     ),
                 ),
             )
@@ -316,7 +332,13 @@ fn project_form(
     form: &ProjectForm,
     existing_id: Option<&str>,
     error: Option<&str>,
+    has_token: bool,
 ) -> Markup {
+    let token_placeholder = if has_token {
+        "stored — leave blank to keep it"
+    } else {
+        "ghp_… or github_pat_…"
+    };
     html! {
         section class="page-head" { h1 { (title) } }
         @if let Some(error) = error { (views::alert("error", error)) }
@@ -354,6 +376,23 @@ fn project_form(
                 }
 
                 label {
+                    span { "Access token" span class="optional" { "private repos only" } }
+                    input type="password" name="git_token" autocomplete="off"
+                          placeholder=(token_placeholder);
+                    span class="hint" {
+                        "A GitHub personal access token with repo read access. Used for clone "
+                        "and pull over HTTPS, handed to git through a credential helper so it "
+                        "never lands in the process list or in .git/config."
+                    }
+                }
+                @if has_token {
+                    label class="checkbox" {
+                        input type="checkbox" name="clear_git_token" value="1";
+                        span { "Remove the stored token" }
+                    }
+                }
+
+                label {
                     span { "Path on this server" }
                     span class="input-row" {
                         input type="text" id="path" name="path" value=(form.path) required
@@ -381,8 +420,8 @@ fn project_form(
                         label class="radio" {
                             input type="radio" name="deploy_preset" value=(id)
                                   checked[form.deploy_preset == id]
-                                  hx-get="/f/deploy-fields" hx-target="#deploy-fields"
-                                  hx-swap="innerHTML";
+                                  hx-get="/f/deploy-fields" hx-include="closest form"
+                                  hx-target="#deploy-fields" hx-swap="innerHTML";
                             span class="radio-text" {
                                 strong { (label) }
                                 span class="hint" { (description) }
@@ -436,20 +475,30 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
         name: String::new(),
         id: String::new(),
         repository: String::new(),
+        git_token: String::new(),
+        clear_git_token: None,
         path: String::new(),
         branch: String::new(),
-        command: String::new(),
+        command: query.command.unwrap_or_default(),
         deploy_preset: query.deploy_preset.unwrap_or_else(|| "custom".to_string()),
-        compose_file: "compose.yaml".to_string(),
-        compose_profiles: String::new(),
+        compose_file: query
+            .compose_file
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "docker-compose.yml".to_string()),
+        compose_profiles: query.compose_profiles.unwrap_or_default(),
         verify_mode: String::new(),
     };
     deploy_fields_markup(&form)
 }
 
+/// The subset of the form the preview needs. Sent by `hx-include="closest form"`,
+/// so every other field arrives too and is simply ignored.
 #[derive(Deserialize)]
 pub struct PresetQuery {
     pub deploy_preset: Option<String>,
+    pub compose_file: Option<String>,
+    pub compose_profiles: Option<String>,
+    pub command: Option<String>,
 }
 
 fn deploy_fields_markup(form: &ProjectForm) -> Markup {
@@ -459,15 +508,24 @@ fn deploy_fields_markup(form: &ProjectForm) -> Markup {
             label {
                 span { "Compose file" }
                 input type="text" name="compose_file" value=(form.compose_file)
-                      placeholder="compose.yaml";
+                      placeholder="docker-compose.yml"
+                      hx-get="/f/deploy-fields" hx-include="closest form"
+                      hx-target="#deploy-fields" hx-swap="innerHTML"
+                      hx-trigger="keyup changed delay:400ms";
                 span class="hint" {
-                    "Relative to the checkout. It cannot use '..' to escape the project directory."
+                    "Path relative to the checkout — for example "
+                    code class="mono" { "docker-compose.yml" } " or "
+                    code class="mono" { "deploy/compose.prod.yml" } ". "
+                    "It cannot use '..' to escape the project directory."
                 }
             }
             label {
                 span { "Compose profiles" span class="optional" { "optional" } }
                 input type="text" name="compose_profiles" value=(form.compose_profiles)
-                      placeholder="web, worker";
+                      placeholder="web, worker"
+                      hx-get="/f/deploy-fields" hx-include="closest form"
+                      hx-target="#deploy-fields" hx-swap="innerHTML"
+                      hx-trigger="keyup changed delay:400ms";
                 span class="hint" { "Comma-separated." }
             }
         } @else {
@@ -475,6 +533,48 @@ fn deploy_fields_markup(form: &ProjectForm) -> Markup {
                 span { "Command" }
                 textarea name="command" rows="3" placeholder="./deploy.sh" { (form.command) }
                 span class="hint" { "Runs with sh -c from the project directory." }
+            }
+        }
+        (command_preview(form))
+    }
+}
+
+/// Show the exact command a deploy will run, built from the same helper the
+/// project page uses, so the form is never a guess about what happens.
+fn command_preview(form: &ProjectForm) -> Markup {
+    let preview = config::deploy_command_preview(&ProjectConfig {
+        deploy_preset: form.deploy_preset.clone(),
+        compose_file: if form.compose_file.trim().is_empty() {
+            "docker-compose.yml".to_string()
+        } else {
+            form.compose_file.trim().to_string()
+        },
+        compose_profiles: form
+            .compose_profiles
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+        command: form.command.clone(),
+        ..ProjectConfig::new(
+            "preview".into(),
+            "preview".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "github".into(),
+        )
+    });
+
+    html! {
+        div id="cmd-preview-wrap" {
+            span class="field-label" { "Runs" }
+            @if preview.trim().is_empty() {
+                p class="hint" { "Fill in the command above." }
+            } @else {
+                pre id="cmd-preview" class="log cmd-preview" { (preview) }
             }
         }
     }

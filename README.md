@@ -105,7 +105,7 @@ Run `webhookr --help` for the same list.
 | `webhookr logs --id <ID> [--lines <N>]` | Tail the latest run's log (default 50 lines). |
 | `webhookr run --id <ID> [--no-pull]` | Pull the latest source, then run the deployment; `--no-pull` deploys the checkout as-is. |
 | `webhookr update --id <ID>` | Clone or fast-forward the source, then deploy it. |
-| `webhookr cloudflare --hostname hooks.example.com [--admin-hostname deploy.example.com]` | Provision a Cloudflare Tunnel; reads `CLOUDFLARE_API_TOKEN` or `--api-token`. |
+| `webhookr cloudflare [--hostname hooks.example.com] [--admin-hostname deploy.example.com]` | Provision a Cloudflare Tunnel; at least one hostname required. Reads `CLOUDFLARE_API_TOKEN` or `--api-token`. |
 
 ## Deployment presets
 
@@ -120,6 +120,14 @@ The add/edit wizard and CLI support four deployment modes:
 
 Use `--compose-profile <name>` more than once to enable Compose profiles.
 Compose files must be relative to the checkout and cannot use `..` to escape it.
+
+### Private repositories
+
+Set an **access token** on the project (web UI, `Source` section) to clone and
+pull private repos over HTTPS — a GitHub personal access token with read access
+to the repository. It is handed to git through a credential helper that reads an
+environment variable, so it never appears in the process list and is never
+written into the checkout's `.git/config`.
 
 If `--repository` is set and the project path does not exist, the first update
 clones that branch into the path. Later updates fetch, check out, and fast-forward
@@ -144,8 +152,10 @@ webhookr web enable --addr 127.0.0.1:9001
 sudo systemctl restart webhookr
 ```
 
-The UI then runs inside the same `webhookr serve` process as the webhook
-listener, on its own port — no second service to manage.
+The UI runs inside the same `webhookr serve` process as the webhook listener.
+Its port serves **both** surfaces: the dashboard at `/`, and webhooks at
+`/webhook/<id>` (with `/hooks/<id>` kept as an alias). So one hostname is
+enough for everything.
 
 ### Reaching it
 
@@ -154,17 +164,29 @@ Cloudflare Tunnel: `cloudflared` runs on the same host and connects to
 `http://127.0.0.1:<port>`. Binding to `0.0.0.0` would additionally expose the
 panel on the LAN and the server's public IP, where Access cannot protect it.
 
-To publish it, give it its own hostname:
+To publish it on one hostname, provision the tunnel with only an admin
+hostname — the admin port already serves webhooks too:
 
 ```sh
 export CLOUDFLARE_API_TOKEN='scoped-token'
-webhookr cloudflare --hostname hooks.example.com --admin-hostname deploy.example.com
+webhookr cloudflare --admin-hostname deploy.example.com
 sudo systemctl restart webhookr
 ```
 
-The admin UI **must** use a hostname separate from the webhook listener: an
-Access policy on the webhook hostname would break GitHub, which cannot complete
-an Access login. Then add an Access policy on `deploy.example.com`.
+That gives you `https://deploy.example.com` for the dashboard and
+`https://deploy.example.com/webhook/<id>` for GitHub.
+
+> **Access needs a path exception.** GitHub cannot complete an Access login, so
+> a policy covering the whole hostname will silently break every delivery. In
+> the Access application for `deploy.example.com`, add a **Bypass** policy for
+> the path `/webhook/*` (and `/hooks/*` if you use the alias) ahead of your
+> normal policy. Those paths stay protected by the per-project HMAC/token check.
+
+If you would rather keep them apart, pass both and Access only the admin host:
+
+```sh
+webhookr cloudflare --hostname hooks.example.com --admin-hostname deploy.example.com
+```
 
 For a quick look without persisting anything, and without exposing it at all:
 
@@ -181,6 +203,7 @@ webhookr serve --web --web-port 9001    # then browse http://127.0.0.1:9001
 | `/projects/{id}` | Config, webhook URL, reveal-on-click secret, recent runs. |
 | `/runs`, `/runs/{id}` | Run history and a log view that streams while a deploy is running, then stops polling by itself. |
 | `/settings`, `/settings/cloudflare` | Listen addresses and tunnel provisioning. |
+| `/webhook/{id}` | The webhook receiver, on this same port. Not behind the CSRF or Access-header checks — it authenticates with the project secret instead. |
 
 Requests that change anything are rejected unless the browser reports them as
 same-origin, so a page on another site cannot drive the panel using your Access

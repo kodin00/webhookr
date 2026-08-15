@@ -20,6 +20,11 @@ pub fn page(title: &str, body: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "webhookr — " (title) }
+                // htmx otherwise injects a <style> block for its request
+                // indicators, which `style-src 'self'` blocks. Turning it off
+                // keeps the CSP strict instead of relaxing it to
+                // 'unsafe-inline'; the indicator styling lives in app.css.
+                meta name="htmx-config" content=r#"{"includeIndicatorStyles":false}"#;
                 link rel="stylesheet" href={ "/static/app.css?v=" (version) };
                 script src={ "/static/htmx.min.js?v=" (version) } defer {}
             }

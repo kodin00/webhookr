@@ -101,9 +101,7 @@ pub async fn serve(port: Option<u16>, web_override: WebOverride) -> Result<()> {
         println!("  !! the admin UI has no login; protect it with Cloudflare Access");
     }
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/hooks/{id}", post(webhook));
+    let app = webhook_router();
 
     // Bind both up front so a port clash fails at startup, where systemd will
     // report it, rather than leaving the daemon half-started.
@@ -131,6 +129,22 @@ pub async fn serve(port: Option<u16>, web_override: WebOverride) -> Result<()> {
         web::serve(&web_addr, state),
     )?;
     Ok(())
+}
+
+/// Routes that receive webhooks.
+///
+/// `/webhook/{id}` and `/hooks/{id}` are the same handler: `/hooks` is what
+/// earlier versions published and is kept so already-configured senders keep
+/// working, `/webhook` is the name used when the admin port serves everything
+/// from a single hostname.
+pub fn webhook_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/webhook/{id}", post(webhook))
+        .route("/hooks/{id}", post(webhook))
 }
 
 /// Keep the host portion of `addr` but swap in `port` (split at the last `:`).

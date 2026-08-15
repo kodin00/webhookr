@@ -88,12 +88,45 @@ pub fn listen_port(address: &str) -> u16 {
         .unwrap_or(9000)
 }
 
-/// Public webhook URL for a project: the tunnel hostname when one is
-/// configured, otherwise the raw listen address.
+/// Public webhook URL for a project.
+///
+/// Prefers a dedicated webhook hostname when one is configured. Otherwise the
+/// admin hostname doubles as the webhook host, since the admin port serves
+/// `/webhook/{id}` alongside the dashboard — that is the single-hostname setup.
 pub fn webhook_url(config: &AppConfig, project_id: &str) -> String {
-    match &config.cloudflare {
-        Some(tunnel) => format!("https://{}/hooks/{project_id}", tunnel.hostname),
-        None => format!("http://{}/hooks/{project_id}", config.listen_addr),
+    if let Some(tunnel) = &config.cloudflare {
+        if !tunnel.hostname.trim().is_empty() {
+            return format!("https://{}/hooks/{project_id}", tunnel.hostname);
+        }
+        if let Some(admin) = tunnel.admin_hostname.as_deref() {
+            return format!("https://{admin}/webhook/{project_id}");
+        }
+    }
+    if config.web.enabled {
+        format!("http://{}/webhook/{project_id}", config.web.listen_addr)
+    } else {
+        format!("http://{}/hooks/{project_id}", config.listen_addr)
+    }
+}
+
+/// The exact shell command a deployment will run, for display.
+///
+/// Built from the same fields the executor uses, so what the UI shows is what
+/// actually runs.
+pub fn deploy_command_preview(project: &ProjectConfig) -> String {
+    if !project.uses_compose() {
+        return project.command.clone();
+    }
+
+    let mut base = format!("docker compose -f {}", project.compose_file);
+    for profile in &project.compose_profiles {
+        base.push_str(&format!(" --profile {profile}"));
+    }
+
+    match project.deploy_preset.as_str() {
+        "compose_pull" => format!("{base} pull\n{base} up -d --remove-orphans"),
+        "compose_build" => format!("{base} up -d --build --remove-orphans"),
+        _ => format!("{base} up -d --remove-orphans"),
     }
 }
 
@@ -117,6 +150,13 @@ pub struct ProjectConfig {
     /// Git remote cloned when `path` does not exist. Empty keeps legacy local-checkout behavior.
     #[serde(default)]
     pub repository: String,
+    /// Personal access token for private repositories.
+    ///
+    /// Passed to git through a credential helper reading an environment
+    /// variable, so it never appears in the process list and is never written
+    /// into the checkout's `.git/config`.
+    #[serde(default)]
+    pub git_token: String,
     /// Deployment preset: `custom`, `compose_build`, `compose_pull`, or `compose_up`.
     #[serde(default = "default_deploy_preset")]
     pub deploy_preset: String,
@@ -148,6 +188,7 @@ impl ProjectConfig {
             secret,
             verify_mode,
             repository: String::new(),
+            git_token: String::new(),
             deploy_preset: default_deploy_preset(),
             compose_file: default_compose_file(),
             compose_profiles: Vec::new(),
@@ -570,6 +611,7 @@ mod tests {
             secret: "secret".into(),
             verify_mode: "github".into(),
             repository: "https://github.com/example/site.git".into(),
+            git_token: String::new(),
             deploy_preset: "compose_up".into(),
             compose_file: "deploy/compose.yaml".into(),
             compose_profiles: vec!["web".into()],

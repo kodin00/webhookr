@@ -26,8 +26,9 @@ use super::AppState;
 /// Full HTML pages.
 pub fn pages() -> Router<AppState> {
     Router::new()
+        // `/healthz` deliberately lives in `server::webhook_router`, which is
+        // merged in alongside this — so both ports answer the same probe.
         .route("/", get(dashboard::index))
-        .route("/healthz", get(dashboard::healthz))
         .route("/projects", get(projects::list).post(projects::create))
         .route("/projects/new", get(projects::new_form))
         .route("/projects/{id}", get(projects::detail).post(projects::update))

@@ -140,22 +140,18 @@ async fn sync_project(
             .parent()
             .map(|parent| parent.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
-        let ok = run_command(
-            "git",
-            &[
-                "clone",
-                "--branch",
-                p.branch.as_str(),
-                "--single-branch",
-                p.repository.as_str(),
-                p.path.as_str(),
-            ],
-            &cwd,
-            "git clone",
-            log,
-        )
-        .await
-        .map_err(|error| format!("failed to run git clone: {error:#}"))?;
+        let mut command = git_command(p);
+        command.args([
+            "clone",
+            "--branch",
+            p.branch.as_str(),
+            "--single-branch",
+            p.repository.as_str(),
+            p.path.as_str(),
+        ]);
+        let ok = exec(command, &cwd, "git clone", log)
+            .await
+            .map_err(|error| format!("failed to run git clone: {error:#}"))?;
         return ok
             .then_some(())
             .ok_or_else(|| last_error("git clone failed", log_path));
@@ -175,7 +171,9 @@ async fn sync_project(
     ];
     for (step, args) in git_steps {
         let label = format!("git {step}");
-        let ok = run_command("git", &args, &p.path, &label, log)
+        let mut command = git_command(p);
+        command.args(&args);
+        let ok = exec(command, &p.path, &label, log)
             .await
             .map_err(|error| format!("failed to run {label}: {error:#}"))?;
         if !ok {
@@ -224,6 +222,32 @@ async fn deploy(p: &ProjectConfig, log: &mut std::fs::File) -> Result<bool> {
     }
 }
 
+/// A `git` command carrying the project's credentials, if it has any.
+///
+/// The token is handed over through a credential helper that reads an
+/// environment variable. That keeps it out of the process list (where a URL
+/// like `https://token@github.com/...` would expose it to every user on the
+/// box) and out of the checkout's `.git/config`, so it is not persisted to disk
+/// by git and does not survive in a repository someone later copies.
+fn git_command(project: &ProjectConfig) -> Command {
+    let mut command = Command::new("git");
+    let token = project.git_token.trim();
+    if !token.is_empty() {
+        command
+            // Clear inherited helpers first, so a system-wide helper cannot
+            // answer before ours and silently use the wrong account.
+            .arg("-c")
+            .arg("credential.helper=")
+            .arg("-c")
+            .arg(
+                "credential.helper=!f() { echo username=x-access-token; \
+                 echo \"password=$WEBHOOKR_GIT_TOKEN\"; }; f",
+            )
+            .env("WEBHOOKR_GIT_TOKEN", token);
+    }
+    command
+}
+
 /// Run one command, streaming its output straight into the run log.
 ///
 /// The child inherits duplicated descriptors of the log file, which was opened
@@ -239,6 +263,18 @@ async fn run_command(
     label: &str,
     log: &mut std::fs::File,
 ) -> Result<bool> {
+    let mut command = Command::new(program);
+    command.args(args);
+    exec(command, cwd, label, log).await
+}
+
+/// Run a pre-built command, streaming its output into the run log.
+async fn exec(
+    mut command: Command,
+    cwd: &str,
+    label: &str,
+    log: &mut std::fs::File,
+) -> Result<bool> {
     writeln!(log, "--- {label} ---")?;
     let stdout = log
         .try_clone()
@@ -247,8 +283,7 @@ async fn run_command(
         .try_clone()
         .with_context(|| format!("failed to attach log to {label}"))?;
 
-    let status = Command::new(program)
-        .args(args)
+    let status = command
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))

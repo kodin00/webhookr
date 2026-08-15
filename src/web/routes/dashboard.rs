@@ -1,8 +1,6 @@
 //! Dashboard and health probe.
 
-use axum::Json;
 use maud::{html, Markup};
-use serde_json::json;
 use std::collections::HashMap;
 
 use crate::config;
@@ -116,12 +114,3 @@ fn project_grid(cfg: &config::AppConfig) -> Markup {
     }
 }
 
-/// Mirrors the webhook server's probe so either port can be monitored.
-pub async fn healthz() -> Json<serde_json::Value> {
-    let projects = config::load_config().map(|c| c.projects.len()).unwrap_or(0);
-    Json(json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-        "projects": projects,
-    }))
-}
