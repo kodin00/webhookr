@@ -884,18 +884,31 @@ impl App {
                     } else {
                         "token".to_string()
                     };
-                    // The TUI wizard has no token field; carry forward whatever
-                    // is already stored so editing here never wipes a token set
-                    // from the web UI.
-                    let git_token = self
-                        .config
-                        .get(&id)
+                    // The TUI wizard has no token field, and no commit-status
+                    // fields; carry forward whatever is already stored so
+                    // editing here never wipes what was set in the web UI.
+                    let stored = self.config.get(&id).cloned();
+                    let git_token = stored
+                        .as_ref()
                         .map(|existing| existing.git_token.clone())
+                        .unwrap_or_default();
+                    let (status_reports, status_token, status_context) = stored
+                        .as_ref()
+                        .map(|existing| {
+                            (
+                                existing.status_reports,
+                                existing.status_token.clone(),
+                                existing.status_context.clone(),
+                            )
+                        })
                         .unwrap_or_default();
                     let project = ProjectConfig {
                         id,
                         name,
                         git_token,
+                        status_reports,
+                        status_token,
+                        status_context,
                         path: w.path.value().trim().to_string(),
                         branch: w.branch.value().trim().to_string(),
                         command: w.command.value().trim().to_string(),

@@ -109,6 +109,31 @@ pub fn webhook_url(config: &AppConfig, project_id: &str) -> String {
     }
 }
 
+/// Public base URL of the admin UI, when there is one worth handing to a third
+/// party.
+///
+/// Used for the `target_url` of a GitHub commit status, which GitHub renders as
+/// the status's "Details" link. Two deliberate differences from [`webhook_url`]:
+///
+/// - `cloudflare.hostname` is never used. It routes to the webhook listener,
+///   which serves only `/healthz` and `/webhook/{id}`; the run pages exist on
+///   the admin router alone, so a link built from it would always 404.
+/// - There is no fallback to a listen address. The default is loopback, and a
+///   `http://127.0.0.1:9001/...` link is dead for everyone who clicks it while
+///   also advertising internal topology to a third party. No link is better.
+pub fn admin_base_url(config: &AppConfig) -> Option<String> {
+    if !config.web.enabled {
+        return None;
+    }
+    let host = config
+        .cloudflare
+        .as_ref()
+        .and_then(|tunnel| tunnel.admin_hostname.as_deref())
+        .or(config.web.hostname.as_deref())?
+        .trim();
+    (!host.is_empty()).then(|| format!("https://{host}"))
+}
+
 /// The exact shell command a deployment will run, for display.
 ///
 /// Built from the same fields the executor uses, so what the UI shows is what
@@ -166,6 +191,22 @@ pub struct ProjectConfig {
     /// Optional Compose profiles enabled during deployment.
     #[serde(default)]
     pub compose_profiles: Vec<String>,
+    /// Report deploy outcomes to GitHub as a commit status, so the deployed
+    /// commit shows the pending/success/failure indicator on the repo page.
+    #[serde(default)]
+    pub status_reports: bool,
+    /// Token for the GitHub Statuses API. Needs write access to commit statuses
+    /// (`repo:status` on a classic PAT, or "Commit statuses: write" on a
+    /// fine-grained one). Empty falls back to [`Self::git_token`]: a token
+    /// scoped only to *read* contents cannot write statuses, so the two are
+    /// separable, but a single PAT covers the common case.
+    #[serde(default)]
+    pub status_token: String,
+    /// The `context` label GitHub shows beside the status. Empty derives
+    /// `webhookr/{id}`, so several projects reporting on one repository do not
+    /// overwrite each other's status.
+    #[serde(default)]
+    pub status_context: String,
 }
 
 impl ProjectConfig {
@@ -192,6 +233,9 @@ impl ProjectConfig {
             deploy_preset: default_deploy_preset(),
             compose_file: default_compose_file(),
             compose_profiles: Vec::new(),
+            status_reports: false,
+            status_token: String::new(),
+            status_context: String::new(),
         }
     }
 
@@ -251,6 +295,21 @@ impl ProjectConfig {
                 bail!("compose profiles must be non-empty names and may not start with '-'");
             }
         }
+        // Sent verbatim to GitHub as a JSON string and shown as a label beside
+        // the commit, so it has to be a short single line.
+        //
+        // Note what is deliberately *not* checked here: whether status
+        // reporting has a usable repository and token. The executor validates
+        // before every run, so a rule here would turn a misconfigured *report*
+        // into a failed *deploy*. See [`Self::status_report_problem`].
+        if !self.status_context.trim().is_empty() {
+            if self.status_context.chars().any(char::is_control) {
+                bail!("status context must be a single line");
+            }
+            if self.status_context.chars().count() > 100 {
+                bail!("status context must be at most 100 characters");
+            }
+        }
         Ok(())
     }
 
@@ -265,6 +324,62 @@ impl ProjectConfig {
             "compose_up" => "Compose up",
             _ => "Custom command",
         }
+    }
+
+    /// Token to use for the Statuses API: the dedicated one, else the
+    /// repository access token, which is enough when one PAT covers both.
+    pub fn effective_status_token(&self) -> &str {
+        let dedicated = self.status_token.trim();
+        if dedicated.is_empty() {
+            self.git_token.trim()
+        } else {
+            dedicated
+        }
+    }
+
+    /// The `context` this project reports under. Per-project by default, so two
+    /// webhookr projects deploying from one repository do not overwrite each
+    /// other's indicator.
+    pub fn effective_status_context(&self) -> String {
+        let configured = self.status_context.trim();
+        if configured.is_empty() {
+            format!("webhookr/{}", self.id)
+        } else {
+            configured.to_string()
+        }
+    }
+
+    /// Why commit status reporting will not work for this project, if it will
+    /// not. `None` when it is off, or on and usable.
+    ///
+    /// Advisory only: surfaced in the admin UI when a project is saved, and
+    /// logged once per run. Deliberately kept out of [`Self::validate`], which
+    /// the executor calls before every deploy — a rule there would let a
+    /// misconfigured status report block the deploy it was meant to report on.
+    pub fn status_report_problem(&self) -> Option<String> {
+        if !self.status_reports {
+            return None;
+        }
+        if self.repository.trim().is_empty() {
+            return Some(
+                "set a repository URL, so webhookr knows which repository to report to"
+                    .to_string(),
+            );
+        }
+        if crate::github::parse_repo(&self.repository).is_none() {
+            return Some(format!(
+                "{} is not a repository URL webhookr can report to",
+                self.repository
+            ));
+        }
+        if self.effective_status_token().is_empty() {
+            return Some(
+                "set an access token that can write commit statuses (the repository \
+                 access token is used when this is left blank)"
+                    .to_string(),
+            );
+        }
+        None
     }
 }
 
@@ -572,6 +687,10 @@ mod tests {
         assert_eq!(project.deploy_preset, "custom");
         assert_eq!(project.compose_file, "compose.yaml");
         assert!(project.repository.is_empty());
+        // An upgrade must not start making outbound calls to github.com.
+        assert!(!project.status_reports);
+        assert!(project.status_token.is_empty());
+        assert!(project.status_context.is_empty());
         assert!(config.cloudflare.is_none());
         // A config written before the web UI existed must not switch it on.
         assert!(!config.web.enabled);
@@ -615,6 +734,9 @@ mod tests {
             deploy_preset: "compose_up".into(),
             compose_file: "deploy/compose.yaml".into(),
             compose_profiles: vec!["web".into()],
+            status_reports: false,
+            status_token: String::new(),
+            status_context: String::new(),
         };
         project.validate().unwrap();
     }
@@ -650,6 +772,140 @@ mod tests {
         assert!(leading_dash_repo.validate().is_err());
 
         assert!(base().validate().is_ok());
+    }
+
+    #[test]
+    fn status_reporting_never_blocks_a_deploy() {
+        let mut project = ProjectConfig::new(
+            "site".into(),
+            "Site".into(),
+            "/tmp".into(),
+            "main".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        project.status_reports = true;
+
+        // Reporting is switched on but has nothing to report to. The executor
+        // calls `validate` before every run, so this MUST still pass: a broken
+        // report may never break the deploy.
+        project.validate().unwrap();
+        assert!(project.status_report_problem().is_some());
+
+        project.repository = "/srv/local-mirror.git".into();
+        project.validate().unwrap();
+        assert!(
+            project.status_report_problem().is_some(),
+            "a filesystem remote has nowhere to report to"
+        );
+
+        project.repository = "https://github.com/me/site.git".into();
+        project.validate().unwrap();
+        assert!(
+            project.status_report_problem().is_some(),
+            "still no token"
+        );
+
+        project.git_token = "ghp_repo".into();
+        project.validate().unwrap();
+        assert_eq!(project.status_report_problem(), None);
+
+        // Switched off, nothing to complain about even with a broken remote.
+        project.status_reports = false;
+        project.repository = "nonsense".into();
+        assert_eq!(project.status_report_problem(), None);
+    }
+
+    #[test]
+    fn status_token_and_context_fall_back() {
+        let mut project = ProjectConfig::new(
+            "my-site".into(),
+            "Site".into(),
+            "/tmp".into(),
+            "main".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        // Per-project by default, so two projects on one repo do not collide.
+        assert_eq!(project.effective_status_context(), "webhookr/my-site");
+        assert_eq!(project.effective_status_token(), "");
+
+        project.git_token = "ghp_clone".into();
+        assert_eq!(
+            project.effective_status_token(),
+            "ghp_clone",
+            "one PAT should cover both"
+        );
+
+        project.status_token = "ghp_statuses".into();
+        assert_eq!(project.effective_status_token(), "ghp_statuses");
+
+        project.status_context = "  deploy/production  ".into();
+        assert_eq!(project.effective_status_context(), "deploy/production");
+    }
+
+    #[test]
+    fn status_context_must_be_a_short_single_line() {
+        let mut project = ProjectConfig::new(
+            "site".into(),
+            "Site".into(),
+            "/tmp".into(),
+            "main".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        project.status_context = "deploy\nproduction".into();
+        assert!(project.validate().is_err());
+
+        project.status_context = "x".repeat(101);
+        assert!(project.validate().is_err());
+
+        project.status_context = "deploy/production".into();
+        project.validate().unwrap();
+    }
+
+    #[test]
+    fn details_links_are_only_built_for_a_reachable_admin_ui() {
+        let mut config = AppConfig::default();
+        // Admin UI off: nothing to link to.
+        assert_eq!(super::admin_base_url(&config), None);
+
+        // On, but bound to loopback with no public hostname. A 127.0.0.1 link
+        // would be dead for everyone who clicked it.
+        config.web.enabled = true;
+        assert_eq!(super::admin_base_url(&config), None);
+
+        config.web.hostname = Some("deploy.example.com".into());
+        assert_eq!(
+            super::admin_base_url(&config).as_deref(),
+            Some("https://deploy.example.com")
+        );
+
+        // The tunnel's admin hostname wins. The webhook hostname is never used:
+        // it routes to a listener that does not serve the run pages at all.
+        config.cloudflare = Some(super::CloudflareConfig {
+            hostname: "hooks.example.com".into(),
+            account_id: "acct".into(),
+            zone_id: "zone".into(),
+            tunnel_id: "tunnel".into(),
+            tunnel_name: "webhookr".into(),
+            admin_hostname: Some("panel.example.com".into()),
+            admin_zone_id: None,
+        });
+        assert_eq!(
+            super::admin_base_url(&config).as_deref(),
+            Some("https://panel.example.com")
+        );
+
+        // A tunnel with only a webhook hostname still yields no admin link.
+        config.web.hostname = None;
+        if let Some(tunnel) = config.cloudflare.as_mut() {
+            tunnel.admin_hostname = None;
+        }
+        assert_eq!(super::admin_base_url(&config), None);
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod cli;
 mod cloudflare;
 mod config;
 mod executor;
+mod github;
 mod server;
 mod state;
 mod tui;

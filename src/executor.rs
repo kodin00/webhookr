@@ -10,6 +10,7 @@ use std::time::Instant;
 use tokio::process::Command;
 
 use crate::config::ProjectConfig;
+use crate::github;
 use crate::state::RunRecord;
 
 /// Rough cap for the summary line derived from command output.
@@ -33,20 +34,51 @@ fn project_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// What kicked a run off.
+///
+/// A webhook delivery carries the push payload — already HMAC-verified by
+/// [`crate::server`] — which is where the commit to report a status against
+/// comes from. The CLI, TUI and admin UI use [`Default`] and fall back to
+/// whatever the checkout has at HEAD.
+#[derive(Debug, Default)]
+pub struct Trigger {
+    pub payload: Option<github::PushPayload>,
+}
+
 /// Clone or fast-forward the source, then deploy it.
 pub async fn run_project(p: &ProjectConfig) -> Result<RunRecord> {
-    run(p, true).await
+    run(p, true, Trigger::default()).await
+}
+
+/// [`run_project`] for a webhook delivery, carrying the verified push payload.
+pub async fn run_project_with(p: &ProjectConfig, trigger: Trigger) -> Result<RunRecord> {
+    run(p, true, trigger).await
 }
 
 /// Re-run the configured deployment without touching the Git checkout.
 /// Used only as an explicit escape hatch (`run --no-pull`, TUI "Run deployment").
 pub async fn deploy_project(p: &ProjectConfig) -> Result<RunRecord> {
-    run(p, false).await
+    run(p, false, Trigger::default()).await
 }
 
-async fn run(p: &ProjectConfig, sync_source: bool) -> Result<RunRecord> {
+async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<RunRecord> {
     p.validate()?;
     crate::config::ensure_dirs()?;
+
+    // Built before the lock: the refusal path below reports too, and it has
+    // neither a run id nor a log file to hang the report on.
+    let mut reporter = github::Reporter::for_project(p, trigger.payload.as_ref());
+
+    // The pushed sha is only usable when the push was to the branch this
+    // project deploys. webhookr does not filter deliveries by branch, so a push
+    // to `dev` still deploys `main` — reporting against the `dev` commit would
+    // be a lie. When the ref does not match we fall back to post-sync HEAD.
+    let pushed_sha = trigger
+        .payload
+        .as_ref()
+        .filter(|payload| github::ref_matches(payload, &p.branch))
+        .and_then(github::payload_sha)
+        .map(str::to_string);
 
     // Single-flight per project: a webhook and a manual trigger must not race
     // `git pull` and `docker compose up` on the same checkout. `try_lock`
@@ -54,6 +86,14 @@ async fn run(p: &ProjectConfig, sync_source: bool) -> Result<RunRecord> {
     // cannot wedge the project behind an invisible queue.
     let lock = project_lock(&p.id);
     let Ok(_guard) = lock.try_lock() else {
+        // Terminal, not `pending`: nothing would ever resolve a pending here.
+        // Silence would read on GitHub as "the webhook is not wired up", hiding
+        // a push that really was received and not deployed. In the common case
+        // the in-flight run's own `git pull` picks this commit up anyway and its
+        // final status — same sha, same context — supersedes this one.
+        if let (Some(reporter), Some(sha)) = (reporter.as_mut(), pushed_sha.as_deref()) {
+            reporter.refused(sha).await;
+        }
         bail!("a run for {} is already in progress", p.id);
     };
 
@@ -94,30 +134,110 @@ async fn run(p: &ProjectConfig, sync_source: bool) -> Result<RunRecord> {
         eprintln!("webhookr: could not record run start: {error:#}");
     }
 
-    if sync_source {
-        if let Err(message) = sync_project(p, &mut log, &log_path).await {
-            return finalize(
-                &mut log,
-                &id,
-                &p.id,
-                &started_at,
-                started,
-                "failed",
-                message,
-            );
+    if let Some(reporter) = reporter.as_mut() {
+        reporter.set_run_url(&id);
+        // A manual run carries no payload, so it announces against the checkout
+        // as it stands. That is what lets a redeploy clear a stale red X on the
+        // commit that is actually live.
+        let sha = match pushed_sha.clone() {
+            Some(sha) => Some(sha),
+            None => head_sha(&p.path).await,
+        };
+        if let Some(sha) = sha {
+            reporter.pending(&sha, Some(&mut log)).await;
         }
     }
 
-    let deploy_ok = match deploy(p, &mut log).await {
+    let (status, state, message) = if sync_source {
+        match sync_project(p, &mut log, &log_path).await {
+            // The source could never be fetched, so the deployment did not run
+            // at all. That is what GitHub's `error` means, as against a deploy
+            // that ran and failed.
+            Err(message) => ("failed", github::State::Error, message),
+            Ok(()) => {
+                // The pull may have moved HEAD past what we announced: a newer
+                // push, or a run that had already fetched. Announce the commit
+                // that is actually deploying; both then get the final state, so
+                // neither is left pending forever.
+                if let Some(reporter) = reporter.as_mut() {
+                    if let Some(head) = head_sha(&p.path).await {
+                        reporter.pending(&head, Some(&mut log)).await;
+                    }
+                }
+                deploy_phase(p, &mut log, &log_path).await
+            }
+        }
+    } else {
+        deploy_phase(p, &mut log, &log_path).await
+    };
+
+    // History before GitHub: the admin UI polls `finished_at` to stop tailing
+    // the log, so a slow API call must not hold a finished run visibly open.
+    let record = finalize(
+        &mut log,
+        &id,
+        &p.id,
+        &started_at,
+        started,
+        status,
+        message.clone(),
+    )?;
+    if let Some(reporter) = reporter.as_mut() {
+        let text = if state == github::State::Success {
+            format!("deployed in {}", human_duration(record.duration_ms))
+        } else {
+            message
+        };
+        reporter.finish(state, &text, &mut log).await;
+    }
+    Ok(record)
+}
+
+/// Run the configured deployment and classify the result.
+///
+/// Extracted so both the "source synced" and "no sync requested" paths reach it
+/// without duplicating the error handling. Infallible: a log write that fails is
+/// not a reason to lose the run's outcome.
+async fn deploy_phase(
+    p: &ProjectConfig,
+    log: &mut std::fs::File,
+    log_path: &Path,
+) -> (&'static str, github::State, String) {
+    let ok = match deploy(p, log).await {
         Ok(ok) => ok,
         Err(error) => {
-            writeln!(log, "--- deployment error ---\n{error:#}")?;
+            let _ = writeln!(log, "--- deployment error ---\n{error:#}");
             false
         }
     };
-    let status = if deploy_ok { "success" } else { "failed" };
-    let message = summary_line(&log_path).unwrap_or_else(|| "no output".to_string());
-    finalize(&mut log, &id, &p.id, &started_at, started, status, message)
+    let message = summary_line(log_path).unwrap_or_else(|| "no output".to_string());
+    if ok {
+        ("success", github::State::Success, message)
+    } else {
+        ("failed", github::State::Failure, message)
+    }
+}
+
+/// The commit currently checked out, or `None` if there isn't one.
+///
+/// A plain [`Command`] rather than [`git_command`]: `rev-parse` reads only local
+/// refs, so it is never handed the project's token. And `.output()` rather than
+/// [`exec`], because this is the one git call whose stdout we need to read
+/// instead of stream into the run log.
+async fn head_sha(path: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 async fn sync_project(
@@ -370,6 +490,18 @@ fn finalize(
     Ok(record)
 }
 
+/// A run duration for display in a commit status, where there is room for a
+/// rounded figure and nothing more.
+fn human_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{}s", (ms + 500) / 1000)
+    } else {
+        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
 /// Truncate to roughly [`MAX_MESSAGE_CHARS`] characters, marking cuts with `...`.
 fn truncate(s: &str) -> String {
     if s.chars().count() <= MAX_MESSAGE_CHARS {
@@ -384,6 +516,7 @@ fn truncate(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
     use std::process::Command as StdCommand;
 
     use super::sync_project;
@@ -442,6 +575,90 @@ mod tests {
             "two"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The guard on requirement one: GitHub being unreachable must not change
+    /// the outcome of a deploy.
+    #[tokio::test]
+    async fn a_dead_github_does_not_fail_the_deploy() {
+        let root =
+            std::env::temp_dir().join(format!("webhookr-status-{}", crate::util::new_run_id()));
+        fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEBHOOKR_STATE_DIR", root.join("state"));
+
+        let mut project = ProjectConfig::new(
+            "site".into(),
+            "Site".into(),
+            root.to_string_lossy().into_owned(),
+            "main".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        project.repository = "https://github.com/me/site.git".into();
+        project.status_reports = true;
+        project.status_token = "ghp_not-a-real-token".into();
+
+        // Port 1 refuses instantly, so this is a fast, offline stand-in for
+        // every way the Statuses API can be unavailable.
+        let mut reporter = crate::github::Reporter::with_api_base(
+            &project,
+            crate::github::RepoSlug {
+                host: "github.com".into(),
+                owner: "me".into(),
+                repo: "site".into(),
+            },
+            "http://127.0.0.1:1".into(),
+        );
+
+        let log_path = root.join("run.log");
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(log, "--- custom command ---").unwrap();
+        writeln!(log, "Successfully tagged site:latest").unwrap();
+
+        reporter
+            .pending("1111111111111111111111111111111111111111", Some(&mut log))
+            .await;
+        reporter
+            .finish(
+                crate::github::State::Success,
+                "Successfully tagged site:latest",
+                &mut log,
+            )
+            .await;
+
+        let written = fs::read_to_string(&log_path).unwrap();
+        assert!(
+            written.contains("# github status: could not post"),
+            "the failure should be noted, not hidden: {written}"
+        );
+        assert!(
+            !written.contains("ghp_not-a-real-token"),
+            "the token must never reach the run log: {written}"
+        );
+        // The load-bearing part: those notes are the last lines in the log, and
+        // the run's history message must still be the real command output.
+        assert_eq!(
+            super::summary_line(&log_path).as_deref(),
+            Some("Successfully tagged site:latest")
+        );
+
+        std::env::remove_var("WEBHOOKR_STATE_DIR");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durations_read_as_durations() {
+        assert_eq!(super::human_duration(0), "0ms");
+        assert_eq!(super::human_duration(940), "940ms");
+        assert_eq!(super::human_duration(1_400), "1s");
+        assert_eq!(super::human_duration(1_600), "2s");
+        assert_eq!(super::human_duration(59_000), "59s");
+        assert_eq!(super::human_duration(150_000), "2m30s");
     }
 
     #[test]

@@ -241,6 +241,80 @@ webhookr verifies the `X-Hub-Signature-256` header against the project's
 secret before running anything, so only requests signed with the secret are
 accepted.
 
+To get the deploy result back onto the commit as a green check or red X, see
+[GitHub commit status](#github-commit-status).
+
+## GitHub commit status
+
+webhookr can report each deploy back to GitHub as a **commit status**, so the
+commit you pushed shows the pending dot, green check or red X on the repository
+page, the commits list and any pull request that contains it. Clicking
+**Details** opens that run's log.
+
+It is off by default. Turn it on per project in the web admin UI, under
+`GitHub commit status` on the project form. Three settings:
+
+| Setting | What it does |
+| --- | --- |
+| Report deploy results | The master switch for this project. |
+| Status token | A token that can **write commit statuses**. Leave blank to reuse the project's access token. |
+| Context | The label GitHub shows beside the status. Defaults to `webhookr/<id>`. |
+
+The token needs `repo:status` on a classic personal access token, or
+**Commit statuses: write** on a fine-grained one scoped to the single
+repository. `repo:status` is deliberately narrow — it grants no access to the
+repository's code. A fine-grained token scoped only to read contents (the right
+scope for cloning) **cannot** write statuses, which is why this is a separate
+field; when one token covers both, leave it blank and the access token is used.
+
+The default context is per project, so two webhookr projects deploying from one
+repository do not overwrite each other's indicator.
+
+### What gets posted
+
+- `pending` when the deploy starts.
+- `success` when it finishes, described as e.g. `deployed in 47s`.
+- `failure` when the deploy command exits non-zero, described with the last
+  line of its output.
+- `error` when the source could not be fetched at all, so nothing was deployed.
+
+The status lands on the commit named in the push payload when the push was to
+the project's branch, and on whatever `git rev-parse HEAD` reports otherwise —
+including for manual deploys (`webhookr run`, `webhookr update`, the TUI, the
+admin UI's Deploy button). That is deliberate: a redeploy after a fix clears a
+stale red X on the commit that is actually live.
+
+If the pull moves HEAD past the commit that was announced — a newer push landed
+first — both commits get the final status, so nothing is left showing `pending`
+forever.
+
+A push that arrives while that project is already deploying is refused rather
+than queued (see [How it works](#how-it-works)), and gets a terminal `error`
+saying so. In the usual case the in-flight run's own `git pull` picks that
+commit up anyway, and its result supersedes the `error` on the same commit.
+
+Posting a status can never fail or delay a deploy. Anything that goes wrong —
+an unreachable API, a rejected token, a commit GitHub does not know about — is
+written into the run log as a `# github status:` line and otherwise ignored.
+
+### The Details link
+
+`Details` points at `/runs/<run-id>` on the admin UI, which needs a public
+hostname to be worth sending. webhookr uses the tunnel's **admin hostname** if
+there is one; with only a loopback address configured the link is omitted
+rather than pointing at `127.0.0.1`, and GitHub simply shows no link. The
+webhook hostname is never used for it — that one routes to a listener that does
+not serve the run pages.
+
+Following the link hits Cloudflare Access normally and logs you in; unlike
+`/webhook/*`, it needs no bypass policy, because a person is clicking it.
+
+### GitHub Enterprise
+
+Derived from the repository URL, with nothing to configure: a `github.com`
+remote uses `api.github.com`, and any other host is treated as GitHub
+Enterprise Server at `https://<host>/api/v3`.
+
 ## `token` verify mode
 
 For non-GitHub senders, set the project's `verify_mode` to `token`

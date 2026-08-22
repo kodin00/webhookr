@@ -305,6 +305,17 @@ fn print_project(p: &ProjectConfig) {
     println!("  verify_mode: {}", p.verify_mode);
     println!("  repository:  {}", display_or_dash(&p.repository));
     println!("  deployment:  {}", p.preset_label());
+    // Read-only: commit status reporting is configured in the web admin UI,
+    // like the access token it shares, but a CLI-only operator should still be
+    // able to see whether it is on.
+    println!(
+        "  commit status: {}",
+        if p.status_reports {
+            p.effective_status_context()
+        } else {
+            "-".to_string()
+        }
+    );
     if p.uses_compose() {
         println!("  compose:     {}", p.compose_file);
         println!(

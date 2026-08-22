@@ -13,6 +13,7 @@ use serde_json::json;
 use crate::cloudflare;
 use crate::config::{self, ProjectConfig};
 use crate::executor;
+use crate::github;
 use crate::util;
 use crate::web;
 
@@ -195,8 +196,17 @@ async fn webhook(
         );
     }
 
+    // Parsed only now, never before `verify_secret`: it is the signature that
+    // makes the repository and commit named in the body trustworthy enough to
+    // post a status against. Any other event (`ping`, `workflow_run`, or a
+    // non-GitHub sender in `token` mode) yields no payload and simply carries no
+    // commit, leaving the run to report against whatever it checks out.
+    let trigger = executor::Trigger {
+        payload: github::parse_push(&body),
+    };
+
     std::mem::drop(tokio::spawn(async move {
-        if let Err(error) = executor::run_project(&project).await {
+        if let Err(error) = executor::run_project_with(&project, trigger).await {
             // Includes the single-flight rejection when a run is already going.
             eprintln!("webhookr: run for {} failed to start: {error:#}", project.id);
         }

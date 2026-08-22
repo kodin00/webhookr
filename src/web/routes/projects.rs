@@ -130,6 +130,18 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
             (views::code_field("URL", &hook_url))
             (views::field("Verification", verify_label(&project.verify_mode)))
 
+            @if project.status_reports {
+                (views::code_field("Commit status", &project.effective_status_context()))
+                @if let Some(problem) = project.status_report_problem() {
+                    div class="field" {
+                        span class="field-label" {}
+                        span class="field-value warn-inline" { (problem) }
+                    }
+                }
+            } @else {
+                (views::field("Commit status", "not reported"))
+            }
+
             div class="field" {
                 span class="field-label" { "Secret" }
                 span class="field-value" {
@@ -216,10 +228,21 @@ pub async fn new_form() -> Result<Markup, WebError> {
         compose_file: "compose.yaml".to_string(),
         compose_profiles: String::new(),
         verify_mode: "github".to_string(),
+        status_reports: None,
+        status_token: String::new(),
+        clear_status_token: None,
+        status_context: String::new(),
     };
     Ok(views::page(
         "Add project",
-        project_form("Add project", "/projects", &blank, None, None, false),
+        project_form(
+            "Add project",
+            "/projects",
+            &blank,
+            None,
+            None,
+            StoredSecrets::default(),
+        ),
     ))
 }
 
@@ -234,7 +257,7 @@ pub async fn edit_form(Path(id): Path<String>) -> Result<Markup, WebError> {
             &form,
             Some(&project.id),
             None,
-            !project.git_token.is_empty(),
+            StoredSecrets::of(&project),
         ),
     ))
 }
@@ -254,7 +277,7 @@ pub async fn create(Form(form): Form<ProjectForm>) -> Result<Response, WebError>
                         &form,
                         None,
                         Some(&forms::explain(&error)),
-                        false,
+                        StoredSecrets::default(),
                     ),
                 ),
             )
@@ -283,7 +306,7 @@ pub async fn create(Form(form): Form<ProjectForm>) -> Result<Response, WebError>
                     &form,
                     None,
                     Some(&forms::explain(&error)),
-                    false,
+                    StoredSecrets::default(),
                 ),
             ),
         )
@@ -310,7 +333,7 @@ pub async fn update(
                         &form,
                         Some(&id),
                         Some(&forms::explain(&error)),
-                        !existing.git_token.is_empty(),
+                        StoredSecrets::of(&existing),
                     ),
                 ),
             )
@@ -325,6 +348,26 @@ pub async fn update(
     Ok(Redirect::to(&format!("/projects/{id}")).into_response())
 }
 
+/// Which of a project's tokens are already on file.
+///
+/// A struct rather than a pair of positional `bool`s: the form has several call
+/// sites, and two adjacent bare booleans are the kind of argument that silently
+/// swaps places during an edit.
+#[derive(Debug, Default, Clone, Copy)]
+struct StoredSecrets {
+    git_token: bool,
+    status_token: bool,
+}
+
+impl StoredSecrets {
+    fn of(project: &ProjectConfig) -> Self {
+        Self {
+            git_token: !project.git_token.is_empty(),
+            status_token: !project.status_token.is_empty(),
+        }
+    }
+}
+
 /// The add/edit form: every field the TUI's nine-step wizard collects, at once.
 fn project_form(
     title: &str,
@@ -332,12 +375,24 @@ fn project_form(
     form: &ProjectForm,
     existing_id: Option<&str>,
     error: Option<&str>,
-    has_token: bool,
+    stored: StoredSecrets,
 ) -> Markup {
-    let token_placeholder = if has_token {
-        "stored — leave blank to keep it"
+    let kept = "stored — leave blank to keep it";
+    let token_placeholder = if stored.git_token {
+        kept
     } else {
         "ghp_… or github_pat_…"
+    };
+    let status_token_placeholder = if stored.status_token {
+        kept
+    } else {
+        "blank reuses the access token above"
+    };
+    // The context the project will actually report under, so the placeholder
+    // shows the real default rather than a generic example.
+    let context_placeholder = match existing_id {
+        Some(id) => format!("webhookr/{id}"),
+        None => "webhookr/<slug>".to_string(),
     };
     html! {
         section class="page-head" { h1 { (title) } }
@@ -385,7 +440,7 @@ fn project_form(
                         "never lands in the process list or in .git/config."
                     }
                 }
-                @if has_token {
+                @if stored.git_token {
                     label class="checkbox" {
                         input type="checkbox" name="clear_git_token" value="1";
                         span { "Remove the stored token" }
@@ -458,6 +513,49 @@ fn project_form(
                 }
             }
 
+            fieldset {
+                legend { "GitHub commit status" }
+
+                label class="checkbox" {
+                    input type="checkbox" name="status_reports" value="1"
+                          checked[form.status_reports.is_some()];
+                    span { "Report deploy results on the commit" }
+                }
+                span class="hint" {
+                    "GitHub shows the pending dot, green check or red X beside the "
+                    "deployed commit on the repository page."
+                }
+
+                label {
+                    span { "Status token" span class="optional" { "optional" } }
+                    input type="password" name="status_token" autocomplete="off"
+                          placeholder=(status_token_placeholder);
+                    span class="hint" {
+                        "Needs write access to commit statuses: repo:status on a classic "
+                        "token, or \"Commit statuses: write\" on a fine-grained one. Leave "
+                        "blank to reuse the access token above — a token that can only read "
+                        "contents cannot write statuses, so the two may need to differ."
+                    }
+                }
+                @if stored.status_token {
+                    label class="checkbox" {
+                        input type="checkbox" name="clear_status_token" value="1";
+                        span { "Remove the stored status token" }
+                    }
+                }
+
+                label {
+                    span { "Context" span class="optional" { "optional" } }
+                    input type="text" name="status_context" value=(form.status_context)
+                          placeholder=(context_placeholder);
+                    span class="hint" {
+                        "The label GitHub shows beside the status. Defaults to one per "
+                        "project, so two projects deploying from one repository do not "
+                        "overwrite each other."
+                    }
+                }
+            }
+
             div class="form-actions" {
                 button type="submit" class="button primary" { "Save project" }
                 a class="button" href="/projects" { "Cancel" }
@@ -487,6 +585,10 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
             .unwrap_or_else(|| "docker-compose.yml".to_string()),
         compose_profiles: query.compose_profiles.unwrap_or_default(),
         verify_mode: String::new(),
+        status_reports: None,
+        status_token: String::new(),
+        clear_status_token: None,
+        status_context: String::new(),
     };
     deploy_fields_markup(&form)
 }

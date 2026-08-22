@@ -45,6 +45,18 @@ pub struct ProjectForm {
     pub compose_profiles: String,
     #[serde(default)]
     pub verify_mode: String,
+    /// Present when the "report commit statuses" checkbox is ticked.
+    #[serde(default)]
+    pub status_reports: Option<String>,
+    /// Blank on edit means "leave the stored token alone", exactly as
+    /// [`Self::git_token`] does.
+    #[serde(default)]
+    pub status_token: String,
+    /// Set by a checkbox to explicitly clear a stored status token.
+    #[serde(default)]
+    pub clear_status_token: Option<String>,
+    #[serde(default)]
+    pub status_context: String,
 }
 
 impl ProjectForm {
@@ -80,6 +92,15 @@ impl ProjectForm {
             submitted_token.to_string()
         };
 
+        let submitted_status_token = self.status_token.trim();
+        let status_token = if self.clear_status_token.is_some() {
+            String::new()
+        } else if submitted_status_token.is_empty() {
+            existing.map(|p| p.status_token.clone()).unwrap_or_default()
+        } else {
+            submitted_status_token.to_string()
+        };
+
         let compose_file = if self.compose_file.trim().is_empty() {
             "compose.yaml".to_string()
         } else {
@@ -111,6 +132,9 @@ impl ProjectForm {
             deploy_preset,
             compose_file,
             compose_profiles: split_profiles(&self.compose_profiles),
+            status_reports: self.status_reports.is_some(),
+            status_token,
+            status_context: self.status_context.trim().to_string(),
         };
 
         project.validate()?;
@@ -133,6 +157,11 @@ impl ProjectForm {
             compose_file: project.compose_file.clone(),
             compose_profiles: project.compose_profiles.join(", "),
             verify_mode: project.verify_mode.clone(),
+            status_reports: project.status_reports.then(|| "1".to_string()),
+            // Never echo a stored token back into the page.
+            status_token: String::new(),
+            clear_status_token: None,
+            status_context: project.status_context.clone(),
         }
     }
 }
@@ -181,6 +210,10 @@ mod tests {
             compose_file: String::new(),
             compose_profiles: " web , , worker\nextra ".into(),
             verify_mode: "github".into(),
+            status_reports: None,
+            status_token: String::new(),
+            clear_status_token: None,
+            status_context: String::new(),
         }
     }
 
@@ -213,6 +246,39 @@ mod tests {
             .to_project(Some(&original))
             .unwrap();
         assert_eq!(original, rebuilt);
+    }
+
+    #[test]
+    fn a_stored_status_token_survives_an_edit_unless_cleared() {
+        let mut created = form();
+        created.status_reports = Some("1".into());
+        created.status_token = "ghp_statuses".into();
+        let original = created.to_project(None).unwrap();
+        assert!(original.status_reports);
+        assert_eq!(original.status_token, "ghp_statuses");
+
+        // The edit form never renders the token, so it comes back blank. That
+        // must mean "keep it", not "clear it".
+        let rebuilt = ProjectForm::from_project(&original);
+        assert!(rebuilt.status_token.is_empty(), "the token must not be echoed back");
+        assert_eq!(
+            rebuilt.to_project(Some(&original)).unwrap().status_token,
+            "ghp_statuses"
+        );
+
+        // Ticking the clear checkbox does clear it.
+        let mut cleared = ProjectForm::from_project(&original);
+        cleared.clear_status_token = Some("1".into());
+        assert!(cleared
+            .to_project(Some(&original))
+            .unwrap()
+            .status_token
+            .is_empty());
+
+        // Unticking the enable checkbox switches reporting off.
+        let mut off = ProjectForm::from_project(&original);
+        off.status_reports = None;
+        assert!(!off.to_project(Some(&original)).unwrap().status_reports);
     }
 
     #[test]
