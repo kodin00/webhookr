@@ -26,11 +26,52 @@ service that starts on boot and restarts on failure.
 
 ### Updating
 
-Re-run the same command — it overwrites the installed binary with the latest
-release, refreshes the systemd service, and restarts it. Your config
-(`~/.config/webhookr/`) and run history are left untouched.
+Easiest is from the app itself: **Settings → Version → Update and restart** in
+the web UI, or `Update webhookr` (`v`) in the TUI. Both download the published
+build, verify its checksum, and replace the binary. From a shell:
 
-To build from source instead, see [Build](#build).
+```sh
+webhookr version       # what is running, and what is published
+webhookr self-update   # replace this binary with the published build
+```
+
+Re-running the install one-liner also works. It overwrites the binary, rewrites
+the systemd unit, and restarts the service. Two things to know about that path:
+
+- The unit is regenerated from scratch every time, with
+  `User=` set to whoever invoked the script. Run it from the same account as
+  before — if `User=` changes, systemd hands the daemon a different `$HOME`, it
+  reads a different `config.json`, and every project appears to have vanished.
+  Any other hand-edits to the unit are overwritten too.
+- `releases/latest/download` serves whatever `latest` points at right now, with
+  no error if that is still the previous build. If you push and install within
+  the same couple of minutes, you can silently reinstall the old binary — which
+  is exactly what `webhookr version` is for.
+
+Your config (`~/.config/webhookr/`) and run history are left untouched either
+way. To build from source instead, see [Build](#build).
+
+### Which build am I running?
+
+A release is a single rolling `latest` tag, so the tag says nothing about what
+is in it. Every build therefore carries the commit it came from:
+
+```sh
+$ webhookr version
+running:   0.2.0 (73deef9)
+published: 0.2.0 (73deef9) (up to date)
+```
+
+The same pair is on **Settings → Version** in the web UI and in the TUI banner.
+`(local build)` instead of a commit means the binary was built from a checkout
+rather than installed from a release.
+
+Self-update needs write access to the installed binary. The daemon deliberately
+does not run as root, so if `/usr/local/bin/webhookr` is root-owned the update
+will say so and the install one-liner (which uses `sudo`) is the way through.
+Updating from the web UI or `serve` also exits the process on purpose, so the
+service manager starts the new binary; if you are running `webhookr serve` in a
+terminal rather than under systemd, it will not come back by itself.
 
 ## How it works
 
@@ -106,6 +147,8 @@ Run `webhookr --help` for the same list.
 | `webhookr run --id <ID> [--no-pull]` | Pull the latest source, then run the deployment; `--no-pull` deploys the checkout as-is. |
 | `webhookr update --id <ID>` | Clone or fast-forward the source, then deploy it. |
 | `webhookr cloudflare [--hostname hooks.example.com] [--admin-hostname deploy.example.com]` | Provision a Cloudflare Tunnel; at least one hostname required. Reads `CLOUDFLARE_API_TOKEN` or `--api-token`. |
+| `webhookr version [--offline]` | Show the running build and compare it with the published one. |
+| `webhookr self-update [--check]` | Replace this binary with the published build; `--check` only reports. |
 
 ## Deployment presets
 
@@ -141,9 +184,10 @@ stream live, and configure the Cloudflare Tunnel — with ordinary web forms
 instead of a nine-step terminal wizard.
 
 > **It has no login.** Anyone who can reach it can set a project's deploy
-> command and run it as the daemon's user. Put Cloudflare Access (or an
-> equivalent) in front of it before exposing it, and set `User=` in the systemd
-> unit so that user is not root.
+> command and run it as the daemon's user, and can replace the webhookr binary
+> with the published build. Put Cloudflare Access (or an equivalent) in front of
+> it before exposing it, and set `User=` in the systemd unit so that user is not
+> root.
 
 It is **off by default**. Turn it on with:
 
@@ -202,7 +246,7 @@ webhookr serve --web --web-port 9001    # then browse http://127.0.0.1:9001
 | `/projects/new`, `/projects/{id}/edit` | The whole project form on one page, with a server-side directory picker for the checkout path. |
 | `/projects/{id}` | Config, webhook URL, reveal-on-click secret, recent runs. |
 | `/runs`, `/runs/{id}` | Run history and a log view that streams while a deploy is running, then stops polling by itself. |
-| `/settings`, `/settings/cloudflare` | Listen addresses and tunnel provisioning. |
+| `/settings`, `/settings/cloudflare` | Listen addresses, the running build with an update button, and tunnel provisioning. |
 | `/webhook/{id}` | The webhook receiver, on this same port. Not behind the CSRF or Access-header checks — it authenticates with the project secret instead. |
 
 Requests that change anything are rejected unless the browser reports them as
@@ -228,6 +272,7 @@ the stylesheet are compiled into the binary.
 | `q` | Quit |
 | `c` | Configure Cloudflare Tunnel |
 | `w` | Toggle the web admin UI on or off |
+| `v` | Update webhookr to the published build |
 
 ## Configuring a GitHub webhook
 

@@ -6,6 +6,7 @@ mod github;
 mod server;
 mod state;
 mod tui;
+mod update;
 mod util;
 mod web;
 

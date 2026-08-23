@@ -1,9 +1,10 @@
 [package]
 name = "webhookr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Self-hosted webhook runner: trigger git pull + deploy commands from GitHub webhooks"
 license = "MIT"
+repository = "https://github.com/kodin00/webhookr"
 
 [[bin]]
 name = "webhookr"

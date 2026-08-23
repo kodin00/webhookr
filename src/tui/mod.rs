@@ -28,6 +28,7 @@ use ratatui::{Frame, Terminal};
 use crate::cloudflare;
 use crate::config::{self, AppConfig, ProjectConfig};
 use crate::state;
+use crate::update;
 use crate::util;
 
 // ----- palette -----------------------------------------------------------
@@ -41,7 +42,7 @@ const TEXT: Color = Color::Gray;
 
 // ----- menu --------------------------------------------------------------
 
-const MENU: [(&str, &str, &str); 10] = [
+const MENU: [(&str, &str, &str); 11] = [
     ("+", "Add project", "Register a checkout and deploy command"),
     ("U", "Update app", "Clone or pull source, then deploy"),
     (">", "Run deployment", "Deploy again without pulling source"),
@@ -52,6 +53,7 @@ const MENU: [(&str, &str, &str); 10] = [
     ("-", "Remove project", "Delete a configured route"),
     ("#", "View run log", "Read output from the latest run"),
     ("W", "Web admin UI", "Toggle the browser dashboard on or off"),
+    ("^", "Update webhookr", "Check for a newer build and install it"),
 ];
 
 /// Launch the interactive management TUI (blocks until the user quits).
@@ -581,6 +583,9 @@ impl App {
             KeyCode::Char('d') => self.activate_menu(7),
             KeyCode::Char('l') => self.activate_menu(8),
             KeyCode::Char('w') => self.activate_menu(9),
+            // Past index 9 the digit shortcut cannot reach it: a single
+            // keypress only ever spells 1-9.
+            KeyCode::Char('v') => self.activate_menu(10),
             KeyCode::Char('j') | KeyCode::Down => {
                 self.menu_selected = (self.menu_selected + 1) % MENU.len();
             }
@@ -614,8 +619,47 @@ impl App {
             7 => self.open_list(ListMode::Remove),
             8 => self.open_list(ListMode::Log),
             9 => self.toggle_web_ui(),
+            10 => self.self_update(),
             _ => {}
         }
+    }
+
+    /// Check for a newer published build and install it.
+    ///
+    /// Shells out to `webhookr self-update` rather than calling the updater
+    /// here, for the same reason [`Self::trigger_project`] does: this loop is
+    /// synchronous and running on an async runtime's thread, so the async work
+    /// belongs in a child process. Blocking for the download is acceptable —
+    /// the TUI blocks on key events anyway, and there is nothing to draw
+    /// meanwhile.
+    fn self_update(&mut self) {
+        let Ok(exe) = std::env::current_exe() else {
+            self.last_msg = Some("could not locate the webhookr binary".to_string());
+            return;
+        };
+        let output = std::process::Command::new(exe)
+            .arg("self-update")
+            .stdin(std::process::Stdio::null())
+            .output();
+
+        let text = match output {
+            Ok(output) => {
+                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                let errors = String::from_utf8_lossy(&output.stderr);
+                if !errors.trim().is_empty() {
+                    text.push_str(&errors);
+                }
+                if text.trim().is_empty() {
+                    text = "self-update produced no output".to_string();
+                }
+                text
+            }
+            Err(error) => format!("could not run self-update: {error}"),
+        };
+        self.screen = Screen::Log {
+            text: util::strip_ansi(&text),
+            scroll: 0,
+        };
     }
 
     /// Flip the web admin UI on or off and persist it.
@@ -1147,6 +1191,10 @@ impl App {
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" // CONTROL PLANE", Style::default().fg(TEXT)),
+                Span::styled(
+                    format!("    v{}", update::Build::current().label()),
+                    Style::default().fg(MUTED),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("listen  ", Style::default().fg(MUTED)),
@@ -1228,7 +1276,7 @@ impl App {
             Paragraph::new(key_hints(&[
                 ("j/k", "move"),
                 ("enter", "select"),
-                ("1-9/u/c", "jump"),
+                ("1-9/u/c/v", "jump"),
                 ("q", "quit"),
             ])),
             chunks[3],

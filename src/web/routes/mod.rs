@@ -48,6 +48,10 @@ pub fn pages() -> Router<AppState> {
             "/settings/cloudflare",
             get(settings::cloudflare_form).post(settings::cloudflare_save),
         )
+        // POST, like every other state-changing route: the CSRF guard exempts
+        // GET, and a prefetched link must never replace the binary.
+        .route("/settings/check-update", post(settings::check_update))
+        .route("/settings/update", post(settings::self_update))
 }
 
 /// htmx fragments: bare markup, no page chrome.

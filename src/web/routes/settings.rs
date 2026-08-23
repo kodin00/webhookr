@@ -10,12 +10,13 @@ use serde::Deserialize;
 
 use crate::cloudflare;
 use crate::config;
+use crate::update;
 use crate::web::views;
 use crate::web::WebError;
 
 pub async fn index() -> Result<Markup, WebError> {
     let cfg = config::load_config()?;
-    Ok(views::page("Settings", settings_body(&cfg, None, None)))
+    Ok(views::page("Settings", settings_body(&cfg, None, None, None)))
 }
 
 #[derive(Deserialize)]
@@ -53,7 +54,7 @@ pub async fn save(Form(form): Form<SettingsForm>) -> Result<Response, WebError> 
                 StatusCode::UNPROCESSABLE_ENTITY,
                 views::page(
                     "Settings",
-                    settings_body(&cfg, None, Some(&format!("{error:#}"))),
+                    settings_body(&cfg, None, Some(&format!("{error:#}")), None),
                 ),
             )
                 .into_response())
@@ -61,7 +62,12 @@ pub async fn save(Form(form): Form<SettingsForm>) -> Result<Response, WebError> 
     }
 }
 
-fn settings_body(cfg: &config::AppConfig, notice: Option<&str>, error: Option<&str>) -> Markup {
+fn settings_body(
+    cfg: &config::AppConfig,
+    notice: Option<&str>,
+    error: Option<&str>,
+    checked: Option<&Result<update::Build, String>>,
+) -> Markup {
     html! {
         section class="page-head" { h1 { "Settings" } }
         @if let Some(notice) = notice { (views::alert("ok", notice)) }
@@ -118,13 +124,113 @@ fn settings_body(cfg: &config::AppConfig, notice: Option<&str>, error: Option<&s
             p { a class="button" href="/settings/cloudflare" { "Configure tunnel" } }
         }
 
+        (version_card(checked))
+
         section class="card" {
             h2 { "Paths" }
             (views::code_field("Config", &config::config_path().display().to_string()))
             (views::code_field("State", &config::state_dir().display().to_string()))
             (views::code_field("Logs", &config::log_dir().display().to_string()))
-            (views::field("Version", env!("CARGO_PKG_VERSION")))
         }
+    }
+}
+
+// ----- version & updates -------------------------------------------------
+
+/// Running build, published build, and the button between them.
+///
+/// `checked` is the result of an on-demand comparison — the page does not check
+/// on every load, because that would put a network call in front of a settings
+/// page that has to work when GitHub does not.
+fn version_card(checked: Option<&Result<update::Build, String>>) -> Markup {
+    let current = update::Build::current();
+    html! {
+        section id="version" class="card" {
+            h2 { "Version" }
+            (views::code_field("Running", &current.label()))
+
+            @match checked {
+                None => {
+                    p class="hint" {
+                        "A release is a single rolling tag, so the commit in brackets is what \
+                         actually identifies a build. Check it against what is published to \
+                         see whether this server is up to date."
+                    }
+                }
+                Some(Ok(latest)) => {
+                    (views::code_field("Published", &latest.label()))
+                    @if *latest == current {
+                        p class="field-value" { "Up to date." }
+                    } @else {
+                        p class="warn-inline" { "An update is available." }
+                        form method="post" action="/settings/update" {
+                            button type="submit" class="button primary"
+                                   hx-confirm="Replace the binary and restart the daemon?" {
+                                "Update and restart"
+                            }
+                            span class="hint" {
+                                "Downloads the published build, verifies its checksum, replaces \
+                                 this binary and exits so the service manager starts it again. \
+                                 If you are running webhookr in a terminal rather than under \
+                                 systemd, it will not come back by itself."
+                            }
+                        }
+                    }
+                }
+                Some(Err(error)) => (views::alert("error", error)),
+            }
+
+            p {
+                button type="submit" class="button" form="version-check" { "Check for updates" }
+            }
+            form id="version-check" method="post" action="/settings/check-update" {}
+        }
+    }
+}
+
+pub async fn check_update() -> Result<Markup, WebError> {
+    let cfg = config::load_config()?;
+    let checked = update::latest().await.map_err(|error| format!("{error:#}"));
+    Ok(views::page(
+        "Settings",
+        settings_body(&cfg, None, None, Some(&checked)),
+    ))
+}
+
+pub async fn self_update() -> Result<Response, WebError> {
+    let cfg = config::load_config()?;
+    match update::install().await {
+        Ok(update::Outcome::UpToDate(build)) => {
+            let notice = format!("Already running the published build: {}", build.label());
+            Ok(views::page("Settings", settings_body(&cfg, Some(&notice), None, None)).into_response())
+        }
+        Ok(update::Outcome::Replaced { from, to, path }) => {
+            println!(
+                "webhookr: replaced {} ({} -> {}); exiting so the service restarts",
+                path.display(),
+                from.label(),
+                to.label()
+            );
+            // Respond first, then go. The new binary only starts running when
+            // this process ends, and the operator should see why it happened.
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                std::process::exit(update::RESTART_EXIT_CODE);
+            });
+            let notice = format!(
+                "Updated to {}. Restarting — reload this page in a few seconds.",
+                to.label()
+            );
+            Ok(views::page("Settings", settings_body(&cfg, Some(&notice), None, None)).into_response())
+        }
+        Err(error) => Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            views::page(
+                "Settings",
+                settings_body(&cfg, None, Some(&format!("{error:#}")), None),
+            ),
+        )
+            .into_response()),
     }
 }
 

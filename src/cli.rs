@@ -10,10 +10,18 @@ use crate::executor;
 use crate::server;
 use crate::state;
 use crate::tui;
+use crate::update;
 use crate::util;
 
 #[derive(Parser)]
-#[command(name = "webhookr", version, about = "Self-hosted webhook runner", long_about = None)]
+#[command(
+    name = "webhookr",
+    // Carries the release commit, so "which build is this?" has an answer
+    // without opening the UI. A rolling `latest` tag cannot answer it.
+    version = update::version_string(),
+    about = "Self-hosted webhook runner",
+    long_about = None
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -128,6 +136,18 @@ pub enum Commands {
     Update {
         #[arg(long)]
         id: String,
+    },
+    /// Show the running build and check for a newer published one
+    Version {
+        /// Skip the check against the published release
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Replace this binary with the latest published build
+    SelfUpdate {
+        /// Report what would change without downloading anything
+        #[arg(long)]
+        check: bool,
     },
     /// Provision a Cloudflare Tunnel and public hostname
     Cloudflare {
@@ -245,6 +265,8 @@ async fn handle(cmd: Commands) -> Result<()> {
         Commands::Logs { id, lines } => cmd_logs(id, lines),
         Commands::Run { id, no_pull } => cmd_run(id, no_pull).await,
         Commands::Update { id } => cmd_update(id).await,
+        Commands::Version { offline } => cmd_version(offline).await,
+        Commands::SelfUpdate { check } => cmd_self_update(check).await,
         Commands::Cloudflare {
             api_token,
             hostname,
@@ -652,6 +674,58 @@ fn cmd_web(action: WebAction) -> Result<()> {
                     "no"
                 }
             );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_version(offline: bool) -> Result<()> {
+    let current = update::Build::current();
+    println!("running:   {}", current.label());
+    if offline {
+        return Ok(());
+    }
+    match update::latest().await {
+        Ok(latest) if latest == current => println!("published: {} (up to date)", latest.label()),
+        Ok(latest) => {
+            println!("published: {}", latest.label());
+            println!("an update is available; run 'webhookr self-update'");
+        }
+        // Being unable to reach GitHub is not a failure of this command: the
+        // running build is still reported, which is the part that matters.
+        Err(error) => println!("published: could not check ({error:#})"),
+    }
+    Ok(())
+}
+
+async fn cmd_self_update(check: bool) -> Result<()> {
+    let current = update::Build::current();
+    if check {
+        let latest = update::latest().await?;
+        println!("running:   {}", current.label());
+        println!("published: {}", latest.label());
+        println!(
+            "{}",
+            if latest == current {
+                "up to date"
+            } else {
+                "an update is available"
+            }
+        );
+        return Ok(());
+    }
+
+    match update::install().await? {
+        update::Outcome::UpToDate(build) => {
+            println!("already running the published build: {}", build.label());
+        }
+        update::Outcome::Replaced { from, to, path } => {
+            println!("replaced {}", path.display());
+            println!("  was: {}", from.label());
+            println!("  now: {}", to.label());
+            // This process is the CLI, not the daemon. Restarting the service
+            // needs privileges this may not have, and is the operator's call.
+            println!("restart the daemon to run it: sudo systemctl restart webhookr");
         }
     }
     Ok(())

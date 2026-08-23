@@ -28,11 +28,16 @@ jobs:
 
       - name: Build (x86_64)
         run: cargo build --release --target x86_64-unknown-linux-gnu
+        env:
+          # Baked in so `webhookr version` can say which build is running. The
+          # release tag is a rolling `latest`, so it identifies nothing.
+          WEBHOOKR_BUILD_SHA: ${{ github.sha }}
 
       - name: Build (aarch64)
         run: cargo build --release --target aarch64-unknown-linux-gnu
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          WEBHOOKR_BUILD_SHA: ${{ github.sha }}
 
       - name: Stage assets
         run: |
@@ -41,6 +46,10 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/webhookr dist/webhookr-linux-aarch64
           sed "s|__REPO__|${{ github.repository }}|g" install.sh > dist/install.sh
           chmod +x dist/install.sh
+          # The crate version and the commit, which together name this build.
+          # `webhookr version` fetches this to decide whether it is current.
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          printf '%s %s\n' "$version" "${{ github.sha }}" > dist/VERSION
           (cd dist && sha256sum webhookr-linux-x86_64 webhookr-linux-aarch64 > SHA256SUMS)
 
       - name: Publish release
@@ -49,7 +58,8 @@ jobs:
         run: |
           set -euo pipefail
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           gh release create latest dist/* \
-            --title "webhookr latest" \
-            --notes "Rolling release built from $(git rev-parse --short HEAD)." \
+            --title "webhookr v${version}" \
+            --notes "webhookr ${version}, built from $(git rev-parse --short HEAD)." \
             --target "$GITHUB_SHA"

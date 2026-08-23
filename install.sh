@@ -61,7 +61,9 @@ Wants=network-online.target
 [Service]
 User=${run_user}
 ExecStart=${BIN} serve
-Restart=on-failure
+# always, not on-failure: a self-update exits deliberately so the new binary is
+# the one that comes back, and on-failure would stop the service instead.
+Restart=always
 RestartSec=3
 
 [Install]
