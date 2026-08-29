@@ -203,10 +203,9 @@ async fn fetch(url: &str) -> Result<Vec<u8>> {
 fn asset_name() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok("webhookr-linux-x86_64"),
-        ("linux", "aarch64") => Ok("webhookr-linux-aarch64"),
         (os, arch) => bail!(
             "there is no published build for {os}/{arch}; releases cover Linux \
-             x86_64 and aarch64 only, so update this one from source"
+             x86_64 only, so update this one from source"
         ),
     }
 }
@@ -331,7 +330,7 @@ mod tests {
     #[test]
     fn finds_the_checksum_for_an_asset() {
         let sums = "\
-aaaa1111  webhookr-linux-aarch64
+aaaa1111  webhookr-linux-other
 BBBB2222  webhookr-linux-x86_64
 ";
         assert_eq!(
@@ -340,7 +339,7 @@ BBBB2222  webhookr-linux-x86_64
             "hashes compare case-insensitively"
         );
         assert_eq!(
-            expected_sum(sums, "webhookr-linux-aarch64").as_deref(),
+            expected_sum(sums, "webhookr-linux-other").as_deref(),
             Some("aaaa1111")
         );
         assert_eq!(expected_sum(sums, "webhookr-linux-riscv64"), None);

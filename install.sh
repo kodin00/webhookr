@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install webhookr from the latest GitHub release (Linux x86_64 / aarch64).
+# Install webhookr from the latest GitHub release (Linux x86_64).
 # Installs the binary and, when systemd is present, configures a webhookr
 # service so the daemon starts on boot and restarts on failure.
 #
@@ -21,8 +21,7 @@ esac
 
 case "$(uname -m)" in
   x86_64|amd64) arch="x86_64" ;;
-  aarch64|arm64) arch="aarch64" ;;
-  *) echo "webhookr: unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+  *) echo "webhookr: unsupported architecture: $(uname -m) (x86_64 only)" >&2; exit 1 ;;
 esac
 
 asset="webhookr-linux-$arch"
