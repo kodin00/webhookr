@@ -130,23 +130,32 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         status: "running".to_string(),
         duration_ms: 0,
         message: format!("{action} in progress"),
+        // Best guess while the run is in flight: the pushed sha when the
+        // webhook carried one, otherwise unknown until the deploy finishes.
+        commit: pushed_sha.clone(),
     }) {
         eprintln!("webhookr: could not record run start: {error:#}");
     }
 
+    // The sha to announce against at the start: the pushed one when we have
+    // it, otherwise the checkout as it stands. A manual run carries no payload,
+    // so it announces against the current HEAD, which is also what lets a
+    // redeploy clear a stale red X on the commit that is actually live.
+    let start_sha = match pushed_sha.clone() {
+        Some(sha) => Some(sha),
+        None => head_sha(&p.path).await,
+    };
     if let Some(reporter) = reporter.as_mut() {
         reporter.set_run_url(&id);
-        // A manual run carries no payload, so it announces against the checkout
-        // as it stands. That is what lets a redeploy clear a stale red X on the
-        // commit that is actually live.
-        let sha = match pushed_sha.clone() {
-            Some(sha) => Some(sha),
-            None => head_sha(&p.path).await,
-        };
-        if let Some(sha) = sha {
-            reporter.pending(&sha, Some(&mut log)).await;
+        if let Some(sha) = &start_sha {
+            reporter.pending(sha, Some(&mut log)).await;
         }
     }
+
+    // The commit this run ends up deploying, kept for the run history. A
+    // synced run re-reads HEAD after the pull, which may have moved past the
+    // sha announced above; a no-sync run deploys exactly that HEAD.
+    let mut commit = if sync_source { pushed_sha.clone() } else { start_sha };
 
     let (status, state, message) = if sync_source {
         match sync_project(p, &mut log, &log_path).await {
@@ -156,11 +165,13 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
             Err(message) => ("failed", github::State::Error, message),
             Ok(()) => {
                 // The pull may have moved HEAD past what we announced: a newer
-                // push, or a run that had already fetched. Announce the commit
-                // that is actually deploying; both then get the final state, so
-                // neither is left pending forever.
-                if let Some(reporter) = reporter.as_mut() {
-                    if let Some(head) = head_sha(&p.path).await {
+                // push, or a run that had already fetched. The commit actually
+                // deploying is the post-pull HEAD — record it for the history,
+                // and announce it so both shas get the final state and neither
+                // is left pending forever.
+                if let Some(head) = head_sha(&p.path).await {
+                    commit = Some(head.clone());
+                    if let Some(reporter) = reporter.as_mut() {
                         reporter.pending(&head, Some(&mut log)).await;
                     }
                 }
@@ -181,6 +192,7 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         started,
         status,
         message.clone(),
+        commit,
     )?;
     if let Some(reporter) = reporter.as_mut() {
         let text = if state == github::State::Success {
@@ -468,6 +480,7 @@ fn finalize(
     started: Instant,
     status: &str,
     message: String,
+    commit: Option<String>,
 ) -> Result<RunRecord> {
     let finished_at = crate::util::now_iso();
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -480,6 +493,7 @@ fn finalize(
         status: status.to_string(),
         duration_ms,
         message,
+        commit,
     };
 
     writeln!(

@@ -46,14 +46,17 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
                 div class="table-scroll" {
                     table {
                         thead { tr {
-                            th { "Status" } th { "Project" } th { "Started" }
-                            th { "Duration" } th { "Summary" }
+                            th { "Status" } th { "Project" } th { "Commit" }
+                            th { "Started" } th { "Duration" } th { "Summary" }
                         } }
                         tbody {
                             @for run in &runs {
                                 tr {
                                     td { (views::status_badge(Some(run))) }
                                     td { a href={ "/projects/" (run.project_id) } { (run.project_id) } }
+                                    td class="mono small" title=[run.commit.as_deref()] {
+                                        (short_sha(run))
+                                    }
                                     td class="mono small" {
                                         a href={ "/runs/" (run.id) } { (run.started_at) }
                                     }
@@ -77,6 +80,16 @@ fn find_run(run_id: &str) -> Result<RunRecord, WebError> {
         .ok_or_else(|| WebError::not_found("run"))
 }
 
+/// A sha clipped to the seven characters GitHub itself prints, so the column
+/// stays narrow; the full value rides along in the cell's tooltip.
+fn short_sha(run: &RunRecord) -> String {
+    match run.commit.as_deref() {
+        // Char-boundary-safe against a hand-edited history file.
+        Some(sha) => sha.chars().take(7).collect(),
+        None => "—".to_string(),
+    }
+}
+
 pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
     let run = find_run(&run_id)?;
     let body = html! {
@@ -87,6 +100,9 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
         section class="card" {
             (views::field("Status", &run.status))
             (views::field("Project", &run.project_id))
+            @if let Some(sha) = &run.commit {
+                (views::code_field("Commit", sha))
+            }
             (views::code_field("Started", &run.started_at))
             @if let Some(finished) = &run.finished_at {
                 (views::code_field("Finished", finished))

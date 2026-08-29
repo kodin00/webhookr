@@ -33,6 +33,13 @@ pub struct RunRecord {
     pub duration_ms: u64,
     /// Short summary (e.g. last line of output or an error message).
     pub message: String,
+    /// Full sha of the commit this run deployed, when one could be determined.
+    ///
+    /// Absent on runs recorded before the field existed, and on runs that never
+    /// reached a checkout (a failed clone, say) — hence an Option rather than an
+    /// empty string.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 /// Path to the runs index JSON file.
