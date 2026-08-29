@@ -152,6 +152,18 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         }
     }
 
+    // Telegram notifications are app-wide rather than per project, so the
+    // config is read here instead of being threaded through every caller. A
+    // load failure just means no notifications: it must never fail the deploy.
+    let telegram = crate::config::load_config()
+        .ok()
+        .and_then(|app| crate::telegram::Notifier::for_app(&app));
+    if let Some(telegram) = telegram.as_ref() {
+        telegram
+            .started(&p.name, &id, start_sha.as_deref(), &mut log)
+            .await;
+    }
+
     // The commit this run ends up deploying, kept for the run history. A
     // synced run re-reads HEAD after the pull, which may have moved past the
     // sha announced above; a no-sync run deploys exactly that HEAD.
@@ -201,6 +213,14 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
             message
         };
         reporter.finish(state, &text, &mut log).await;
+    }
+    if let Some(telegram) = telegram.as_ref() {
+        // `read_tail` rather than `state::read_run_log_tail`: the state helper
+        // prefixes a truncation marker aimed at the polling web view, and the
+        // message adds its own. Strip ANSI before the tail is cut so colour
+        // codes cannot eat the character budget.
+        let tail = crate::util::strip_ansi(&read_tail(&log_path, 16 * 1024));
+        telegram.finished(&p.name, &record, &tail, &mut log).await;
     }
     Ok(record)
 }
@@ -504,9 +524,9 @@ fn finalize(
     Ok(record)
 }
 
-/// A run duration for display in a commit status, where there is room for a
-/// rounded figure and nothing more.
-fn human_duration(ms: u64) -> String {
+/// A run duration for display in a commit status or a Telegram message, where
+/// there is room for a rounded figure and nothing more.
+pub(crate) fn human_duration(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
     } else if ms < 60_000 {
@@ -662,6 +682,65 @@ mod tests {
         );
 
         std::env::remove_var("WEBHOOKR_STATE_DIR");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dead_telegram_does_not_fail_the_deploy() {
+        let root =
+            std::env::temp_dir().join(format!("webhookr-telegram-{}", crate::util::new_run_id()));
+        fs::create_dir_all(&root).unwrap();
+
+        // Port 1 refuses instantly, so this is a fast, offline stand-in for
+        // every way the Telegram API can be unavailable.
+        let notifier = crate::telegram::Notifier::with_api_base(
+            "123:not-a-real-token",
+            "-1001",
+            "http://127.0.0.1:1".into(),
+        );
+
+        let log_path = root.join("run.log");
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(log, "--- custom command ---").unwrap();
+        writeln!(log, "Successfully tagged site:latest").unwrap();
+
+        notifier
+            .started("Site", "a1b2c3d4e5f6", None, &mut log)
+            .await;
+        let failed = crate::state::RunRecord {
+            id: "a1b2c3d4e5f6".into(),
+            project_id: "site".into(),
+            started_at: String::new(),
+            finished_at: None,
+            status: "failed".into(),
+            duration_ms: 100,
+            message: "error: pull failed".into(),
+            commit: None,
+        };
+        notifier
+            .finished("Site", &failed, "docker: no such image", &mut log)
+            .await;
+
+        let written = fs::read_to_string(&log_path).unwrap();
+        assert!(
+            written.contains("# telegram: could not send"),
+            "the failure should be noted, not hidden: {written}"
+        );
+        assert!(
+            !written.contains("123:not-a-real-token"),
+            "the token must never reach the run log: {written}"
+        );
+        // The load-bearing part: those notes are the last lines in the log, and
+        // the run's history message must still be the real command output.
+        assert_eq!(
+            super::summary_line(&log_path).as_deref(),
+            Some("Successfully tagged site:latest")
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 

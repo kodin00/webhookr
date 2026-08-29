@@ -360,6 +360,48 @@ Derived from the repository URL, with nothing to configure: a `github.com`
 remote uses `api.github.com`, and any other host is treated as GitHub
 Enterprise Server at `https://<host>/api/v3`.
 
+## Telegram notifications
+
+webhookr can post each deploy to a **Telegram** chat through a bot you own:
+`🚀` when a run starts, `✅` when it succeeds, `❌` when it fails — quoting the
+tail of the run log on a failure. It is off by default, and it is global: one
+bot and one chat for every project, configured under **Settings** in the web
+admin UI.
+
+| Setting | What it does |
+| --- | --- |
+| Notify a Telegram chat about deploys | The master switch. |
+| Bot token | A token from [@BotFather](https://t.me/BotFather). Stored like the other secrets: the form never echoes it back, blank keeps the stored one. |
+| Chat id | The chat to post to. Group chats have negative ids; `@channelname` also works. |
+
+To find a group's chat id: create the bot with @BotFather, **add it to the
+group**, send any message in the group, then open
+`https://api.telegram.org/bot<token>/getUpdates` and read `message.chat.id` —
+it will start with `-100`.
+
+### What gets posted
+
+- `🚀 deploy started — <project>` with the run and commit when the deploy
+  begins.
+- `✅ deploy succeeded` with the duration and the deploy's summary line.
+- `❌ deploy failed` with the duration, the error, and the last part of the
+  run log (ANSI stripped, capped so the whole message stays under Telegram's
+  4096-character limit).
+
+When the admin UI has a public hostname, each message ends with a link to that
+run's log page. With only a loopback address configured the link is omitted,
+for the same reason as the GitHub Details link: a `127.0.0.1` link is dead for
+everyone who taps it.
+
+Posting a message can never fail or delay a deploy. Anything that goes wrong —
+an unreachable API, a rejected token, a chat the bot has not been added to — is
+written into the run log as a `# telegram:` line and otherwise ignored. The
+final message is retried once; the `started` message is not, since the final
+one supersedes it minutes later anyway.
+
+The bot token lives in `config.json` alongside the other secrets, in a file
+webhookr keeps owner-only.
+
 ## `token` verify mode
 
 For non-GitHub senders, set the project's `verify_mode` to `token`

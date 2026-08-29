@@ -491,6 +491,62 @@ impl WebConfig {
     }
 }
 
+/// Telegram bot notifications about deploy runs. Global: one bot and one chat
+/// for every project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TelegramConfig {
+    /// Master switch. Off unless explicitly turned on, so an upgrade or a
+    /// stray config edit never starts posting to Telegram.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bot token from @BotFather, e.g. `123456789:AAF…`. A secret: stored in
+    /// `config.json` (owner-only) and never echoed back into the settings form.
+    #[serde(default)]
+    pub bot_token: String,
+    /// Destination chat. Group and supergroup ids are negative
+    /// (`-1001234567890`); channels may also be named `@channel`. Stored as
+    /// written and parsed at send time, so a hand-edited config always loads.
+    #[serde(default)]
+    pub chat_id: String,
+}
+
+impl TelegramConfig {
+    /// Why notifications cannot be sent, if they cannot. `None` when off, or
+    /// on and usable.
+    ///
+    /// Advisory only, exactly like [`ProjectConfig::status_report_problem`]:
+    /// surfaced in the settings UI and logged once per run, deliberately kept
+    /// out of any validation the executor runs — a misconfigured notification
+    /// may never block the deploy it was meant to report on.
+    pub fn problem(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        if self.bot_token.trim().is_empty() {
+            return Some("set a Telegram bot token (from @BotFather)".to_string());
+        }
+        if !self.bot_token.contains(':') {
+            return Some(
+                "that does not look like a bot token — expected something like 123456789:AAF…"
+                    .to_string(),
+            );
+        }
+        let chat = self.chat_id.trim();
+        if chat.is_empty() {
+            return Some(
+                "set a Telegram chat id — group chats have negative ids, e.g. -1001234567890"
+                    .to_string(),
+            );
+        }
+        if chat.parse::<i64>().is_err() && !chat.starts_with('@') {
+            return Some(format!(
+                "{chat} is not a chat id webhookr can send to (a number, negative for groups, or @channelname)"
+            ));
+        }
+        None
+    }
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -504,6 +560,9 @@ pub struct AppConfig {
     /// Browser admin UI settings.
     #[serde(default)]
     pub web: WebConfig,
+    /// Telegram deploy notifications.
+    #[serde(default)]
+    pub telegram: TelegramConfig,
 }
 
 impl Default for AppConfig {
@@ -514,6 +573,7 @@ impl Default for AppConfig {
             projects: Vec::new(),
             cloudflare: None,
             web: WebConfig::default(),
+            telegram: TelegramConfig::default(),
         }
     }
 }
@@ -695,6 +755,47 @@ mod tests {
         // A config written before the web UI existed must not switch it on.
         assert!(!config.web.enabled);
         assert_eq!(config.web.listen_addr, "127.0.0.1:9001");
+        // Nor must an upgrade start posting to Telegram.
+        assert!(!config.telegram.enabled);
+        assert!(config.telegram.bot_token.is_empty());
+        assert!(config.telegram.chat_id.is_empty());
+    }
+
+    #[test]
+    fn telegram_notifications_parse_partially_and_default_off() {
+        assert!(!AppConfig::default().telegram.enabled);
+        assert_eq!(super::TelegramConfig::default(), Default::default());
+
+        let partial: AppConfig = serde_json::from_str(
+            r#"{"listen_addr":"0.0.0.0:9000","projects":[],"telegram":{"enabled":true,"chat_id":"-100123"}}"#,
+        )
+        .unwrap();
+        assert!(partial.telegram.enabled);
+        assert_eq!(partial.telegram.chat_id, "-100123");
+        assert!(partial.telegram.bot_token.is_empty());
+    }
+
+    #[test]
+    fn telegram_problems_are_advisory_never_blocking() {
+        let telegram = |enabled, token: &str, chat: &str| super::TelegramConfig {
+            enabled,
+            bot_token: token.into(),
+            chat_id: chat.into(),
+        };
+
+        // Off: nothing to complain about, however broken the fields are.
+        assert_eq!(telegram(false, "", "").problem(), None);
+        assert_eq!(telegram(false, "nonsense", "nonsense").problem(), None);
+
+        // On: every unusable combination says why.
+        assert!(telegram(true, "", "").problem().is_some());
+        assert!(telegram(true, "no-colon-in-it", "").problem().is_some());
+        assert!(telegram(true, "123:AAF…", "").problem().is_some());
+        assert!(telegram(true, "123:AAF…", "abc").problem().is_some());
+
+        // On and usable, both chat shapes.
+        assert_eq!(telegram(true, "123:AAF…", "-1001234567890").problem(), None);
+        assert_eq!(telegram(true, "123:AAF…", "@mychannel").problem(), None);
     }
 
     #[test]

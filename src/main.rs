@@ -5,6 +5,7 @@ mod executor;
 mod github;
 mod server;
 mod state;
+mod telegram;
 mod tui;
 mod update;
 mod util;

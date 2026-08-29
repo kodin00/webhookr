@@ -25,6 +25,30 @@ pub struct SettingsForm {
     pub web_listen_addr: String,
     #[serde(default)]
     pub require_access_header: Option<String>,
+    #[serde(default)]
+    pub telegram_enabled: Option<String>,
+    #[serde(default)]
+    pub telegram_chat_id: String,
+    #[serde(default)]
+    pub telegram_bot_token: String,
+    #[serde(default)]
+    pub telegram_clear_bot_token: Option<String>,
+}
+
+/// Apply the Telegram fields of a submitted settings form.
+///
+/// The bot token follows the house secret rule: the form never round-trips it
+/// through the browser, so a blank field means "keep what is stored" and a
+/// separate checkbox is the only way to remove it.
+fn apply_telegram(form: &SettingsForm, telegram: &mut config::TelegramConfig) {
+    telegram.enabled = form.telegram_enabled.is_some();
+    telegram.chat_id = form.telegram_chat_id.trim().to_string();
+    let submitted = form.telegram_bot_token.trim();
+    if form.telegram_clear_bot_token.is_some() {
+        telegram.bot_token.clear();
+    } else if !submitted.is_empty() {
+        telegram.bot_token = submitted.to_string();
+    }
 }
 
 pub async fn save(Form(form): Form<SettingsForm>) -> Result<Response, WebError> {
@@ -41,8 +65,17 @@ pub async fn save(Form(form): Form<SettingsForm>) -> Result<Response, WebError> 
         web.require_access_header = require_access_header;
         web.validate(&listen_addr)?;
 
+        let mut telegram = cfg.telegram.clone();
+        apply_telegram(&form, &mut telegram);
+        // Settings-save validation only: this never runs in the deploy path,
+        // so a broken block can bounce the form but never a deploy.
+        if let Some(problem) = telegram.problem() {
+            anyhow::bail!("{problem}");
+        }
+
         cfg.listen_addr = listen_addr.clone();
         cfg.web = web;
+        cfg.telegram = telegram;
         Ok(())
     });
 
@@ -101,6 +134,50 @@ fn settings_body(
                              a replacement for an Access policy."
                         }
                     }
+                }
+            }
+            fieldset {
+                legend { "Telegram notifications" }
+                label class="checkbox" {
+                    input type="checkbox" name="telegram_enabled" value="1"
+                          checked[cfg.telegram.enabled];
+                    span {
+                        strong { "Notify a Telegram chat about deploys" }
+                        span class="hint" {
+                            "One bot and one chat for every project. Messages are posted \
+                             when a run starts and when it ends; a failed run quotes the \
+                             tail of its log."
+                        }
+                    }
+                }
+                label {
+                    span { "Chat id" }
+                    input type="text" name="telegram_chat_id" value=(cfg.telegram.chat_id)
+                          placeholder="-1001234567890";
+                    span class="hint" {
+                        "Group chats have negative ids. Add the bot to the group, send any \
+                         message, then read the id from \
+                         api.telegram.org/bot&lt;token&gt;/getUpdates. @channelname also works."
+                    }
+                }
+                label {
+                    span { "Bot token" }
+                    input type="password" name="telegram_bot_token" autocomplete="off"
+                          placeholder=(if cfg.telegram.bot_token.is_empty() {
+                              "123456789:AAF…"
+                          } else {
+                              "stored — leave blank to keep it"
+                          });
+                    span class="hint" { "Create a bot with @BotFather on Telegram." }
+                }
+                @if !cfg.telegram.bot_token.is_empty() {
+                    label class="checkbox" {
+                        input type="checkbox" name="telegram_clear_bot_token" value="1";
+                        span { "Remove the stored bot token" }
+                    }
+                }
+                @if let Some(problem) = cfg.telegram.problem() {
+                    span class="warn-inline" { (problem) }
                 }
             }
             div class="form-actions" {
@@ -366,5 +443,56 @@ fn cloudflare_body(cfg: &config::AppConfig, error: Option<&str>) -> Markup {
                  hostname before using it."
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_telegram, SettingsForm};
+    use crate::config;
+
+    fn form(enabled: bool, chat_id: &str, bot_token: &str, clear: bool) -> SettingsForm {
+        SettingsForm {
+            listen_addr: "127.0.0.1:9000".into(),
+            web_listen_addr: "127.0.0.1:9001".into(),
+            require_access_header: enabled.then(|| "1".into()),
+            telegram_enabled: enabled.then(|| "1".into()),
+            telegram_chat_id: chat_id.into(),
+            telegram_bot_token: bot_token.into(),
+            telegram_clear_bot_token: clear.then(|| "1".into()),
+        }
+    }
+
+    #[test]
+    fn a_stored_bot_token_survives_a_save_unless_cleared() {
+        let stored = config::TelegramConfig {
+            enabled: true,
+            bot_token: "111:OLD".into(),
+            chat_id: "-100123".into(),
+        };
+
+        // Blank means "keep what is stored": the secret never round-trips
+        // through the browser.
+        let mut kept = stored.clone();
+        apply_telegram(&form(true, " -100123 ", "", false), &mut kept);
+        assert_eq!(kept.bot_token, "111:OLD");
+        assert_eq!(kept.chat_id, "-100123", "chat id is trimmed on save");
+
+        // A filled field replaces it; a checked box removes it entirely.
+        let mut replaced = stored.clone();
+        apply_telegram(&form(true, "-100123", " 222:NEW ", false), &mut replaced);
+        assert_eq!(replaced.bot_token, "222:NEW");
+
+        let mut cleared = stored.clone();
+        apply_telegram(&form(false, "-100123", "", true), &mut cleared);
+        assert!(cleared.bot_token.is_empty());
+
+        // Unticking the switch keeps the token and the chat, so re-enabling
+        // is one click rather than a trip back to @BotFather.
+        let mut disabled = stored.clone();
+        apply_telegram(&form(false, "-100123", "", false), &mut disabled);
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.bot_token, "111:OLD");
+        assert_eq!(disabled.chat_id, "-100123");
     }
 }
