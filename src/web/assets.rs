@@ -15,6 +15,7 @@ use axum::{
 /// sha256 71ea67185bfa8c98c39d31717c6fce5d852370fcdfd129db4543774d3145c0de
 const HTMX: &str = include_str!("assets/htmx.min.js");
 const CSS: &str = include_str!("assets/app.css");
+const LOG_JS: &str = include_str!("assets/log.js");
 
 /// Serve one of the embedded assets.
 ///
@@ -23,6 +24,7 @@ pub async fn asset(Path(file): Path<String>) -> Response {
     let (body, content_type) = match file.as_str() {
         "htmx.min.js" => (HTMX, "application/javascript; charset=utf-8"),
         "app.css" => (CSS, "text/css; charset=utf-8"),
+        "log.js" => (LOG_JS, "application/javascript; charset=utf-8"),
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
 

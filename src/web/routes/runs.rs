@@ -111,9 +111,25 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
             @if !run.message.is_empty() { (views::field("Summary", &run.message)) }
         }
         section class="card" {
-            h2 { "Output" }
+            div class="card-head" {
+                h2 { "Output" }
+                // Autoscroll only means something while output is still
+                // arriving, so finished runs get no toggle. It sits outside
+                // #log-pane on purpose: the pane replaces itself every poll
+                // and would take a focused or mid-click checkbox with it.
+                @if run.status == "running" {
+                    label class="log-toggle" for="autoscroll" {
+                        input id="autoscroll" type="checkbox" checked {}
+                        "Auto-scroll"
+                    }
+                }
+            }
             (log_block(&run))
         }
+        // The only page with bespoke behaviour; log.js keeps the output pane
+        // pinned to the newest line. Loaded here rather than in every page
+        // head, and versioned like the other assets so upgrades bust caches.
+        script src={ "/static/log.js?v=" (env!("CARGO_PKG_VERSION")) } defer {}
     };
     Ok(views::page("Run", body))
 }
