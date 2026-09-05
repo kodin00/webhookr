@@ -18,9 +18,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, AppConfig};
-use crate::state::RunRecord;
+use crate::state::{RunRecord, TelegramDelivery};
 
-const TELEGRAM_API: &str = "https://api.telegram.org";
+/// The one Telegram endpoint webhookr will ever talk to. `pub(crate)` so the
+/// settings handler can aim a test message at the real thing.
+pub(crate) const TELEGRAM_API: &str = "https://api.telegram.org";
 
 /// Hard per-message limit Telegram enforces and rejects beyond.
 const MAX_MESSAGE: usize = 4096;
@@ -224,14 +226,14 @@ impl Notifier {
     }
 
     /// The run has ended: post the `✅` or `❌` message, quoting `log_tail` on
-    /// a failure.
+    /// a failure. Returns the delivery outcome for the run record.
     pub async fn finished(
         &self,
         project_name: &str,
         record: &RunRecord,
         log_tail: &str,
         log: &mut File,
-    ) {
+    ) -> TelegramDelivery {
         let text = message_finished(
             project_name,
             record,
@@ -243,7 +245,7 @@ impl Notifier {
         } else {
             "failed"
         };
-        self.send(label, &text, true, log).await;
+        self.send(label, &text, true, log).await
     }
 
     fn run_url(&self, run_id: &str) -> Option<String> {
@@ -252,8 +254,8 @@ impl Notifier {
             .map(|base| format!("{base}/runs/{run_id}"))
     }
 
-    /// Send one message, swallowing every failure.
-    async fn send(&self, label: &str, text: &str, retry: bool, log: &mut File) {
+    /// Send one message, swallowing every failure but reporting it.
+    async fn send(&self, label: &str, text: &str, retry: bool, log: &mut File) -> TelegramDelivery {
         let mut outcome = post_message(&self.api_base, &self.token, &self.chat_id, text).await;
         // One retry for a final message: a transient 5xx would otherwise leave
         // the chat silent about a finished deploy. `started` is not worth a
@@ -263,18 +265,50 @@ impl Notifier {
             outcome = post_message(&self.api_base, &self.token, &self.chat_id, text).await;
         }
 
-        let note = match &outcome {
-            Ok(()) => format!("{label} message sent"),
-            Err(error) => format!(
-                "could not send the {label} message: {}",
-                redact(&format!("{error:#}"), &self.token)
-            ),
+        let delivery = match &outcome {
+            Ok(()) => TelegramDelivery {
+                sent: true,
+                detail: String::new(),
+            },
+            Err(error) => TelegramDelivery {
+                sent: false,
+                detail: redact(&format!("{error:#}"), &self.token),
+            },
+        };
+        let note = if delivery.sent {
+            format!("{label} message sent")
+        } else {
+            format!("could not send the {label} message: {}", delivery.detail)
         };
         // The '#' is load-bearing, not decoration: `executor::summary_line`
         // skips lines starting with '#', so a note appended after the deploy
         // cannot become the run's history message in place of the real output.
         let _ = writeln!(log, "# telegram: {note}");
+        delivery
     }
+}
+
+// ----- the test message ----------------------------------------------------
+
+/// Send a one-off message with the given settings, aimed at `api_base`, so the
+/// Settings page can prove the bot and the chat work before a deploy has to.
+///
+/// Validation runs with the switch forced on: testing a disabled-but-filled
+/// configuration is exactly what the button is for, while an unusable one
+/// should bounce with the same words the settings page uses. See
+/// [`post_message`] for why `api_base` is a parameter, not a switch.
+pub(crate) async fn send_test(api_base: &str, config: &config::TelegramConfig) -> Result<()> {
+    let mut check = config.clone();
+    check.enabled = true;
+    if let Some(problem) = check.problem() {
+        bail!("{problem}");
+    }
+    let text = format!(
+        "🔔 webhookr test message — the bot and the chat are working. \
+         (webhookr {})",
+        env!("CARGO_PKG_VERSION")
+    );
+    post_message(api_base, config.bot_token.trim(), config.chat_id.trim(), &text).await
 }
 
 // ----- the messages --------------------------------------------------------
@@ -361,6 +395,7 @@ mod tests {
             duration_ms: 42_000,
             message: message.into(),
             commit: Some("4f5e6d7c8b9a".repeat(4)),
+            telegram: None,
         }
     }
 
@@ -646,5 +681,103 @@ mod tests {
             !rendered.contains("123:TESTTOKEN"),
             "token leaked: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_message_reports_itself_as_sent() {
+        let (base, _seen, server) =
+            fake_telegram(axum::http::StatusCode::OK, r#"{"ok":true}"#).await;
+        let notifier = Notifier::with_api_base("123:TESTTOKEN", "-1001", base);
+
+        let path =
+            std::env::temp_dir().join(format!("webhookr-sent-{}", crate::util::new_run_id()));
+        let mut log = std::fs::File::create(&path).unwrap();
+        let delivery = notifier
+            .finished("Site", &record("success", "done"), "", &mut log)
+            .await;
+        let written = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(delivery.sent, "{delivery:?}");
+        assert!(delivery.detail.is_empty(), "{delivery:?}");
+        // The other half of `send`'s contract: the log says so too.
+        assert!(
+            written.contains("# telegram: succeeded message sent"),
+            "{written}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_test_posts_the_saved_settings_even_while_disabled() {
+        let (base, seen, server) =
+            fake_telegram(axum::http::StatusCode::OK, r#"{"ok":true}"#).await;
+        // Disabled on purpose: proving the bot works before switching
+        // notifications on is the point of the button.
+        let config = crate::config::TelegramConfig {
+            enabled: false,
+            bot_token: "123:TESTTOKEN".into(),
+            chat_id: "-1001234567890".into(),
+        };
+
+        send_test(&base, &config).await.expect("should send");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, "/bot123:TESTTOKEN/sendMessage");
+        assert!(
+            seen[0].body.contains("webhookr test message"),
+            "{}",
+            seen[0].body
+        );
+        assert!(
+            seen[0].body.contains(r#""chat_id":-1001234567890"#),
+            "{}",
+            seen[0].body
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_test_bounces_an_unusable_config_without_sending() {
+        let (base, seen, server) =
+            fake_telegram(axum::http::StatusCode::OK, r#"{"ok":true}"#).await;
+
+        // Every which way the saved settings can be incomplete or broken,
+        // paired with the word the bounce must carry.
+        let cases = [
+            (crate::config::TelegramConfig::default(), "bot token"),
+            (
+                crate::config::TelegramConfig {
+                    enabled: true,
+                    bot_token: "no-colon".into(),
+                    chat_id: "-1001".into(),
+                },
+                "does not look like a bot token",
+            ),
+            (
+                crate::config::TelegramConfig {
+                    enabled: true,
+                    bot_token: "123:TESTTOKEN".into(),
+                    chat_id: String::new(),
+                },
+                "chat id",
+            ),
+        ];
+        for (broken, expected) in cases {
+            let error = send_test(&base, &broken)
+                .await
+                .expect_err("an unusable config must bounce before any request");
+            assert!(
+                error.to_string().contains(expected),
+                "wanted {expected:?} in: {error:#}"
+            );
+        }
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no request may leave for an unusable config"
+        );
+        server.abort();
     }
 }

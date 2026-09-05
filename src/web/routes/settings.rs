@@ -16,7 +16,10 @@ use crate::web::WebError;
 
 pub async fn index() -> Result<Markup, WebError> {
     let cfg = config::load_config()?;
-    Ok(views::page("Settings", settings_body(&cfg, None, None, None)))
+    Ok(views::page(
+        "Settings",
+        settings_body(&cfg, None, None, None, None),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -87,7 +90,7 @@ pub async fn save(Form(form): Form<SettingsForm>) -> Result<Response, WebError> 
                 StatusCode::UNPROCESSABLE_ENTITY,
                 views::page(
                     "Settings",
-                    settings_body(&cfg, None, Some(&format!("{error:#}")), None),
+                    settings_body(&cfg, None, Some(&format!("{error:#}")), None, None),
                 ),
             )
                 .into_response())
@@ -100,6 +103,7 @@ fn settings_body(
     notice: Option<&str>,
     error: Option<&str>,
     checked: Option<&Result<update::Build, String>>,
+    tested: Option<&Result<String, String>>,
 ) -> Markup {
     html! {
         section class="page-head" { h1 { "Settings" } }
@@ -179,11 +183,32 @@ fn settings_body(
                 @if let Some(problem) = cfg.telegram.problem() {
                     span class="warn-inline" { (problem) }
                 }
+                p {
+                    // `form=` points at a form outside this one: a nested
+                    // `<form>` is dropped by the HTML parser, which would
+                    // silently retarget this button at "save settings".
+                    button type="submit" class="button" form="telegram-test" {
+                        "Send test message"
+                    }
+                    span class="hint" {
+                        "Uses the saved settings, so save first — the test \
+                         cannot see anything typed but unsaved above it."
+                    }
+                }
+                @match tested {
+                    Some(Ok(msg)) => { (views::alert("ok", msg)) }
+                    Some(Err(err)) => { (views::alert("error", err)) }
+                    None => {}
+                }
             }
             div class="form-actions" {
                 button type="submit" class="button primary" { "Save settings" }
             }
         }
+        // The test button's target. Sibling of the settings form, like the
+        // version-check form below, because nested forms are dropped by the
+        // HTML parser — see the button inside the Telegram fieldset.
+        form id="telegram-test" method="post" action="/settings/telegram-test" {}
 
         section class="card" {
             h2 { "Cloudflare Tunnel" }
@@ -270,7 +295,31 @@ pub async fn check_update() -> Result<Markup, WebError> {
     let checked = update::latest().await.map_err(|error| format!("{error:#}"));
     Ok(views::page(
         "Settings",
-        settings_body(&cfg, None, None, Some(&checked)),
+        settings_body(&cfg, None, None, Some(&checked), None),
+    ))
+}
+
+/// Fire one real message through the saved bot and chat, so a configuration
+/// can be proven before a deploy depends on it.
+///
+/// POST like every state-changing route, though it changes no state: the CSRF
+/// guard exempts GET, and a prefetched link must not post to a chat.
+pub async fn telegram_test() -> Result<Markup, WebError> {
+    let cfg = config::load_config()?;
+    // Validation inside `send_test` requires a chat id, so the success path
+    // always has one to name.
+    let tested = crate::telegram::send_test(crate::telegram::TELEGRAM_API, &cfg.telegram)
+        .await
+        .map(|()| {
+            format!(
+                "Test message sent to chat {} — check Telegram.",
+                cfg.telegram.chat_id.trim()
+            )
+        })
+        .map_err(|error| format!("{error:#}"));
+    Ok(views::page(
+        "Settings",
+        settings_body(&cfg, None, None, None, Some(&tested)),
     ))
 }
 
@@ -279,7 +328,13 @@ pub async fn self_update() -> Result<Response, WebError> {
     match update::install().await {
         Ok(update::Outcome::UpToDate(build)) => {
             let notice = format!("Already running the published build: {}", build.label());
-            Ok(views::page("Settings", settings_body(&cfg, Some(&notice), None, None)).into_response())
+            Ok(
+                views::page(
+                    "Settings",
+                    settings_body(&cfg, Some(&notice), None, None, None),
+                )
+                .into_response(),
+            )
         }
         Ok(update::Outcome::Replaced { from, to, path }) => {
             println!(
@@ -298,13 +353,19 @@ pub async fn self_update() -> Result<Response, WebError> {
                 "Updated to {}. Restarting — reload this page in a few seconds.",
                 to.label()
             );
-            Ok(views::page("Settings", settings_body(&cfg, Some(&notice), None, None)).into_response())
+            Ok(
+                views::page(
+                    "Settings",
+                    settings_body(&cfg, Some(&notice), None, None, None),
+                )
+                .into_response(),
+            )
         }
         Err(error) => Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
             views::page(
                 "Settings",
-                settings_body(&cfg, None, Some(&format!("{error:#}")), None),
+                settings_body(&cfg, None, Some(&format!("{error:#}")), None, None),
             ),
         )
             .into_response()),

@@ -40,6 +40,24 @@ pub struct RunRecord {
     /// empty string.
     #[serde(default)]
     pub commit: Option<String>,
+    /// Whether the run's final Telegram message got through. Absent when no
+    /// notifier ran (notifications off or unusable) and on runs recorded before
+    /// the field existed.
+    #[serde(default)]
+    pub telegram: Option<TelegramDelivery>,
+}
+
+/// Outcome of a run's final Telegram notification.
+///
+/// Kept on the [`RunRecord`] because the run page stops polling the log the
+/// moment a run leaves `running` — which is before the `# telegram:` note is
+/// written — so the record is the only place the outcome is reliably visible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramDelivery {
+    /// Whether Telegram accepted the message.
+    pub sent: bool,
+    /// Why it was not sent, token-free. Empty when it was.
+    pub detail: String,
 }
 
 /// Path to the runs index JSON file.
@@ -103,9 +121,16 @@ fn save_runs_inner(runs: &[RunRecord]) -> Result<()> {
 pub fn append_run(record: RunRecord) -> Result<()> {
     let _guard = RUNS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut runs = load_runs();
+    upsert_run(&mut runs, record);
+    save_runs_inner(&runs)
+}
+
+/// Drop any record with this id, then add this one. Pure, so the
+/// replace-by-id contract (the primitive the Telegram-outcome update rides
+/// on) can be tested without pointing the global state dir at a fixture.
+fn upsert_run(runs: &mut Vec<RunRecord>, record: RunRecord) {
     runs.retain(|r| r.id != record.id);
     runs.push(record);
-    save_runs_inner(&runs)
 }
 
 /// Close out runs left `running` by a crashed or restarted daemon.
@@ -170,4 +195,69 @@ pub fn read_run_log_tail(run_id: &str, max_bytes: u64) -> String {
     let start = buf.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
     let tail = String::from_utf8_lossy(&buf[start..]);
     format!("[... earlier output truncated ...]\n{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(id: &str, message: &str) -> RunRecord {
+        RunRecord {
+            id: id.into(),
+            project_id: "site".into(),
+            started_at: "2026-09-01T00:00:00Z".into(),
+            finished_at: Some("2026-09-01T00:00:42Z".into()),
+            status: "success".into(),
+            duration_ms: 42_000,
+            message: message.into(),
+            commit: None,
+            telegram: None,
+        }
+    }
+
+    #[test]
+    fn appending_replaces_the_record_with_the_same_id() {
+        let mut runs = vec![record("run-0", "other"), record("run-1", "first attempt")];
+
+        // The shape the Telegram-outcome update produces: the same run id,
+        // reposted with the delivery filled in.
+        let mut updated = record("run-1", "first attempt");
+        updated.telegram = Some(TelegramDelivery {
+            sent: false,
+            detail: "HTTP 401 Unauthorized".into(),
+        });
+        upsert_run(&mut runs, updated);
+
+        assert_eq!(runs.len(), 2, "a repost must not duplicate the row");
+        let run_one = runs.iter().find(|r| r.id == "run-1").unwrap();
+        assert!(
+            run_one
+                .telegram
+                .as_ref()
+                .is_some_and(|delivery| !delivery.sent),
+            "the replacement must be the one kept: {run_one:?}"
+        );
+    }
+
+    #[test]
+    fn records_from_before_the_telegram_field_still_parse() {
+        let legacy = r#"[{
+            "id": "legacy123",
+            "project_id": "site",
+            "started_at": "2026-08-01T00:00:00Z",
+            "finished_at": null,
+            "status": "success",
+            "duration_ms": 1000,
+            "message": "deployed",
+            "commit": null
+        }]"#;
+        let runs: Vec<RunRecord> =
+            serde_json::from_str(legacy).expect("an old history must still load");
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].telegram.is_none());
+
+        // And it survives the round trip with the new field along.
+        let rewritten = serde_json::to_string(&runs).unwrap();
+        assert!(rewritten.contains(r#""telegram":null"#), "{rewritten}");
+    }
 }

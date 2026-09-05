@@ -7,7 +7,7 @@ use axum::{
 use maud::{html, Markup};
 use serde::Deserialize;
 
-use crate::state::{self, RunRecord};
+use crate::state::{self, RunRecord, TelegramDelivery};
 use crate::util;
 use crate::web::views;
 use crate::web::WebError;
@@ -90,6 +90,29 @@ fn short_sha(run: &RunRecord) -> String {
     }
 }
 
+/// Whether the chat was actually notified about this run, and if not, why.
+///
+/// Rendered from the record rather than the log because the page stops
+/// polling the log before the `# telegram:` note is written.
+fn telegram_field(delivery: &TelegramDelivery) -> Markup {
+    html! {
+        div class="field" {
+            span class="field-label" { "Telegram" }
+            span class="field-value" {
+                @if delivery.sent {
+                    span class="badge badge-ok" { "sent" }
+                } @else {
+                    span class="badge badge-fail" { "not sent" }
+                    @if !delivery.detail.is_empty() {
+                        " "
+                        span class="warn-inline" { (delivery.detail) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
     let run = find_run(&run_id)?;
     let body = html! {
@@ -109,6 +132,9 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
             }
             (views::field("Duration", &views::duration(&run)))
             @if !run.message.is_empty() { (views::field("Summary", &run.message)) }
+            @if let Some(delivery) = &run.telegram {
+                (telegram_field(delivery))
+            }
         }
         section class="card" {
             div class="card-head" {

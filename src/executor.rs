@@ -133,6 +133,8 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         // Best guess while the run is in flight: the pushed sha when the
         // webhook carried one, otherwise unknown until the deploy finishes.
         commit: pushed_sha.clone(),
+        // Filled in once the final message has been attempted below.
+        telegram: None,
     }) {
         eprintln!("webhookr: could not record run start: {error:#}");
     }
@@ -196,7 +198,7 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
 
     // History before GitHub: the admin UI polls `finished_at` to stop tailing
     // the log, so a slow API call must not hold a finished run visibly open.
-    let record = finalize(
+    let mut record = finalize(
         &mut log,
         &id,
         &p.id,
@@ -220,7 +222,15 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         // message adds its own. Strip ANSI before the tail is cut so colour
         // codes cannot eat the character budget.
         let tail = crate::util::strip_ansi(&read_tail(&log_path, 16 * 1024));
-        telegram.finished(&p.name, &record, &tail, &mut log).await;
+        let delivery = telegram.finished(&p.name, &record, &tail, &mut log).await;
+        // The outcome goes onto the persisted record, not just the log: the
+        // run page stops polling the log as soon as the run leaves `running`,
+        // which is before the `# telegram:` note is written. `append_run`
+        // replaces by id, and like every history write this is best-effort.
+        record.telegram = Some(delivery);
+        if let Err(error) = crate::state::append_run(record.clone()) {
+            eprintln!("webhookr: could not record the Telegram outcome: {error:#}");
+        }
     }
     Ok(record)
 }
@@ -514,6 +524,7 @@ fn finalize(
         duration_ms,
         message,
         commit,
+        telegram: None,
     };
 
     writeln!(
@@ -720,8 +731,9 @@ mod tests {
             duration_ms: 100,
             message: "error: pull failed".into(),
             commit: None,
+            telegram: None,
         };
-        notifier
+        let delivery = notifier
             .finished("Site", &failed, "docker: no such image", &mut log)
             .await;
 
@@ -733,6 +745,18 @@ mod tests {
         assert!(
             !written.contains("123:not-a-real-token"),
             "the token must never reach the run log: {written}"
+        );
+        // The caller records the delivery on the run; it must carry the same
+        // verdict, still without the token.
+        assert!(!delivery.sent);
+        assert!(
+            !delivery.detail.is_empty(),
+            "a reason is worth recording: {delivery:?}"
+        );
+        assert!(
+            !delivery.detail.contains("123:not-a-real-token"),
+            "the token must never reach the record: {:?}",
+            delivery.detail
         );
         // The load-bearing part: those notes are the last lines in the log, and
         // the run's history message must still be the real command output.

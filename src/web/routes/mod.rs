@@ -52,6 +52,9 @@ pub fn pages() -> Router<AppState> {
         // GET, and a prefetched link must never replace the binary.
         .route("/settings/check-update", post(settings::check_update))
         .route("/settings/update", post(settings::self_update))
+        // POST even though it changes no state: the CSRF guard exempts GET,
+        // and a prefetched link must not post to a Telegram chat.
+        .route("/settings/telegram-test", post(settings::telegram_test))
 }
 
 /// htmx fragments: bare markup, no page chrome.
