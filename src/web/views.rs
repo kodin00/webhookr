@@ -88,6 +88,23 @@ fn minutes_since(started_at: &str) -> Option<i64> {
     Some(elapsed.num_minutes().max(0))
 }
 
+/// A stored UTC timestamp rendered as Asia/Jakarta wall clock.
+///
+/// History keeps UTC — sortable, unambiguous — but every human-facing page
+/// shows WIB. Jakarta has never observed DST, so a fixed +07:00 offset is
+/// correct indefinitely and spares the binary a tz-database dependency.
+/// A malformed timestamp (hand-edited history file) passes through untouched
+/// rather than blanking the cell.
+pub fn jakarta_time(iso: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(iso) {
+        Ok(dt) => {
+            let wib = chrono::FixedOffset::east_opt(7 * 3600).expect("7h is a valid offset");
+            dt.with_timezone(&wib).format("%Y-%m-%d %H:%M:%S WIB").to_string()
+        }
+        Err(_) => iso.to_string(),
+    }
+}
+
 /// Human-readable run duration.
 pub fn duration(record: &RunRecord) -> String {
     if record.status == "running" {
@@ -120,5 +137,33 @@ pub fn code_field(label: &str, value: &str) -> Markup {
             span class="field-label" { (label) }
             code class="field-value mono" { (value) }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jakarta_time;
+
+    #[test]
+    fn utc_timestamps_render_as_wib() {
+        assert_eq!(
+            jakarta_time("2026-09-01T00:00:42Z"),
+            "2026-09-01 07:00:42 WIB"
+        );
+    }
+
+    #[test]
+    fn conversion_crosses_day_and_year_boundaries() {
+        // 17:30 UTC on New Year's Eve is already 1 January in Jakarta.
+        assert_eq!(
+            jakarta_time("2026-12-31T17:30:00Z"),
+            "2027-01-01 00:30:00 WIB"
+        );
+    }
+
+    #[test]
+    fn unparseable_timestamps_pass_through() {
+        assert_eq!(jakarta_time("whenever"), "whenever");
+        assert_eq!(jakarta_time(""), "");
     }
 }

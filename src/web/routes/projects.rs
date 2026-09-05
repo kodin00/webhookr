@@ -174,7 +174,9 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
                     @for run in &runs {
                         li {
                             (views::status_badge(Some(run)))
-                            a href={ "/runs/" (run.id) } { (run.started_at) }
+                            a href={ "/runs/" (run.id) } title=(run.started_at) {
+                                (views::jakarta_time(&run.started_at))
+                            }
                             span class="muted" { (views::duration(run)) }
                             span class="summary" { (run.message) }
                         }

@@ -58,7 +58,11 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
                                         (short_sha(run))
                                     }
                                     td class="mono small" {
-                                        a href={ "/runs/" (run.id) } { (run.started_at) }
+                                        // WIB for reading; hover for the
+                                        // stored UTC value.
+                                        a href={ "/runs/" (run.id) } title=(run.started_at) {
+                                            (views::jakarta_time(&run.started_at))
+                                        }
                                     }
                                     td class="mono small" { (views::duration(run)) }
                                     td class="summary" { (run.message) }
@@ -126,9 +130,9 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
             @if let Some(sha) = &run.commit {
                 (views::code_field("Commit", sha))
             }
-            (views::code_field("Started", &run.started_at))
+            (views::code_field("Started (WIB)", &views::jakarta_time(&run.started_at)))
             @if let Some(finished) = &run.finished_at {
-                (views::code_field("Finished", finished))
+                (views::code_field("Finished (WIB)", &views::jakarta_time(finished)))
             }
             (views::field("Duration", &views::duration(&run)))
             @if !run.message.is_empty() { (views::field("Summary", &run.message)) }

@@ -94,7 +94,7 @@ fn project_grid(cfg: &config::AppConfig) -> Markup {
                     @if let Some(run) = run {
                         p class="summary" { (run.message) }
                         p class="muted small" {
-                            (run.started_at) " · " (views::duration(run))
+                            (views::jakarta_time(&run.started_at)) " · " (views::duration(run))
                             " · " a href={ "/runs/" (run.id) } { "log" }
                         }
                     } @else {
