@@ -38,19 +38,34 @@ fn project_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 ///
 /// A webhook delivery carries the push payload — already HMAC-verified by
 /// [`crate::server`] — which is where the commit to report a status against
-/// comes from. The CLI, TUI and admin UI use [`Default`] and fall back to
-/// whatever the checkout has at HEAD.
+/// comes from. The CLI, TUI and admin UI carry no payload and fall back to
+/// whatever the checkout has at HEAD. `source` is the display label recorded
+/// on the run and shown wherever runs are.
 #[derive(Debug, Default)]
 pub struct Trigger {
     pub payload: Option<github::PushPayload>,
+    pub source: Option<String>,
 }
 
-/// Clone or fast-forward the source, then deploy it.
+impl Trigger {
+    /// A trigger with no payload: `label` says who asked for the run
+    /// (`web UI`, `cli`). Webhook deliveries build theirs in [`crate::server`].
+    fn manual(label: &str) -> Self {
+        Self {
+            payload: None,
+            source: Some(label.to_string()),
+        }
+    }
+}
+
+/// Clone or fast-forward the source, then deploy it. Manual entry point
+/// (`webhookr run` / `webhookr update`, and the TUI through them).
 pub async fn run_project(p: &ProjectConfig) -> Result<RunRecord> {
-    run(p, true, Trigger::default()).await
+    run(p, true, Trigger::manual("cli")).await
 }
 
-/// [`run_project`] for a webhook delivery, carrying the verified push payload.
+/// [`run_project`] carrying a caller-built trigger: a webhook delivery with
+/// its verified payload, or the admin UI's buttons labelled `web UI`.
 pub async fn run_project_with(p: &ProjectConfig, trigger: Trigger) -> Result<RunRecord> {
     run(p, true, trigger).await
 }
@@ -58,7 +73,13 @@ pub async fn run_project_with(p: &ProjectConfig, trigger: Trigger) -> Result<Run
 /// Re-run the configured deployment without touching the Git checkout.
 /// Used only as an explicit escape hatch (`run --no-pull`, TUI "Run deployment").
 pub async fn deploy_project(p: &ProjectConfig) -> Result<RunRecord> {
-    run(p, false, Trigger::default()).await
+    run(p, false, Trigger::manual("cli")).await
+}
+
+/// [`deploy_project`] carrying a caller-built trigger, for the admin UI's
+/// "Redeploy" button.
+pub async fn deploy_project_with(p: &ProjectConfig, trigger: Trigger) -> Result<RunRecord> {
+    run(p, false, trigger).await
 }
 
 async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<RunRecord> {
@@ -118,6 +139,11 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         "# webhookr {action} {id} for {} started {started_at}",
         p.name
     )?;
+    // Recorded in the log too, so the raw log answers "why did this run"
+    // on its own. The '#' keeps it out of the summary line.
+    if let Some(source) = trigger.source.as_deref() {
+        writeln!(log, "# trigger: {source}")?;
+    }
 
     // Publish a `running` record up front so the daemon, CLI and web UI can all
     // see an in-flight deploy. `finalize` replaces it by id when the run ends.
@@ -133,6 +159,7 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         // Best guess while the run is in flight: the pushed sha when the
         // webhook carried one, otherwise unknown until the deploy finishes.
         commit: pushed_sha.clone(),
+        triggered_by: trigger.source.clone(),
         // Filled in once the final message has been attempted below.
         telegram: None,
     }) {
@@ -162,7 +189,13 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         .and_then(|app| crate::telegram::Notifier::for_app(&app));
     if let Some(telegram) = telegram.as_ref() {
         telegram
-            .started(&p.name, &id, start_sha.as_deref(), &mut log)
+            .started(
+                &p.name,
+                &id,
+                start_sha.as_deref(),
+                trigger.source.as_deref(),
+                &mut log,
+            )
             .await;
     }
 
@@ -207,6 +240,7 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         status,
         message.clone(),
         commit,
+        trigger.source.clone(),
     )?;
     if let Some(reporter) = reporter.as_mut() {
         let text = if state == github::State::Success {
@@ -511,6 +545,7 @@ fn finalize(
     status: &str,
     message: String,
     commit: Option<String>,
+    triggered_by: Option<String>,
 ) -> Result<RunRecord> {
     let finished_at = crate::util::now_iso();
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -524,6 +559,7 @@ fn finalize(
         duration_ms,
         message,
         commit,
+        triggered_by,
         telegram: None,
     };
 
@@ -720,7 +756,7 @@ mod tests {
         writeln!(log, "Successfully tagged site:latest").unwrap();
 
         notifier
-            .started("Site", "a1b2c3d4e5f6", None, &mut log)
+            .started("Site", "a1b2c3d4e5f6", None, Some("push by alice"), &mut log)
             .await;
         let failed = crate::state::RunRecord {
             id: "a1b2c3d4e5f6".into(),
@@ -731,6 +767,7 @@ mod tests {
             duration_ms: 100,
             message: "error: pull failed".into(),
             commit: None,
+            triggered_by: Some("push by alice".into()),
             telegram: None,
         };
         let delivery = notifier

@@ -46,7 +46,7 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
                 div class="table-scroll" {
                     table {
                         thead { tr {
-                            th { "Status" } th { "Project" } th { "Commit" }
+                            th { "Status" } th { "Project" } th { "Commit" } th { "Trigger" }
                             th { "Started" } th { "Duration" } th { "Summary" }
                         } }
                         tbody {
@@ -56,6 +56,11 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
                                     td { a href={ "/projects/" (run.project_id) } { (run.project_id) } }
                                     td class="mono small" title=[run.commit.as_deref()] {
                                         (short_sha(run))
+                                    }
+                                    td class="small" {
+                                        // Who or what started this run; runs from
+                                        // before the field was recorded show a dash.
+                                        (run.triggered_by.as_deref().unwrap_or("—"))
                                     }
                                     td class="mono small" {
                                         // WIB for reading; hover for the
@@ -127,6 +132,9 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
         section class="card" {
             (views::field("Status", &run.status))
             (views::field("Project", &run.project_id))
+            @if let Some(trigger) = run.triggered_by.as_deref() {
+                (views::field("Triggered by", trigger))
+            }
             @if let Some(sha) = &run.commit {
                 (views::code_field("Commit", sha))
             }

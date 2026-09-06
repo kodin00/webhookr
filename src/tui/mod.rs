@@ -1396,7 +1396,10 @@ impl App {
         ];
         let last_line = match self.last_runs.get(&p.id) {
             Some(r) => {
-                let s = format!("{} ({}ms) {}", r.status, r.duration_ms, r.message);
+                let mut s = format!("{} ({}ms) {}", r.status, r.duration_ms, r.message);
+                if let Some(trigger) = r.triggered_by.as_deref() {
+                    s.push_str(&format!(" · {trigger}"));
+                }
                 field_line("last run", &s)
             }
             None => field_line("last run", "never"),

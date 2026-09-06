@@ -201,8 +201,17 @@ async fn webhook(
     // post a status against. Any other event (`ping`, `workflow_run`, or a
     // non-GitHub sender in `token` mode) yields no payload and simply carries no
     // commit, leaving the run to report against whatever it checks out.
+    let payload = github::parse_push(&body);
     let trigger = executor::Trigger {
-        payload: github::parse_push(&body),
+        // The event header names what happened (push, workflow_dispatch, …),
+        // which with the payload's actor becomes the run's "triggered by".
+        source: Some(github::trigger_label(
+            headers
+                .get("x-github-event")
+                .and_then(|value| value.to_str().ok()),
+            payload.as_ref(),
+        )),
+        payload,
     };
 
     std::mem::drop(tokio::spawn(async move {

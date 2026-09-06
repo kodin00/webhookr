@@ -178,6 +178,9 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
                                 (views::jakarta_time(&run.started_at))
                             }
                             span class="muted" { (views::duration(run)) }
+                            @if let Some(trigger) = run.triggered_by.as_deref() {
+                                span class="muted small" { (trigger) }
+                            }
                             span class="summary" { (run.message) }
                         }
                     }
@@ -761,10 +764,16 @@ async fn trigger(id: &str, sync_source: bool) -> Result<Response, WebError> {
         state::load_runs().into_iter().map(|r| r.id).collect();
 
     let handle = tokio::spawn(async move {
+        // Labelled `web UI` so the run's history says a person clicked a
+        // button here, as against a push, a workflow, or the CLI.
+        let trigger = executor::Trigger {
+            payload: None,
+            source: Some("web UI".to_string()),
+        };
         let result = if sync_source {
-            executor::run_project(&project).await
+            executor::run_project_with(&project, trigger).await
         } else {
-            executor::deploy_project(&project).await
+            executor::deploy_project_with(&project, trigger).await
         };
         if let Err(error) = result {
             eprintln!("webhookr: run failed to start: {error:#}");

@@ -84,6 +84,10 @@ terminal rather than under systemd, it will not come back by itself.
 - Run history and per-run logs are written to a separate state directory. Logs
   stream to disk as commands produce them, so a long `docker compose build` can
   be followed while it runs rather than only after it finishes.
+- Each run records what triggered it — `push by <user>`, `merge by <user>` (a
+  pull request merge), `workflow_dispatch by <user>`, `webhook` for generic
+  token-mode senders, `web UI`, or `cli`. The label shows on the run pages, the
+  dashboard cards, and in the Telegram messages.
 - Only one run per project happens at a time; a trigger arriving while that
   project is already deploying is refused rather than queued, so two pushes
   cannot race `git pull` on the same checkout.
@@ -381,12 +385,15 @@ it will start with `-100`.
 
 ### What gets posted
 
-- `🚀 deploy started — <project>` with the run and commit when the deploy
-  begins.
+- `🚀 deploy started — <project>` with the run, the commit, and what
+  triggered the deploy (`push by alice`, `merge by alice`,
+  `workflow_dispatch by alice`, `web UI`, …) when the deploy begins.
 - `✅ deploy succeeded` with the duration and the deploy's summary line.
 - `❌ deploy failed` with the duration, the error, and the last part of the
   run log (ANSI stripped, capped so the whole message stays under Telegram's
   4096-character limit).
+
+The trigger rides along on the finished messages too, next to the commit.
 
 When the admin UI has a public hostname, each message ends with a link to that
 run's log page. With only a loopback address configured the link is omitted,

@@ -40,6 +40,11 @@ pub struct RunRecord {
     /// empty string.
     #[serde(default)]
     pub commit: Option<String>,
+    /// What started the run, for display: `push by alice`, `merge by alice`,
+    /// `workflow_dispatch by alice`, `webhook`, `web UI`, `cli`. Absent on
+    /// runs recorded before the field existed.
+    #[serde(default)]
+    pub triggered_by: Option<String>,
     /// Whether the run's final Telegram message got through. Absent when no
     /// notifier ran (notifications off or unusable) and on runs recorded before
     /// the field existed.
@@ -211,6 +216,7 @@ mod tests {
             duration_ms: 42_000,
             message: message.into(),
             commit: None,
+            triggered_by: None,
             telegram: None,
         }
     }
@@ -255,6 +261,7 @@ mod tests {
             serde_json::from_str(legacy).expect("an old history must still load");
         assert_eq!(runs.len(), 1);
         assert!(runs[0].telegram.is_none());
+        assert!(runs[0].triggered_by.is_none());
 
         // And it survives the round trip with the new field along.
         let rewritten = serde_json::to_string(&runs).unwrap();

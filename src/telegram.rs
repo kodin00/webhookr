@@ -214,12 +214,14 @@ impl Notifier {
         project_name: &str,
         run_id: &str,
         commit: Option<&str>,
+        triggered_by: Option<&str>,
         log: &mut File,
     ) {
         let text = message_started(
             project_name,
             run_id,
             commit,
+            triggered_by,
             self.run_url(run_id).as_deref(),
         );
         self.send("started", &text, false, log).await;
@@ -322,6 +324,7 @@ pub fn message_started(
     project_name: &str,
     run_id: &str,
     commit: Option<&str>,
+    triggered_by: Option<&str>,
     run_url: Option<&str>,
 ) -> String {
     let commit = commit.map(short).unwrap_or("unknown");
@@ -329,6 +332,10 @@ pub fn message_started(
         "🚀 deploy started — {project_name}\nrun {} · commit {commit}",
         short(run_id)
     );
+    if let Some(trigger) = triggered_by {
+        text.push_str(" · ");
+        text.push_str(trigger);
+    }
     if let Some(url) = run_url {
         text.push_str("\n\n");
         text.push_str(url);
@@ -351,8 +358,14 @@ pub fn message_finished(
     } else {
         format!("failed after {duration}")
     };
+    // Says who or what asked for the deploy, next to the commit it deployed.
+    let trigger = record
+        .triggered_by
+        .as_deref()
+        .map(|trigger| format!(" · {trigger}"))
+        .unwrap_or_default();
     let mut text = format!(
-        "{} deploy {verb} — {project_name}\nrun {} · commit {commit} · {timing}\n{}",
+        "{} deploy {verb} — {project_name}\nrun {} · commit {commit}{trigger} · {timing}\n{}",
         if succeeded { "✅" } else { "❌" },
         short(&record.id),
         record.message
@@ -395,6 +408,7 @@ mod tests {
             duration_ms: 42_000,
             message: message.into(),
             commit: Some("4f5e6d7c8b9a".repeat(4)),
+            triggered_by: None,
             telegram: None,
         }
     }
@@ -433,27 +447,30 @@ mod tests {
             "My Site",
             "a1b2c3d4e5f6",
             Some("4f5e6d7c8b9a"),
+            Some("push by alice"),
             Some("https://panel.example.com/runs/a1b2c3d4e5f6"),
         );
         assert!(started.contains("🚀 deploy started — My Site"), "{started}");
         assert!(
-            started.contains("run a1b2c3d4 · commit 4f5e6d7"),
+            started.contains("run a1b2c3d4 · commit 4f5e6d7c · push by alice"),
             "{started}"
         );
         assert!(started.ends_with("https://panel.example.com/runs/a1b2c3d4e5f6"));
 
-        // No commit to name yet (a manual run before HEAD is read).
-        let blind = message_started("My Site", "a1b2c3d4e5f6", None, None);
+        // No commit to name yet (a manual run before HEAD is read), and no
+        // trigger (a run recorded before the field existed).
+        let blind = message_started("My Site", "a1b2c3d4e5f6", None, None, None);
         assert!(blind.contains("commit unknown"), "{blind}");
+        assert!(!blind.contains(" · push"), "no trigger, no label: {blind}");
 
-        let ok = message_finished(
-            "My Site",
-            &record("success", "Successfully tagged site:latest"),
-            "leftover",
-            None,
-        );
+        let mut triggered = record("success", "Successfully tagged site:latest");
+        triggered.triggered_by = Some("merge by alice".into());
+        let ok = message_finished("My Site", &triggered, "leftover", None);
         assert!(ok.contains("✅ deploy succeeded — My Site"), "{ok}");
-        assert!(ok.contains("deployed in 42s"), "{ok}");
+        assert!(
+            ok.contains("commit 4f5e6d7c · merge by alice · deployed in 42s"),
+            "{ok}"
+        );
         assert!(ok.contains("Successfully tagged site:latest"), "{ok}");
         assert!(!ok.contains("run log"), "success quotes no log: {ok}");
 

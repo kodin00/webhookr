@@ -144,11 +144,18 @@ pub struct PushPayload {
     pub head_commit: Option<PushCommit>,
     #[serde(default)]
     pub repository: Option<PushRepo>,
+    #[serde(default)]
+    pub pusher: Option<Pusher>,
+    #[serde(default)]
+    pub sender: Option<Sender>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PushCommit {
     pub id: String,
+    /// Present on GitHub `push` deliveries; used to recognise a PR merge.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +166,22 @@ pub struct PushRepo {
     pub clone_url: Option<String>,
     #[serde(default)]
     pub html_url: Option<String>,
+}
+
+/// The `pusher` object of a `push` delivery: who ran `git push`.
+#[derive(Debug, Deserialize)]
+pub struct Pusher {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// The `sender` object every GitHub delivery carries: the account the event
+/// happened as, which for a merge or `workflow_dispatch` is who clicked the
+/// button.
+#[derive(Debug, Deserialize)]
+pub struct Sender {
+    #[serde(default)]
+    pub login: Option<String>,
 }
 
 /// Read a webhook body as a push payload. Anything unparseable yields `None`,
@@ -229,6 +252,56 @@ pub fn payload_slug(payload: &PushPayload) -> Option<RepoSlug> {
         owner: clean_segment(owner)?,
         repo: clean_segment(repo)?,
     })
+}
+
+/// Who the delivery says caused it, for the run's "triggered by" label.
+///
+/// `sender` names the account the event happened as and is present on every
+/// GitHub delivery; `pusher` covers a `push` whose sender is absent or blank.
+fn payload_actor(payload: &PushPayload) -> Option<&str> {
+    let login = payload
+        .sender
+        .as_ref()
+        .and_then(|sender| sender.login.as_deref())
+        .or_else(|| payload.pusher.as_ref().and_then(|p| p.name.as_deref()))?;
+    let login = login.trim();
+    (!login.is_empty()).then_some(login)
+}
+
+/// A short human label for what started a run, persisted on the record and
+/// shown wherever runs are: `push by alice`, `merge by alice`,
+/// `workflow_dispatch by alice`, `web UI`, `cli`.
+///
+/// `event` is the delivery's `X-GitHub-Event` header. Without one the sender
+/// is not GitHub (a generic webhook in `token` mode), so the label is just
+/// `webhook`. A `push` whose head commit is GitHub's merge-commit message is
+/// labelled `merge` — squash and rebase merges keep their own messages and
+/// read as the pushes they arrived as.
+pub fn trigger_label(event: Option<&str>, payload: Option<&PushPayload>) -> String {
+    let actor = payload.and_then(payload_actor);
+    let suffix = |label: &str| match actor {
+        Some(actor) => format!("{label} by {actor}"),
+        None => label.to_string(),
+    };
+
+    match event.map(str::trim).filter(|event| !event.is_empty()) {
+        Some("push") => {
+            let merged = payload
+                .and_then(|payload| payload.head_commit.as_ref())
+                .and_then(|commit| commit.message.as_deref())
+                .is_some_and(|message| {
+                    message.trim_start().starts_with("Merge pull request #")
+                });
+            if merged {
+                suffix("merge")
+            } else {
+                suffix("push")
+            }
+        }
+        // No event header: not a GitHub delivery.
+        None => "webhook".to_string(),
+        Some(other) => suffix(other),
+    }
 }
 
 // ----- the status itself ---------------------------------------------------
@@ -712,6 +785,63 @@ mod tests {
         // With no URL to read a host from, assume the public host.
         let bare = parse_push(br#"{"repository":{"full_name":"me/site"}}"#).unwrap();
         assert_eq!(payload_slug(&bare), slug("github.com", "me", "site"));
+    }
+
+    #[test]
+    fn trigger_labels_name_the_event_and_its_actor() {
+        let push = parse_push(
+            br#"{"ref":"refs/heads/main","pusher":{"name":"alice"},
+                 "sender":{"login":"alice"},"head_commit":{
+                 "id":"1111111111111111111111111111111111111111",
+                 "message":"bump version"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            trigger_label(Some("push"), Some(&push)),
+            "push by alice",
+            "an ordinary push names its pusher"
+        );
+
+        // `sender` wins over `pusher` when they differ.
+        let merged = parse_push(
+            br#"{"pusher":{"name":"bob"},"sender":{"login":"carol"},
+                 "head_commit":{"id":"1111111111111111111111111111111111111111",
+                 "message":"Merge pull request #12 from me/feature"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            trigger_label(Some("push"), Some(&merged)),
+            "merge by carol",
+            "a PR-merge push is a merge, by its sender"
+        );
+
+        // A squash merge keeps its own message; it reads as the push it is.
+        let squash = parse_push(
+            br#"{"sender":{"login":"alice"},"head_commit":{
+                 "id":"1111111111111111111111111111111111111111",
+                 "message":"bump version (#13)"}}"#,
+        )
+        .unwrap();
+        assert_eq!(trigger_label(Some("push"), Some(&squash)), "push by alice");
+
+        // Any other GitHub event is labelled by its event name, so a manually
+        // run workflow says what fired it.
+        let dispatch = parse_push(br#"{"sender":{"login":"alice"}}"#).unwrap();
+        assert_eq!(
+            trigger_label(Some("workflow_dispatch"), Some(&dispatch)),
+            "workflow_dispatch by alice"
+        );
+        let ping = parse_push(br#"{"zen":"Keep it logically awesome.","hook_id":1}"#).unwrap();
+        assert_eq!(trigger_label(Some("ping"), Some(&ping)), "ping");
+
+        // A push with no actor at all (an empty login, not a missing one).
+        let silent = parse_push(br#"{"sender":{"login":"  "}}"#).unwrap();
+        assert_eq!(trigger_label(Some("push"), Some(&silent)), "push");
+
+        // No event header: a generic token-mode webhook, actor or not.
+        assert_eq!(trigger_label(None, Some(&dispatch)), "webhook");
+        assert_eq!(trigger_label(None, None), "webhook");
+        assert_eq!(trigger_label(Some("  "), Some(&dispatch)), "webhook");
     }
 
     #[test]
