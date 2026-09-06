@@ -58,8 +58,8 @@ is in it. Every build therefore carries the commit it came from:
 
 ```sh
 $ webhookr version
-running:   0.2.0 (73deef9)
-published: 0.2.0 (73deef9) (up to date)
+running:   0.2.1 (73deef9)
+published: 0.2.1 (73deef9) (up to date)
 ```
 
 The same pair is on **Settings → Version** in the web UI and in the TUI banner.
