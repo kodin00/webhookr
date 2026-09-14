@@ -196,21 +196,35 @@ async fn webhook(
         );
     }
 
-    // Parsed only now, never before `verify_secret`: it is the signature that
-    // makes the repository and commit named in the body trustworthy enough to
-    // post a status against. Any other event (`ping`, `workflow_run`, or a
-    // non-GitHub sender in `token` mode) yields no payload and simply carries no
-    // commit, leaving the run to report against whatever it checks out.
-    let payload = github::parse_push(&body);
+    // Classified only now, never before `verify_secret`: it is the signature
+    // that makes the repository and commit named in the body trustworthy enough
+    // to post a status against. `classify` both narrows the delivery to a
+    // [`github::TriggerKind`] the project's `trigger_events` filter matches
+    // against, and yields the [`github::PushPayload`] the executor and reporter
+    // consume — a *normalized* view for a merged-PR delivery, or whatever
+    // `parse_push` made of anything else (empty for `ping`/non-push bodies).
+    let event = headers
+        .get("x-github-event")
+        .and_then(|value| value.to_str().ok());
+    let (kind, payload) = github::classify(event, &body);
+
+    // A `ping` never deploys; with a non-empty filter, only the selected kinds
+    // (and a token-mode sender) deploy. Either way GitHub gets a 2xx and no run.
+    if !kind.triggers_on(&project.trigger_events) {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "project": id,
+                "started": false,
+                "reason": format!("event '{}' is not in the project's triggers", kind.as_str()),
+            })),
+        );
+    }
+
     let trigger = executor::Trigger {
-        // The event header names what happened (push, workflow_dispatch, …),
-        // which with the payload's actor becomes the run's "triggered by".
-        source: Some(github::trigger_label(
-            headers
-                .get("x-github-event")
-                .and_then(|value| value.to_str().ok()),
-            payload.as_ref(),
-        )),
+        // The kind, with the payload's actor, becomes the run's "triggered by".
+        source: Some(github::trigger_label(&kind, payload.as_ref())),
         payload,
     };
 

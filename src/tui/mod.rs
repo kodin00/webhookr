@@ -149,6 +149,7 @@ enum Step {
     Deploy,
     Profiles,
     Verify,
+    Triggers,
     Confirm,
 }
 
@@ -166,6 +167,8 @@ struct Wizard {
     compose_file: Input,
     compose_profiles: Input,
     verify: usize, // 0 = github, 1 = token
+    trigger_push: bool,
+    trigger_merge: bool,
     browser: Option<DirBrowser>,
     error: Option<String>,
     secret: String,
@@ -185,6 +188,8 @@ impl Wizard {
             compose_file: Input::new("compose.yaml"),
             compose_profiles: Input::new(""),
             verify: 0,
+            trigger_push: false,
+            trigger_merge: false,
             browser: None,
             error: None,
             secret: util::generate_secret(),
@@ -204,6 +209,8 @@ impl Wizard {
             compose_file: Input::new(&p.compose_file),
             compose_profiles: Input::new(&p.compose_profiles.join(",")),
             verify: if p.verify_mode == "token" { 1 } else { 0 },
+            trigger_push: p.trigger_events.iter().any(|e| e == "push"),
+            trigger_merge: p.trigger_events.iter().any(|e| e == "merge"),
             browser: None,
             error: None,
             secret: p.secret.clone(),
@@ -911,12 +918,22 @@ impl App {
                 }
                 KeyCode::Enter => {
                     w.error = None;
+                    w.step = Step::Triggers;
+                }
+                _ => {}
+            },
+            Step::Triggers => match key {
+                KeyCode::Esc => w.step = Step::Verify,
+                KeyCode::Char('1') => w.trigger_push = !w.trigger_push,
+                KeyCode::Char('2') => w.trigger_merge = !w.trigger_merge,
+                KeyCode::Enter => {
+                    w.error = None;
                     w.step = Step::Confirm;
                 }
                 _ => {}
             },
             Step::Confirm => match key {
-                KeyCode::Esc => w.step = Step::Verify,
+                KeyCode::Esc => w.step = Step::Triggers,
                 KeyCode::Enter => {
                     let name = w.name.value().trim().to_string();
                     let id = match w.editing {
@@ -953,6 +970,16 @@ impl App {
                         status_reports,
                         status_token,
                         status_context,
+                        trigger_events: {
+                            let mut events = Vec::new();
+                            if w.trigger_push {
+                                events.push("push".to_string());
+                            }
+                            if w.trigger_merge {
+                                events.push("merge".to_string());
+                            }
+                            events
+                        },
                         path: w.path.value().trim().to_string(),
                         branch: w.branch.value().trim().to_string(),
                         command: w.command.value().trim().to_string(),
@@ -1526,6 +1553,7 @@ impl App {
                 Some("optional comma-separated profiles, e.g. web,worker".to_string()),
             ),
             Step::Verify => self.render_verify(f, v[1], w),
+            Step::Triggers => self.render_triggers(f, v[1], w),
             Step::Confirm => self.render_confirm_wizard(f, v[1], w),
         }
 
@@ -1603,6 +1631,59 @@ impl App {
                 .border_style(Style::default().fg(MUTED)),
         );
         f.render_widget(list, area);
+    }
+
+    fn render_triggers(&self, f: &mut Frame, area: Rect, w: &Wizard) {
+        let opts = [
+            (
+                '1',
+                &w.trigger_push,
+                "push",
+                "a push to the configured branch",
+            ),
+            (
+                '2',
+                &w.trigger_merge,
+                "merge",
+                "a pull request closed and merged",
+            ),
+        ];
+        let items: Vec<ListItem> = opts
+            .iter()
+            .map(|(key, on, name, desc)| {
+                let mark = if **on { "[x] " } else { "[ ] " };
+                let style = if **on {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("({key}) {mark}{name}"), style),
+                    Span::raw("   "),
+                    Span::styled(*desc, Style::default().fg(MUTED)),
+                ]))
+            })
+            .collect();
+        let note = if w.trigger_push || w.trigger_merge {
+            "selected events only deploy; everything else is ignored"
+        } else {
+            "none selected = deploy on every delivery (the default)"
+        };
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    " deployment triggers ",
+                    Style::default().fg(ACCENT),
+                ))
+                .border_style(Style::default().fg(MUTED)),
+        );
+        f.render_widget(list, area);
+        f.render_widget(
+            Paragraph::new(Span::styled(note, Style::default().fg(MUTED)))
+                .block(Block::default().borders(Borders::BOTTOM)),
+            area,
+        );
     }
 
     fn render_presets(&self, f: &mut Frame, area: Rect, w: &Wizard) {
@@ -2071,7 +2152,7 @@ fn input_line(value: &str, cursor: usize) -> Line<'static> {
 /// Progress breadcrumb across the top of the wizard.
 fn step_progress(w: &Wizard) -> Line<'static> {
     let steps = [
-        "Name", "Source", "Path", "Branch", "Deploy", "Verify", "Confirm",
+        "Name", "Source", "Path", "Branch", "Deploy", "Verify", "Triggers", "Confirm",
     ];
     let cur = match w.step {
         Step::Name => 0,
@@ -2080,7 +2161,8 @@ fn step_progress(w: &Wizard) -> Line<'static> {
         Step::Branch => 3,
         Step::Preset | Step::Deploy | Step::Profiles => 4,
         Step::Verify => 5,
-        Step::Confirm => 6,
+        Step::Triggers => 6,
+        Step::Confirm => 7,
     };
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, s) in steps.iter().enumerate() {
@@ -2121,6 +2203,7 @@ fn wizard_hints(w: &Wizard) -> Line<'static> {
             Step::Path => key_hints(&[("tab", "browse"), ("enter", "next"), ("esc", "back")]),
             Step::Preset => key_hints(&[("j/k", "choose"), ("enter", "next"), ("esc", "back")]),
             Step::Verify => key_hints(&[("j/k", "toggle"), ("enter", "next"), ("esc", "back")]),
+            Step::Triggers => key_hints(&[("1/2", "toggle"), ("enter", "next"), ("esc", "back")]),
             Step::Confirm => key_hints(&[("enter", "save"), ("esc", "back")]),
         }
     }

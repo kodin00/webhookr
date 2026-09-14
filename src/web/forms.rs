@@ -45,6 +45,11 @@ pub struct ProjectForm {
     pub compose_profiles: String,
     #[serde(default)]
     pub verify_mode: String,
+    /// Which deployment triggers are ticked: `push` and/or `merge`. Sent as
+    /// repeated form values with the same name, so a `Vec`. Empty (none ticked)
+    /// is the all-events default.
+    #[serde(default)]
+    pub trigger_events: Vec<String>,
     /// Present when the "report commit statuses" checkbox is ticked.
     #[serde(default)]
     pub status_reports: Option<String>,
@@ -128,6 +133,12 @@ impl ProjectForm {
             secret,
             verify_mode,
             repository: self.repository.trim().to_string(),
+            trigger_events: self
+                .trigger_events
+                .iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect(),
             git_token,
             deploy_preset,
             compose_file,
@@ -157,6 +168,7 @@ impl ProjectForm {
             compose_file: project.compose_file.clone(),
             compose_profiles: project.compose_profiles.join(", "),
             verify_mode: project.verify_mode.clone(),
+            trigger_events: project.trigger_events.clone(),
             status_reports: project.status_reports.then(|| "1".to_string()),
             // Never echo a stored token back into the page.
             status_token: String::new(),
@@ -210,6 +222,7 @@ mod tests {
             compose_file: String::new(),
             compose_profiles: " web , , worker\nextra ".into(),
             verify_mode: "github".into(),
+            trigger_events: Vec::new(),
             status_reports: None,
             status_token: String::new(),
             clear_status_token: None,
@@ -246,6 +259,31 @@ mod tests {
             .to_project(Some(&original))
             .unwrap();
         assert_eq!(original, rebuilt);
+    }
+
+    #[test]
+    fn trigger_events_round_trip_and_trim() {
+        let mut form = form();
+        form.trigger_events = vec![" push ".into(), "merge".into(), "".into()];
+        let project = form.to_project(None).unwrap();
+        assert_eq!(project.trigger_events, vec!["push", "merge"]);
+
+        // An empty selection is the all-events default and survives an edit.
+        let rebuilt = ProjectForm::from_project(&project)
+            .to_project(Some(&project))
+            .unwrap();
+        assert_eq!(rebuilt.trigger_events, vec!["push", "merge"]);
+
+        let cleared = ProjectForm::from_project(&project);
+        let cleared = ProjectForm {
+            trigger_events: Vec::new(),
+            ..cleared
+        };
+        assert!(cleared
+            .to_project(Some(&project))
+            .unwrap()
+            .trigger_events
+            .is_empty());
     }
 
     #[test]

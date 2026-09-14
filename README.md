@@ -290,6 +290,30 @@ webhookr verifies the `X-Hub-Signature-256` header against the project's
 secret before running anything, so only requests signed with the secret are
 accepted.
 
+### Deployment triggers
+
+By default a project deploys on **every** signed delivery GitHub sends. To
+narrow that, pick which events trigger a deploy, per project:
+
+- **Push** — a `push` to the configured branch, including the merge commit
+  pushed after a PR merge.
+- **Merge** — a `pull_request` event that was closed and merged. This needs
+  the **`pull_request`** event enabled in your GitHub webhook settings (the
+  default `push`-only webhook will not fire it). webhookr reports the deploy
+  status against the merge commit.
+
+Leave both unticked to keep the default (every delivery). A `ping` delivery
+never triggers a deploy, regardless of the selection.
+
+If both `push` and `merge` are selected, a PR merge fires two deliveries; the
+second is refused by webhookr's one-run-at-a-time lock, so only one deploy
+starts.
+
+Set the triggers in any of the three surfaces — the web admin UI (the
+**Deployment triggers** field on the project form), the CLI
+(`webhookr add --trigger-event push --trigger-event merge`, or omit on
+`edit` to leave them unchanged), or the TUI wizard's **Triggers** step.
+
 To get the deploy result back onto the commit as a green check or red X, see
 [GitHub commit status](#github-commit-status).
 

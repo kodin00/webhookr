@@ -190,6 +190,48 @@ pub fn parse_push(body: &[u8]) -> Option<PushPayload> {
     serde_json::from_slice(body).ok()
 }
 
+/// The parts of a GitHub `pull_request` payload a deploy decision needs.
+///
+/// Like [`PushPayload`], every field is optional so a non-`pull_request` body
+/// deserializes into an empty struct rather than failing.
+#[derive(Debug, Default, Deserialize)]
+pub struct PullRequestPayload {
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub pull_request: Option<PullRequest>,
+    /// `repository` and `sender` have the same shape as on a `push` delivery.
+    #[serde(default)]
+    pub repository: Option<PushRepo>,
+    #[serde(default)]
+    pub sender: Option<Sender>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PullRequest {
+    /// `true` only on a `closed` action where the PR was actually merged.
+    #[serde(default)]
+    pub merged: Option<bool>,
+    /// The merge commit on the base branch, present when `merged` is true.
+    #[serde(default)]
+    pub merge_commit_sha: Option<String>,
+    /// The branch a merge lands on; used to build the normalized push `ref`.
+    #[serde(default)]
+    pub base: Option<PrBranch>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PrBranch {
+    #[serde(default, rename = "ref")]
+    pub r#ref: Option<String>,
+}
+
+/// Read a webhook body as a `pull_request` payload. Anything unparseable yields
+/// `None`, same contract as [`parse_push`].
+fn parse_pull_request(body: &[u8]) -> Option<PullRequestPayload> {
+    serde_json::from_slice(body).ok()
+}
+
 /// The commit this push landed, or `None` when there is nothing to report on.
 ///
 /// Both sources are needed. A push of more than a couple of thousand commits
@@ -268,39 +310,154 @@ fn payload_actor(payload: &PushPayload) -> Option<&str> {
     (!login.is_empty()).then_some(login)
 }
 
+// ----- delivery classification ---------------------------------------------
+
+/// What kind of GitHub delivery (or non-GitHub sender) a webhook body is.
+///
+/// Computed once per delivery by [`classify`], this is what the project's
+/// `trigger_events` filter matches against, and what [`trigger_label`] turns
+/// into the run's "triggered by" label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerKind {
+    /// A `push` event — code pushed to a branch, including the merge commit
+    /// pushed after a PR merge.
+    Push,
+    /// A `pull_request` event where the PR was closed and merged. The clean
+    /// signal for "a PR merged"; needs the `pull_request` event enabled in the
+    /// repo's webhook settings.
+    Merge,
+    /// GitHub's reachability handshake. Never a deploy intent, so always
+    /// ignored by [`Self::triggers_on`] regardless of the project's filter.
+    Ping,
+    /// Any other GitHub event (`workflow_dispatch`, a `pull_request` action
+    /// other than a merge, …). The string is the event name.
+    Other(String),
+    /// No `X-GitHub-Event` header: the sender is not GitHub (a generic webhook
+    /// in `token` mode). The sender chose to send it, so it always deploys.
+    Webhook,
+}
+
+impl TriggerKind {
+    /// The stable string a project lists under `trigger_events` to accept this
+    /// kind. `push` and `merge` are the only values selectable there.
+    pub fn as_str(&self) -> &str {
+        match self {
+            TriggerKind::Push => "push",
+            TriggerKind::Merge => "merge",
+            TriggerKind::Ping => "ping",
+            TriggerKind::Other(name) => name.as_str(),
+            TriggerKind::Webhook => "webhook",
+        }
+    }
+
+    /// Whether a delivery of this kind should start a run, given the project's
+    /// configured `trigger_events`.
+    ///
+    /// An empty list is the backward-compatible default — every non-`ping`
+    /// delivery deploys. A token-mode sender ([`Self::Webhook`]) always deploys:
+    /// the filter narrows *GitHub* events, and a generic sender chose to send.
+    /// A non-merge `pull_request` action ([`Self::Other`]) deploys only under
+    /// the all-events default, never when specific events are selected.
+    pub fn triggers_on(&self, events: &[String]) -> bool {
+        match self {
+            TriggerKind::Ping => false,
+            TriggerKind::Webhook => true,
+            TriggerKind::Other(_) => events.is_empty(),
+            TriggerKind::Push | TriggerKind::Merge => {
+                events.is_empty() || events.iter().any(|event| event == self.as_str())
+            }
+        }
+    }
+}
+
+/// Classify a delivery into its [`TriggerKind`] and the [`PushPayload`] the
+/// executor and status reporter should consume.
+///
+/// Parsed only after the HMAC check in [`crate::server`]: the signature is what
+/// makes the body trustworthy enough to read a commit sha out of.
+///
+/// For a `Merge` delivery the payload is a *normalized* [`PushPayload`] built
+/// from the `pull_request` body — `after` is the merge commit, `ref` is the
+/// base branch — so the rest of the pipeline treats it like a push and reports
+/// against the merge commit. Every other kind uses [`parse_push`], which yields
+/// an empty payload for a non-`push` body, exactly as before this existed.
+pub fn classify(event: Option<&str>, body: &[u8]) -> (TriggerKind, Option<PushPayload>) {
+    match event.map(str::trim).filter(|event| !event.is_empty()) {
+        None => (TriggerKind::Webhook, parse_push(body)),
+        Some("ping") => (TriggerKind::Ping, None),
+        Some("push") => (TriggerKind::Push, parse_push(body)),
+        Some("pull_request") => match parse_pull_request(body) {
+            Some(pr)
+                if pr.action.as_deref() == Some("closed")
+                    && pr
+                        .pull_request
+                        .as_ref()
+                        .is_some_and(|p| p.merged.unwrap_or(false)) =>
+            {
+                (TriggerKind::Merge, Some(merge_payload(pr)))
+            }
+            _ => (
+                TriggerKind::Other("pull_request".to_string()),
+                parse_push(body),
+            ),
+        },
+        Some(other) => (TriggerKind::Other(other.to_string()), parse_push(body)),
+    }
+}
+
+/// Build the [`PushPayload`] view of a merged-PR delivery, so the executor and
+/// reporter handle a merge like a push: the merge commit is `after`, the base
+/// branch is the `ref`, and the repository/sender carry through.
+fn merge_payload(pr: PullRequestPayload) -> PushPayload {
+    let pull_request = pr.pull_request.as_ref();
+    let merge_commit_sha = pull_request.and_then(|pr| pr.merge_commit_sha.clone());
+    let base_ref = pull_request
+        .and_then(|pr| pr.base.as_ref())
+        .and_then(|b| b.r#ref.clone());
+
+    PushPayload {
+        after: merge_commit_sha,
+        r#ref: base_ref.map(|r| format!("refs/heads/{r}")),
+        deleted: Some(false),
+        repository: pr.repository,
+        sender: pr.sender,
+        ..Default::default()
+    }
+}
+
 /// A short human label for what started a run, persisted on the record and
 /// shown wherever runs are: `push by alice`, `merge by alice`,
 /// `workflow_dispatch by alice`, `web UI`, `cli`.
 ///
-/// `event` is the delivery's `X-GitHub-Event` header. Without one the sender
-/// is not GitHub (a generic webhook in `token` mode), so the label is just
-/// `webhook`. A `push` whose head commit is GitHub's merge-commit message is
-/// labelled `merge` — squash and rebase merges keep their own messages and
-/// read as the pushes they arrived as.
-pub fn trigger_label(event: Option<&str>, payload: Option<&PushPayload>) -> String {
+/// A `push` whose head commit carries GitHub's merge-commit message is still
+/// labelled `merge` — squash and rebase merges keep their own messages and read
+/// as the pushes they arrived as. A [`TriggerKind::Merge`] delivery (the PR
+/// closed-and-merged event) is `merge` too, named after its `sender`.
+pub fn trigger_label(kind: &TriggerKind, payload: Option<&PushPayload>) -> String {
     let actor = payload.and_then(payload_actor);
     let suffix = |label: &str| match actor {
         Some(actor) => format!("{label} by {actor}"),
         None => label.to_string(),
     };
 
-    match event.map(str::trim).filter(|event| !event.is_empty()) {
-        Some("push") => {
+    match kind {
+        TriggerKind::Ping => "ping".to_string(),
+        TriggerKind::Webhook => "webhook".to_string(),
+        TriggerKind::Merge => suffix("merge"),
+        TriggerKind::Push => {
+            // A push of a PR-merge commit reads as a merge; a squash/rebase
+            // merge keeps its own message and reads as the push it is.
             let merged = payload
                 .and_then(|payload| payload.head_commit.as_ref())
                 .and_then(|commit| commit.message.as_deref())
-                .is_some_and(|message| {
-                    message.trim_start().starts_with("Merge pull request #")
-                });
+                .is_some_and(|message| message.trim_start().starts_with("Merge pull request #"));
             if merged {
                 suffix("merge")
             } else {
                 suffix("push")
             }
         }
-        // No event header: not a GitHub delivery.
-        None => "webhook".to_string(),
-        Some(other) => suffix(other),
+        TriggerKind::Other(name) => suffix(name),
     }
 }
 
@@ -797,7 +954,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            trigger_label(Some("push"), Some(&push)),
+            trigger_label(&TriggerKind::Push, Some(&push)),
             "push by alice",
             "an ordinary push names its pusher"
         );
@@ -810,7 +967,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            trigger_label(Some("push"), Some(&merged)),
+            trigger_label(&TriggerKind::Push, Some(&merged)),
             "merge by carol",
             "a PR-merge push is a merge, by its sender"
         );
@@ -822,26 +979,122 @@ mod tests {
                  "message":"bump version (#13)"}}"#,
         )
         .unwrap();
-        assert_eq!(trigger_label(Some("push"), Some(&squash)), "push by alice");
+        assert_eq!(
+            trigger_label(&TriggerKind::Push, Some(&squash)),
+            "push by alice"
+        );
 
         // Any other GitHub event is labelled by its event name, so a manually
         // run workflow says what fired it.
         let dispatch = parse_push(br#"{"sender":{"login":"alice"}}"#).unwrap();
         assert_eq!(
-            trigger_label(Some("workflow_dispatch"), Some(&dispatch)),
+            trigger_label(
+                &TriggerKind::Other("workflow_dispatch".into()),
+                Some(&dispatch)
+            ),
             "workflow_dispatch by alice"
         );
-        let ping = parse_push(br#"{"zen":"Keep it logically awesome.","hook_id":1}"#).unwrap();
-        assert_eq!(trigger_label(Some("ping"), Some(&ping)), "ping");
+        assert_eq!(trigger_label(&TriggerKind::Ping, Some(&dispatch)), "ping");
 
         // A push with no actor at all (an empty login, not a missing one).
         let silent = parse_push(br#"{"sender":{"login":"  "}}"#).unwrap();
-        assert_eq!(trigger_label(Some("push"), Some(&silent)), "push");
+        assert_eq!(trigger_label(&TriggerKind::Push, Some(&silent)), "push");
 
         // No event header: a generic token-mode webhook, actor or not.
-        assert_eq!(trigger_label(None, Some(&dispatch)), "webhook");
-        assert_eq!(trigger_label(None, None), "webhook");
-        assert_eq!(trigger_label(Some("  "), Some(&dispatch)), "webhook");
+        assert_eq!(
+            trigger_label(&TriggerKind::Webhook, Some(&dispatch)),
+            "webhook"
+        );
+        assert_eq!(trigger_label(&TriggerKind::Webhook, None), "webhook");
+    }
+
+    #[test]
+    fn classify_names_pushes_merges_and_the_rest() {
+        // A push delivery classifies as Push and carries its payload.
+        let push_body = br#"{"ref":"refs/heads/main",
+            "after":"1111111111111111111111111111111111111111",
+            "sender":{"login":"alice"}}"#;
+        let (kind, payload) = classify(Some("push"), push_body);
+        assert_eq!(kind, TriggerKind::Push);
+        assert_eq!(
+            payload_sha(payload.as_ref().unwrap()),
+            Some("1111111111111111111111111111111111111111")
+        );
+
+        // A merged PR classifies as Merge, and the payload is normalized to the
+        // merge commit on the base branch so ref_matches reports against it.
+        let merge_body = br#"{"action":"closed","number":12,
+            "pull_request":{"merged":true,
+            "merge_commit_sha":"2222222222222222222222222222222222222222",
+            "base":{"ref":"main","sha":"3333333333333333333333333333333333333333"},
+            "head":{"ref":"feature","sha":"4444444444444444444444444444444444444444"}},
+            "repository":{"full_name":"me/site",
+            "clone_url":"https://github.com/me/site.git"},
+            "sender":{"login":"carol"}}"#;
+        let (kind, payload) = classify(Some("pull_request"), merge_body);
+        assert_eq!(kind, TriggerKind::Merge);
+        let payload = payload.unwrap();
+        assert_eq!(
+            payload.after.as_deref(),
+            Some("2222222222222222222222222222222222222222")
+        );
+        assert_eq!(payload.r#ref.as_deref(), Some("refs/heads/main"));
+        assert!(ref_matches(&payload, "main"));
+        assert_eq!(payload_slug(&payload), slug("github.com", "me", "site"));
+        assert_eq!(trigger_label(&kind, Some(&payload)), "merge by carol");
+
+        // A PR that was closed without merging is not a deploy trigger: it reads
+        // as Other, and the payload stays whatever parse_push made of the body.
+        let closed = br#"{"action":"closed","pull_request":{"merged":false}}"#;
+        let (kind, _) = classify(Some("pull_request"), closed);
+        assert_eq!(kind, TriggerKind::Other("pull_request".to_string()));
+
+        // A newly opened PR is Other too — never a trigger of its own.
+        let opened = br#"{"action":"opened","pull_request":{"merged":null}}"#;
+        let (kind, _) = classify(Some("pull_request"), opened);
+        assert_eq!(kind, TriggerKind::Other("pull_request".to_string()));
+
+        // ping is always ignored.
+        let (kind, payload) = classify(Some("ping"), b"{\"zen\":\"hi\"}");
+        assert_eq!(kind, TriggerKind::Ping);
+        assert!(payload.is_none());
+
+        // No event header: a token-mode sender.
+        let (kind, _) = classify(None, b"{}");
+        assert_eq!(kind, TriggerKind::Webhook);
+    }
+
+    #[test]
+    fn triggers_on_matches_the_project_filter() {
+        let all: Vec<String> = Vec::new();
+        let push_only = vec!["push".to_string()];
+        let merge_only = vec!["merge".to_string()];
+        let both = vec!["push".to_string(), "merge".to_string()];
+
+        // Empty filter (the default): everything but ping deploys.
+        assert!(TriggerKind::Push.triggers_on(&all));
+        assert!(TriggerKind::Merge.triggers_on(&all));
+        assert!(TriggerKind::Webhook.triggers_on(&all));
+        assert!(TriggerKind::Other("workflow_dispatch".into()).triggers_on(&all));
+        assert!(
+            !TriggerKind::Ping.triggers_on(&all),
+            "ping is never a trigger"
+        );
+
+        // Specific events selected: only those kinds (and token-mode) deploy.
+        assert!(TriggerKind::Push.triggers_on(&push_only));
+        assert!(!TriggerKind::Merge.triggers_on(&push_only));
+        assert!(TriggerKind::Merge.triggers_on(&merge_only));
+        assert!(!TriggerKind::Push.triggers_on(&merge_only));
+        assert!(TriggerKind::Push.triggers_on(&both));
+        assert!(TriggerKind::Merge.triggers_on(&both));
+
+        // A token-mode sender always deploys — the filter narrows GitHub events.
+        assert!(TriggerKind::Webhook.triggers_on(&push_only));
+        assert!(TriggerKind::Webhook.triggers_on(&merge_only));
+
+        // A non-merge PR action never deploys when specific events are selected.
+        assert!(!TriggerKind::Other("pull_request".into()).triggers_on(&both));
     }
 
     #[test]

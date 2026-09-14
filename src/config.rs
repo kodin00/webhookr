@@ -207,6 +207,13 @@ pub struct ProjectConfig {
     /// overwrite each other's status.
     #[serde(default)]
     pub status_context: String,
+    /// Which GitHub delivery kinds trigger a deploy. Empty (the default) means
+    /// every non-`ping` delivery deploys — the original behavior. Otherwise only
+    /// the listed kinds do: `push` (a `push` event to the branch) and `merge` (a
+    /// `pull_request` event closed and merged, which needs the `pull_request`
+    /// event enabled in the repo's webhook settings).
+    #[serde(default)]
+    pub trigger_events: Vec<String>,
 }
 
 impl ProjectConfig {
@@ -236,6 +243,7 @@ impl ProjectConfig {
             status_reports: false,
             status_token: String::new(),
             status_context: String::new(),
+            trigger_events: Vec::new(),
         }
     }
 
@@ -295,6 +303,16 @@ impl ProjectConfig {
                 bail!("compose profiles must be non-empty names and may not start with '-'");
             }
         }
+        // `trigger_events` narrows which GitHub deliveries deploy this project.
+        // The allowed values are matched verbatim against the classified event
+        // kind, so anything other than `push`/`merge` is a typo that would
+        // silently match nothing.
+        for event in &self.trigger_events {
+            match event.trim() {
+                "push" | "merge" => {}
+                other => bail!("trigger_events may only contain 'push' or 'merge', got {other:?}"),
+            }
+        }
         // Sent verbatim to GitHub as a JSON string and shown as a label beside
         // the commit, so it has to be a short single line.
         //
@@ -315,6 +333,17 @@ impl ProjectConfig {
 
     pub fn uses_compose(&self) -> bool {
         self.deploy_preset.starts_with("compose_")
+    }
+
+    /// One-line label for the project's configured trigger events, for the CLI
+    /// and the admin UI. Empty reads as "all events": the backward-compatible
+    /// default where every non-`ping` delivery deploys.
+    pub fn triggers_label(&self) -> String {
+        if self.trigger_events.is_empty() {
+            "all events".to_string()
+        } else {
+            self.trigger_events.join(", ")
+        }
     }
 
     pub fn preset_label(&self) -> &'static str {
@@ -821,6 +850,31 @@ mod tests {
     }
 
     #[test]
+    fn trigger_events_accept_push_and_merge_and_reject_unknown() {
+        let mut project = ProjectConfig::new(
+            "site".into(),
+            "Site".into(),
+            "/tmp".into(),
+            "main".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+
+        // Empty is the default — every non-ping delivery deploys.
+        assert!(project.validate().is_ok());
+
+        project.trigger_events = vec!["push".into(), "merge".into()];
+        assert!(project.validate().is_ok());
+
+        project.trigger_events = vec!["push", "merge", " pull "]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(project.validate().is_err(), "a typo silently matches nothing");
+    }
+
+    #[test]
     fn clone_target_may_not_exist_yet() {
         let project = ProjectConfig {
             id: "site".into(),
@@ -838,6 +892,7 @@ mod tests {
             status_reports: false,
             status_token: String::new(),
             status_context: String::new(),
+            trigger_events: Vec::new(),
         };
         project.validate().unwrap();
     }

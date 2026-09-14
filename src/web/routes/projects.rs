@@ -129,6 +129,7 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
             h2 { "Webhook" }
             (views::code_field("URL", &hook_url))
             (views::field("Verification", verify_label(&project.verify_mode)))
+            (views::field("Triggers", &project.triggers_label()))
 
             @if project.status_reports {
                 (views::code_field("Commit status", &project.effective_status_context()))
@@ -233,6 +234,7 @@ pub async fn new_form() -> Result<Markup, WebError> {
         compose_file: "compose.yaml".to_string(),
         compose_profiles: String::new(),
         verify_mode: "github".to_string(),
+        trigger_events: Vec::new(),
         status_reports: None,
         status_token: String::new(),
         clear_status_token: None,
@@ -519,6 +521,32 @@ fn project_form(
             }
 
             fieldset {
+                legend { "Deployment triggers" }
+                span class="hint" {
+                    "Which GitHub deliveries start a deploy. Leave both unticked to deploy on "
+                    "every delivery (the default)."
+                }
+                label class="checkbox" {
+                    input type="checkbox" name="trigger_events" value="push"
+                          checked[form.trigger_events.iter().any(|e| e == "push")];
+                    span { "Push" }
+                    span class="hint" {
+                        "A push to the configured branch — including the merge commit pushed "
+                        "after a PR merge."
+                    }
+                }
+                label class="checkbox" {
+                    input type="checkbox" name="trigger_events" value="merge"
+                          checked[form.trigger_events.iter().any(|e| e == "merge")];
+                    span { "Merge" }
+                    span class="hint" {
+                        "A pull request closed and merged. Needs the pull_request event enabled "
+                        "in your GitHub webhook settings; a ping never triggers a deploy."
+                    }
+                }
+            }
+
+            fieldset {
                 legend { "GitHub commit status" }
 
                 label class="checkbox" {
@@ -590,6 +618,7 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
             .unwrap_or_else(|| "docker-compose.yml".to_string()),
         compose_profiles: query.compose_profiles.unwrap_or_default(),
         verify_mode: String::new(),
+        trigger_events: Vec::new(),
         status_reports: None,
         status_token: String::new(),
         clear_status_token: None,

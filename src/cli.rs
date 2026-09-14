@@ -79,6 +79,10 @@ pub enum Commands {
         /// Compose profile; repeat for multiple profiles
         #[arg(long = "compose-profile")]
         compose_profiles: Vec<String>,
+        /// When to deploy: `push` and/or `merge`; repeat for multiple. Empty
+        /// (the default) deploys on every delivery.
+        #[arg(long = "trigger-event")]
+        trigger_events: Vec<String>,
     },
     /// Edit an existing project
     Edit {
@@ -102,6 +106,10 @@ pub enum Commands {
         compose_file: Option<String>,
         #[arg(long = "compose-profile")]
         compose_profiles: Vec<String>,
+        /// When to deploy: `push` and/or `merge`; repeat for multiple. Absent
+        /// leaves the stored triggers unchanged.
+        #[arg(long = "trigger-event")]
+        trigger_events: Vec<String>,
     },
     /// Remove a project
     Remove {
@@ -225,6 +233,7 @@ async fn handle(cmd: Commands) -> Result<()> {
             preset,
             compose_file,
             compose_profiles,
+            trigger_events,
         } => cmd_add(
             name,
             id,
@@ -236,6 +245,7 @@ async fn handle(cmd: Commands) -> Result<()> {
             preset,
             compose_file,
             compose_profiles,
+            trigger_events,
         ),
         Commands::Edit {
             id,
@@ -248,6 +258,7 @@ async fn handle(cmd: Commands) -> Result<()> {
             preset,
             compose_file,
             compose_profiles,
+            trigger_events,
         } => cmd_edit(
             id,
             name,
@@ -259,6 +270,7 @@ async fn handle(cmd: Commands) -> Result<()> {
             preset,
             compose_file,
             compose_profiles,
+            trigger_events,
         ),
         Commands::Remove { id, yes } => cmd_remove(id, yes),
         Commands::Key { id, rotate } => cmd_key(id, rotate),
@@ -327,6 +339,7 @@ fn print_project(p: &ProjectConfig) {
     println!("  verify_mode: {}", p.verify_mode);
     println!("  repository:  {}", display_or_dash(&p.repository));
     println!("  deployment:  {}", p.preset_label());
+    println!("  triggers:    {}", p.triggers_label());
     // Read-only: commit status reporting is configured in the web admin UI,
     // like the access token it shares, but a CLI-only operator should still be
     // able to see whether it is on.
@@ -433,6 +446,7 @@ fn cmd_add(
     preset: String,
     compose_file: String,
     compose_profiles: Vec<String>,
+    trigger_events: Vec<String>,
 ) -> Result<()> {
     let name = required(name, "name")?;
     let path = required(path, "path")?;
@@ -459,6 +473,7 @@ fn cmd_add(
     project.deploy_preset = preset;
     project.compose_file = compose_file;
     project.compose_profiles = compose_profiles;
+    project.trigger_events = trigger_events;
     project.validate()?;
 
     let mut cfg = config::load_config()?;
@@ -489,6 +504,7 @@ fn cmd_edit(
     preset: Option<String>,
     compose_file: Option<String>,
     compose_profiles: Vec<String>,
+    trigger_events: Vec<String>,
 ) -> Result<()> {
     let mut cfg = config::load_config()?;
     {
@@ -521,6 +537,9 @@ fn cmd_edit(
         }
         if !compose_profiles.is_empty() {
             p.compose_profiles = compose_profiles;
+        }
+        if !trigger_events.is_empty() {
+            p.trigger_events = trigger_events;
         }
         p.validate()?;
     }
