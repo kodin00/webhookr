@@ -2,11 +2,12 @@
 
 use axum::{
     extract::{Path, Query},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
 };
 use maud::{html, Markup};
 use serde::Deserialize;
 
+use crate::executor;
 use crate::state::{self, RunRecord, TelegramDelivery};
 use crate::util;
 use crate::web::views;
@@ -127,7 +128,18 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
     let body = html! {
         section class="page-head" {
             h1 { "Run " span class="mono small" { (run.id) } }
-            a class="button" href={ "/runs/" (run.id) "/raw" } { "Raw log" }
+            div class="head-actions" {
+                // The only way to stop a deploy mid-flight without killing the
+                // daemon. Shown only while a run is genuinely in progress, so a
+                // stale page can never cancel an already-finished one.
+                @if run.status == "running" {
+                    form method="post" action={ "/runs/" (run.id) "/cancel" }
+                         hx-confirm="Cancel this run? The running deploy process will be killed." {
+                        button type="submit" class="button danger" { "Cancel" }
+                    }
+                }
+                a class="button" href={ "/runs/" (run.id) "/raw" } { "Raw log" }
+            }
         }
         section class="card" {
             (views::field("Status", &run.status))
@@ -210,4 +222,12 @@ pub async fn raw(Path(run_id): Path<String>) -> Result<Response, WebError> {
         text,
     )
         .into_response())
+}
+
+/// Cancel an in-flight run. Best-effort: a run that already ended has no token
+/// to trip, and the run page will simply show its terminal status, so there is
+/// nothing to fail on here.
+pub async fn cancel(Path(run_id): Path<String>) -> Result<Response, WebError> {
+    executor::cancel_run(&run_id);
+    Ok(Redirect::to(&format!("/runs/{run_id}")).into_response())
 }

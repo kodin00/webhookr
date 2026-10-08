@@ -242,10 +242,10 @@ impl Notifier {
             log_tail,
             self.run_url(&record.id).as_deref(),
         );
-        let label = if record.status == "success" {
-            "succeeded"
-        } else {
-            "failed"
+        let label = match record.status.as_str() {
+            "success" => "succeeded",
+            "cancelled" => "cancelled",
+            _ => "failed",
         };
         self.send(label, &text, true, log).await
     }
@@ -351,10 +351,21 @@ pub fn message_finished(
 ) -> String {
     let duration = crate::executor::human_duration(record.duration_ms);
     let commit = record.commit.as_deref().map(short).unwrap_or("unknown");
+    // A cancelled run is its own outcome: not a success and not a failure the
+    // operator needs to investigate, so it gets its own verb and emoji.
     let succeeded = record.status == "success";
-    let verb = if succeeded { "succeeded" } else { "failed" };
+    let cancelled = record.status == "cancelled";
+    let verb = if succeeded {
+        "succeeded"
+    } else if cancelled {
+        "cancelled"
+    } else {
+        "failed"
+    };
     let timing = if succeeded {
         format!("deployed in {duration}")
+    } else if cancelled {
+        format!("cancelled after {duration}")
     } else {
         format!("failed after {duration}")
     };
@@ -364,13 +375,22 @@ pub fn message_finished(
         .as_deref()
         .map(|trigger| format!(" · {trigger}"))
         .unwrap_or_default();
+    let icon = if succeeded {
+        "✅"
+    } else if cancelled {
+        "⏹"
+    } else {
+        "❌"
+    };
     let mut text = format!(
         "{} deploy {verb} — {project_name}\nrun {} · commit {commit}{trigger} · {timing}\n{}",
-        if succeeded { "✅" } else { "❌" },
+        icon,
         short(&record.id),
         record.message
     );
-    if !succeeded {
+    // A failure is worth the log tail; a clean cancel is not — the message
+    // already says what happened and the log holds the rest if anyone cares.
+    if !succeeded && !cancelled {
         text.push_str("\n\n--- last part of the run log ---\n");
         text.push_str(&truncate_chars(log_tail, MAX_TAIL_CHARS));
     }

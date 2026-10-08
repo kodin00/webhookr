@@ -73,6 +73,12 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
         .filter(|r| r.project_id == id)
         .take(10)
         .collect();
+    // The in-flight run, if any — so the Deploy card can offer to stop it
+    // without a separate lookup, and the lock state on the page is the truth.
+    let running = runs
+        .iter()
+        .find(|r| r.status == "running")
+        .map(|r| r.id.clone());
     let hook_url = config::webhook_url(&cfg, &project.id);
 
     let body = html! {
@@ -92,6 +98,15 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
                 }
                 form method="post" action={ "/projects/" (project.id) "/deploy" } {
                     button type="submit" class="button" { "Redeploy without pulling" }
+                }
+                @if let Some(run_id) = &running {
+                    form method="post" action={ "/projects/" (project.id) "/cancel" }
+                         hx-confirm="Cancel the running deploy? The process will be killed." {
+                        button type="submit" class="button danger" { "Cancel running" }
+                    }
+                    // A direct link so the operator can watch the run they are
+                    // about to stop, without navigating through the run list.
+                    a class="button" href={ "/runs/" (run_id) } { "View live run" }
                 }
             }
         }
@@ -779,6 +794,22 @@ pub async fn deploy(Path(id): Path<String>) -> Result<Response, WebError> {
 
 pub async fn update_app(Path(id): Path<String>) -> Result<Response, WebError> {
     trigger(&id, true).await
+}
+
+/// Cancel the project's in-flight run, if there is one, and go watch it. A
+/// run that is not actually `running` has no cancel signal to trip, so just
+/// land the operator back on the project page.
+pub async fn cancel(Path(id): Path<String>) -> Result<Response, WebError> {
+    let running = state::load_runs()
+        .into_iter()
+        .find(|r| r.project_id == id && r.status == "running");
+    match running {
+        Some(run) => {
+            executor::cancel_run(&run.id);
+            Ok(Redirect::to(&format!("/runs/{}", run.id)).into_response())
+        }
+        None => Ok(Redirect::to(&format!("/projects/{id}")).into_response()),
+    }
 }
 
 /// Start a run and send the browser to its log.

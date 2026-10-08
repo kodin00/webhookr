@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 use tokio::process::Command;
+use tokio::sync::Notify;
 
 use crate::config::ProjectConfig;
 use crate::github;
@@ -32,6 +33,80 @@ fn project_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .entry(project_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// One cancel signal per in-flight run id, so the web UI can stop a deployment
+/// the same daemon process is executing. A run registers its signal on start
+/// and drops it on finish (success, failure, cancel, or panic) via
+/// [`CancelGuard`]; `cancel_run` trips it and `exec` honours it.
+///
+/// `Notify` stores one permit from `notify_one`, so a cancel that arrives
+/// before `exec` first awaits is not lost — the next `exec` in the run
+/// consumes it immediately. That bounds the gap between a cancel and the
+/// child dying to "the rest of the current step", which is as good as it gets
+/// without a process group kill.
+static CANCEL: LazyLock<Mutex<HashMap<String, Arc<Notify>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Trip a run's cancel signal. Returns `false` when no such run is in flight
+/// (already finished, or an id that never existed) — the caller treats that as
+/// "nothing to cancel".
+pub fn cancel_run(run_id: &str) -> bool {
+    CANCEL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(run_id)
+        .cloned()
+        .inspect(|notify| notify.notify_one())
+        .is_some()
+}
+
+/// Inserts a run's cancel signal on construction, removes it on drop. The
+/// signal stays alive for the guard's whole lifetime so `run()` can hand
+/// `notify()` to every step without re-cloning from the registry.
+struct CancelGuard {
+    id: String,
+    notify: Arc<Notify>,
+}
+
+impl CancelGuard {
+    fn register(id: &str) -> Self {
+        let notify = Arc::new(Notify::new());
+        CANCEL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), notify.clone());
+        Self {
+            id: id.to_string(),
+            notify,
+        }
+    }
+
+    fn notify(&self) -> &Notify {
+        &self.notify
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        CANCEL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// Whether a step ran to completion or was cancelled mid-flight.
+#[derive(Debug)]
+enum ExecOutcome {
+    Ran(bool),
+    Cancelled,
+}
+
+/// Whether syncing the source finished or was cancelled.
+#[derive(Debug)]
+enum SyncOutcome {
+    Done,
+    Cancelled,
 }
 
 /// What kicked a run off.
@@ -119,6 +194,9 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
     };
 
     let id = crate::util::new_run_id();
+    // Registered before the `running` record is published, so a cancel issued
+    // the instant the run appears in the UI still finds a signal to trip.
+    let cancel = CancelGuard::register(&id);
     let started_at = crate::util::now_iso();
     let started = Instant::now();
 
@@ -205,12 +283,19 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
     let mut commit = if sync_source { pushed_sha.clone() } else { start_sha };
 
     let (status, state, message) = if sync_source {
-        match sync_project(p, &mut log, &log_path).await {
+        match sync_project(p, &mut log, &log_path, cancel.notify()).await {
             // The source could never be fetched, so the deployment did not run
             // at all. That is what GitHub's `error` means, as against a deploy
             // that ran and failed.
             Err(message) => ("failed", github::State::Error, message),
-            Ok(()) => {
+            // A cancel during sync never reached the deploy: report it as
+            // cancelled, not failed, so the operator sees what they did.
+            Ok(SyncOutcome::Cancelled) => (
+                "cancelled",
+                github::State::Error,
+                "cancelled by operator".to_string(),
+            ),
+            Ok(SyncOutcome::Done) => {
                 // The pull may have moved HEAD past what we announced: a newer
                 // push, or a run that had already fetched. The commit actually
                 // deploying is the post-pull HEAD — record it for the history,
@@ -222,11 +307,11 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
                         reporter.pending(&head, Some(&mut log)).await;
                     }
                 }
-                deploy_phase(p, &mut log, &log_path).await
+                deploy_phase(p, &mut log, &log_path, cancel.notify()).await
             }
         }
     } else {
-        deploy_phase(p, &mut log, &log_path).await
+        deploy_phase(p, &mut log, &log_path, cancel.notify()).await
     };
 
     // History before GitHub: the admin UI polls `finished_at` to stop tailing
@@ -278,19 +363,27 @@ async fn deploy_phase(
     p: &ProjectConfig,
     log: &mut std::fs::File,
     log_path: &Path,
+    cancel: &Notify,
 ) -> (&'static str, github::State, String) {
-    let ok = match deploy(p, log).await {
-        Ok(ok) => ok,
+    let outcome = match deploy(p, log, cancel).await {
+        Ok(outcome) => outcome,
         Err(error) => {
             let _ = writeln!(log, "--- deployment error ---\n{error:#}");
-            false
+            ExecOutcome::Ran(false)
         }
     };
-    let message = summary_line(log_path).unwrap_or_else(|| "no output".to_string());
-    if ok {
-        ("success", github::State::Success, message)
-    } else {
-        ("failed", github::State::Failure, message)
+    match outcome {
+        ExecOutcome::Cancelled => {
+            ("cancelled", github::State::Error, "cancelled by operator".to_string())
+        }
+        ExecOutcome::Ran(ok) => {
+            let message = summary_line(log_path).unwrap_or_else(|| "no output".to_string());
+            if ok {
+                ("success", github::State::Success, message)
+            } else {
+                ("failed", github::State::Failure, message)
+            }
+        }
     }
 }
 
@@ -320,7 +413,8 @@ async fn sync_project(
     p: &ProjectConfig,
     log: &mut std::fs::File,
     log_path: &Path,
-) -> std::result::Result<(), String> {
+    cancel: &Notify,
+) -> std::result::Result<SyncOutcome, String> {
     let path = Path::new(&p.path);
     if !path.exists() {
         if p.repository.trim().is_empty() {
@@ -345,12 +439,12 @@ async fn sync_project(
             p.repository.as_str(),
             p.path.as_str(),
         ]);
-        let ok = exec(command, &cwd, "git clone", log)
-            .await
-            .map_err(|error| format!("failed to run git clone: {error:#}"))?;
-        return ok
-            .then_some(())
-            .ok_or_else(|| last_error("git clone failed", log_path));
+        return match exec(command, &cwd, "git clone", log, cancel).await {
+            Err(error) => Err(format!("failed to run git clone: {error:#}")),
+            Ok(ExecOutcome::Cancelled) => Ok(SyncOutcome::Cancelled),
+            Ok(ExecOutcome::Ran(true)) => Ok(SyncOutcome::Done),
+            Ok(ExecOutcome::Ran(false)) => Err(last_error("git clone failed", log_path)),
+        };
     }
 
     if !path.join(".git").exists() {
@@ -369,17 +463,19 @@ async fn sync_project(
         let label = format!("git {step}");
         let mut command = git_command(p);
         command.args(&args);
-        let ok = exec(command, &p.path, &label, log)
-            .await
-            .map_err(|error| format!("failed to run {label}: {error:#}"))?;
-        if !ok {
-            return Err(last_error(&format!("{label} failed"), log_path));
+        match exec(command, &p.path, &label, log, cancel).await {
+            Err(error) => return Err(format!("failed to run {label}: {error:#}")),
+            Ok(ExecOutcome::Cancelled) => return Ok(SyncOutcome::Cancelled),
+            Ok(ExecOutcome::Ran(false)) => {
+                return Err(last_error(&format!("{label} failed"), log_path));
+            }
+            Ok(ExecOutcome::Ran(true)) => {}
         }
     }
-    Ok(())
+    Ok(SyncOutcome::Done)
 }
 
-async fn deploy(p: &ProjectConfig, log: &mut std::fs::File) -> Result<bool> {
+async fn deploy(p: &ProjectConfig, log: &mut std::fs::File, cancel: &Notify) -> Result<ExecOutcome> {
     if !Path::new(&p.path).exists() {
         bail!("project path does not exist: {}", p.path);
     }
@@ -395,8 +491,10 @@ async fn deploy(p: &ProjectConfig, log: &mut std::fs::File) -> Result<bool> {
         if p.deploy_preset == "compose_pull" {
             let mut pull = base.clone();
             pull.push("pull");
-            if !run_command("docker", &pull, &p.path, "docker compose pull", log).await? {
-                return Ok(false);
+            match run_command("docker", &pull, &p.path, "docker compose pull", log, cancel).await? {
+                ExecOutcome::Cancelled => return Ok(ExecOutcome::Cancelled),
+                ExecOutcome::Ran(false) => return Ok(ExecOutcome::Ran(false)),
+                ExecOutcome::Ran(true) => {}
             }
         }
         let mut up = base;
@@ -405,7 +503,7 @@ async fn deploy(p: &ProjectConfig, log: &mut std::fs::File) -> Result<bool> {
             up.push("--build");
         }
         up.push("--remove-orphans");
-        run_command("docker", &up, &p.path, "docker compose up", log).await
+        run_command("docker", &up, &p.path, "docker compose up", log, cancel).await
     } else {
         run_command(
             "sh",
@@ -413,6 +511,7 @@ async fn deploy(p: &ProjectConfig, log: &mut std::fs::File) -> Result<bool> {
             &p.path,
             "custom command",
             log,
+            cancel,
         )
         .await
     }
@@ -458,19 +557,27 @@ async fn run_command(
     cwd: &str,
     label: &str,
     log: &mut std::fs::File,
-) -> Result<bool> {
+    cancel: &Notify,
+) -> Result<ExecOutcome> {
     let mut command = Command::new(program);
     command.args(args);
-    exec(command, cwd, label, log).await
+    exec(command, cwd, label, log, cancel).await
 }
 
 /// Run a pre-built command, streaming its output into the run log.
+///
+/// Awaits the child in a `select!` against the run's cancel signal: a cancel
+/// kills the child (and reaps it, so no zombie) and returns
+/// [`ExecOutcome::Cancelled`], which propagates up to mark the run `cancelled`
+/// and free the per-project lock. `kill_on_drop` is still set as a backstop,
+/// but the cancel path reaps the child explicitly.
 async fn exec(
     mut command: Command,
     cwd: &str,
     label: &str,
     log: &mut std::fs::File,
-) -> Result<bool> {
+    cancel: &Notify,
+) -> Result<ExecOutcome> {
     writeln!(log, "--- {label} ---")?;
     let stdout = log
         .try_clone()
@@ -479,7 +586,7 @@ async fn exec(
         .try_clone()
         .with_context(|| format!("failed to attach log to {label}"))?;
 
-    let status = command
+    let mut child = command
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -487,10 +594,27 @@ async fn exec(
         // Turn credential/host-key prompts into fast failures instead of hangs.
         .env("GIT_TERMINAL_PROMPT", "0")
         .kill_on_drop(true)
-        .status()
-        .await
+        .spawn()
         .with_context(|| format!("failed to spawn {label}"))?;
-    Ok(status.success())
+
+    let status = tokio::select! {
+        biased;
+        // A stored permit from `cancel_run` makes this fire even if the cancel
+        // arrived before this step began awaiting.
+        () = cancel.notified() => {
+            let _ = child.kill().await;
+            // Reap the killed child so it does not linger as a zombie.
+            let _ = child.wait().await;
+            let _ = writeln!(log, "--- {label} cancelled ---");
+            return Ok(ExecOutcome::Cancelled);
+        }
+        status = child.wait() => status,
+    };
+    Ok(ExecOutcome::Ran(
+        status
+            .with_context(|| format!("failed to spawn {label}"))?
+            .success(),
+    ))
 }
 
 fn last_error(prefix: &str, log_path: &Path) -> String {
@@ -600,7 +724,7 @@ mod tests {
     use std::io::Write;
     use std::process::Command as StdCommand;
 
-    use super::sync_project;
+    use super::{sync_project, ExecOutcome};
     use crate::config::ProjectConfig;
 
     #[tokio::test]
@@ -640,7 +764,11 @@ mod tests {
             .append(true)
             .open(&log_path)
             .unwrap();
-        sync_project(&project, &mut log, &log_path).await.unwrap();
+        // A fresh, untripped signal: this test never cancels.
+        let cancel = tokio::sync::Notify::new();
+        sync_project(&project, &mut log, &log_path, &cancel)
+            .await
+            .unwrap();
         assert_eq!(
             fs::read_to_string(checkout.join("version.txt")).unwrap(),
             "one"
@@ -650,11 +778,72 @@ mod tests {
         git(&seed, &["add", "."]);
         git(&seed, &["commit", "-m", "update"]);
         git(&seed, &["push"]);
-        sync_project(&project, &mut log, &log_path).await.unwrap();
+        sync_project(&project, &mut log, &log_path, &cancel)
+            .await
+            .unwrap();
         assert_eq!(
             fs::read_to_string(checkout.join("version.txt")).unwrap(),
             "two"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Cancelling mid-run kills the child and returns `Cancelled`, so the run
+    /// is marked `cancelled` instead of dragging a hung command out forever.
+    #[tokio::test]
+    async fn cancelling_a_running_command_kills_the_child() {
+        use std::time::Duration;
+
+        let root =
+            std::env::temp_dir().join(format!("webhookr-cancel-{}", crate::util::new_run_id()));
+        fs::create_dir_all(&root).unwrap();
+        let log_path = root.join("run.log");
+
+        // Writes its own pid to a marker then sleeps long enough to cancel.
+        let marker = root.join("pid");
+        let script = format!("echo $$ > {}\nsleep 30", marker.display());
+        let cwd = root.to_string_lossy().into_owned();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        // Run exec in its own task so the child actually spawns and runs while
+        // we cancel from here; awaiting a pinned future would not poll it until
+        // we awaited, so the cancel would fire before the child existed.
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            let mut log = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            let mut command = tokio::process::Command::new("sh");
+            command.arg("-c").arg(script);
+            super::exec(command, &cwd, "sleep-test", &mut log, &cancel_for_task).await
+        });
+
+        // Let the child spawn and write its pid before we cancel.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.notify_one();
+        let outcome = handle.await.unwrap();
+        assert!(
+            matches!(outcome, Ok(ExecOutcome::Cancelled)),
+            "a cancelled step should report Cancelled, got {outcome:?}"
+        );
+
+        let pid: i32 = fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("the child wrote its pid");
+        // SIGKILL is not instantaneous; give it a beat then prove the pid is gone.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let still_alive = StdCommand::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!still_alive, "child {pid} still alive after cancel");
+
         fs::remove_dir_all(root).unwrap();
     }
 

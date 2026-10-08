@@ -40,9 +40,11 @@ pub fn pages() -> Router<AppState> {
         .route("/projects/{id}/secret/rotate", post(projects::rotate_secret))
         .route("/projects/{id}/deploy", post(projects::deploy))
         .route("/projects/{id}/update-app", post(projects::update_app))
+        .route("/projects/{id}/cancel", post(projects::cancel))
         .route("/runs", get(runs::index))
         .route("/runs/{run_id}", get(runs::detail))
         .route("/runs/{run_id}/raw", get(runs::raw))
+        .route("/runs/{run_id}/cancel", post(runs::cancel))
         .route("/settings", get(settings::index).post(settings::save))
         .route(
             "/settings/cloudflare",

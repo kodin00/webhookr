@@ -65,6 +65,7 @@ pub fn status_badge(record: Option<&RunRecord>) -> Markup {
         "success" => ("ok", "success".to_string()),
         "failed" => ("fail", "failed".to_string()),
         "interrupted" => ("warn", "interrupted".to_string()),
+        "cancelled" => ("warn", "cancelled".to_string()),
         "running" => {
             let mins = minutes_since(&record.started_at);
             // No deploy timeout exists yet, so a very old `running` record is
