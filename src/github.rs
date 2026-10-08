@@ -156,6 +156,17 @@ pub struct PushCommit {
     /// Present on GitHub `push` deliveries; used to recognise a PR merge.
     #[serde(default)]
     pub message: Option<String>,
+    /// The commit's author, when the delivery carries `head_commit`.
+    #[serde(default)]
+    pub author: Option<CommitAuthor>,
+}
+
+/// `head_commit.author` on a `push` delivery. Only `name` is read: the email
+/// and username are not used anywhere and need not be deserialized.
+#[derive(Debug, Deserialize)]
+pub struct CommitAuthor {
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +319,21 @@ fn payload_actor(payload: &PushPayload) -> Option<&str> {
         .or_else(|| payload.pusher.as_ref().and_then(|p| p.name.as_deref()))?;
     let login = login.trim();
     (!login.is_empty()).then_some(login)
+}
+
+/// The author named on the pushed commit, for display alongside the sha.
+///
+/// Only a `push` carrying `head_commit` has one: a merged-PR delivery is
+/// normalized into a payload with no head commit, and a huge push omits it
+/// too, so the executor falls back to reading the author from the checkout.
+pub fn payload_author(payload: &PushPayload) -> Option<&str> {
+    let name = payload
+        .head_commit
+        .as_ref()
+        .and_then(|commit| commit.author.as_ref())
+        .and_then(|author| author.name.as_deref())?;
+    let name = name.trim();
+    (!name.is_empty()).then_some(name)
 }
 
 // ----- delivery classification ---------------------------------------------

@@ -194,6 +194,9 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
                                 (views::jakarta_time(&run.started_at))
                             }
                             span class="muted" { (views::duration(run)) }
+                            @if let Some(author) = run.author.as_deref() {
+                                span class="muted small" { (author) }
+                            }
                             @if let Some(trigger) = run.triggered_by.as_deref() {
                                 span class="muted small" { (trigger) }
                             }

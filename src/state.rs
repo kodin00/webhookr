@@ -40,6 +40,12 @@ pub struct RunRecord {
     /// empty string.
     #[serde(default)]
     pub commit: Option<String>,
+    /// The author of the deployed commit (`git log -1 --format=%an`), or the
+    /// pushed commit's author when the run is still in flight. Absent on runs
+    /// recorded before the field existed and on runs that never reached a
+    /// checkout.
+    #[serde(default)]
+    pub author: Option<String>,
     /// What started the run, for display: `push by alice`, `merge by alice`,
     /// `workflow_dispatch by alice`, `webhook`, `web UI`, `cli`. Absent on
     /// runs recorded before the field existed.
@@ -216,6 +222,7 @@ mod tests {
             duration_ms: 42_000,
             message: message.into(),
             commit: None,
+            author: None,
             triggered_by: None,
             telegram: None,
         }

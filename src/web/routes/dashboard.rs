@@ -95,6 +95,9 @@ fn project_grid(cfg: &config::AppConfig) -> Markup {
                         p class="summary" { (run.message) }
                         p class="muted small" {
                             (views::jakarta_time(&run.started_at))
+                            @if let Some(author) = run.author.as_deref() {
+                                " · " (author)
+                            }
                             @if let Some(trigger) = run.triggered_by.as_deref() {
                                 " · " (trigger)
                             }

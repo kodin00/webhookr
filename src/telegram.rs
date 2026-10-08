@@ -214,6 +214,7 @@ impl Notifier {
         project_name: &str,
         run_id: &str,
         commit: Option<&str>,
+        author: Option<&str>,
         triggered_by: Option<&str>,
         log: &mut File,
     ) {
@@ -221,6 +222,7 @@ impl Notifier {
             project_name,
             run_id,
             commit,
+            author,
             triggered_by,
             self.run_url(run_id).as_deref(),
         );
@@ -306,7 +308,7 @@ pub(crate) async fn send_test(api_base: &str, config: &config::TelegramConfig) -
         bail!("{problem}");
     }
     let text = format!(
-        "🔔 webhookr test message — the bot and the chat are working. \
+        "🔔 webhookr test message: the bot and the chat are working. \
          (webhookr {})",
         env!("CARGO_PKG_VERSION")
     );
@@ -324,12 +326,14 @@ pub fn message_started(
     project_name: &str,
     run_id: &str,
     commit: Option<&str>,
+    author: Option<&str>,
     triggered_by: Option<&str>,
     run_url: Option<&str>,
 ) -> String {
     let commit = commit.map(short).unwrap_or("unknown");
+    let author = author.unwrap_or("unknown");
     let mut text = format!(
-        "🚀 deploy started — {project_name}\nrun {} · commit {commit}",
+        "🚀 {project_name} deployment started\nrun {} · commit {commit} · author {author}",
         short(run_id)
     );
     if let Some(trigger) = triggered_by {
@@ -351,6 +355,7 @@ pub fn message_finished(
 ) -> String {
     let duration = crate::executor::human_duration(record.duration_ms);
     let commit = record.commit.as_deref().map(short).unwrap_or("unknown");
+    let author = record.author.as_deref().unwrap_or("unknown");
     // A cancelled run is its own outcome: not a success and not a failure the
     // operator needs to investigate, so it gets its own verb and emoji.
     let succeeded = record.status == "success";
@@ -383,7 +388,7 @@ pub fn message_finished(
         "❌"
     };
     let mut text = format!(
-        "{} deploy {verb} — {project_name}\nrun {} · commit {commit}{trigger} · {timing}\n{}",
+        "{} {project_name} deployment {verb}\nrun {} · commit {commit} · author {author}{trigger} · {timing}\n{}",
         icon,
         short(&record.id),
         record.message
@@ -391,7 +396,7 @@ pub fn message_finished(
     // A failure is worth the log tail; a clean cancel is not — the message
     // already says what happened and the log holds the rest if anyone cares.
     if !succeeded && !cancelled {
-        text.push_str("\n\n--- last part of the run log ---\n");
+        text.push_str("\n\nlast part of the run log:\n");
         text.push_str(&truncate_chars(log_tail, MAX_TAIL_CHARS));
     }
     if let Some(url) = run_url {
@@ -428,6 +433,7 @@ mod tests {
             duration_ms: 42_000,
             message: message.into(),
             commit: Some("4f5e6d7c8b9a".repeat(4)),
+            author: None,
             triggered_by: None,
             telegram: None,
         }
@@ -467,28 +473,31 @@ mod tests {
             "My Site",
             "a1b2c3d4e5f6",
             Some("4f5e6d7c8b9a"),
+            Some("alice"),
             Some("push by alice"),
             Some("https://panel.example.com/runs/a1b2c3d4e5f6"),
         );
-        assert!(started.contains("🚀 deploy started — My Site"), "{started}");
+        assert!(started.contains("🚀 My Site deployment started"), "{started}");
         assert!(
-            started.contains("run a1b2c3d4 · commit 4f5e6d7c · push by alice"),
+            started.contains("run a1b2c3d4 · commit 4f5e6d7c · author alice · push by alice"),
             "{started}"
         );
         assert!(started.ends_with("https://panel.example.com/runs/a1b2c3d4e5f6"));
 
         // No commit to name yet (a manual run before HEAD is read), and no
         // trigger (a run recorded before the field existed).
-        let blind = message_started("My Site", "a1b2c3d4e5f6", None, None, None);
+        let blind = message_started("My Site", "a1b2c3d4e5f6", None, None, None, None);
         assert!(blind.contains("commit unknown"), "{blind}");
+        assert!(blind.contains("author unknown"), "{blind}");
         assert!(!blind.contains(" · push"), "no trigger, no label: {blind}");
 
         let mut triggered = record("success", "Successfully tagged site:latest");
         triggered.triggered_by = Some("merge by alice".into());
+        triggered.author = Some("dave".into());
         let ok = message_finished("My Site", &triggered, "leftover", None);
-        assert!(ok.contains("✅ deploy succeeded — My Site"), "{ok}");
+        assert!(ok.contains("✅ My Site deployment succeeded"), "{ok}");
         assert!(
-            ok.contains("commit 4f5e6d7c · merge by alice · deployed in 42s"),
+            ok.contains("commit 4f5e6d7c · author dave · merge by alice · deployed in 42s"),
             "{ok}"
         );
         assert!(ok.contains("Successfully tagged site:latest"), "{ok}");
@@ -500,14 +509,14 @@ mod tests {
             "line one\nline two",
             Some("https://panel.example.com/runs/a1b2c3d4e5f6"),
         );
-        assert!(failed.contains("❌ deploy failed — My Site"), "{failed}");
+        assert!(failed.contains("❌ My Site deployment failed"), "{failed}");
         assert!(failed.contains("failed after 42s"), "{failed}");
         assert!(
             failed.contains("error: pull failed: non-fast-forward"),
             "{failed}"
         );
         assert!(
-            failed.contains("--- last part of the run log ---"),
+            failed.contains("last part of the run log"),
             "{failed}"
         );
         assert!(failed.contains("line one\nline two"), "{failed}");

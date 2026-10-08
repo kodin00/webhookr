@@ -47,8 +47,8 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
                 div class="table-scroll" {
                     table {
                         thead { tr {
-                            th { "Status" } th { "Project" } th { "Commit" } th { "Trigger" }
-                            th { "Started" } th { "Duration" } th { "Summary" }
+                            th { "Status" } th { "Project" } th { "Commit" } th { "Author" }
+                            th { "Trigger" } th { "Started" } th { "Duration" } th { "Summary" }
                         } }
                         tbody {
                             @for run in &runs {
@@ -57,6 +57,9 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
                                     td { a href={ "/projects/" (run.project_id) } { (run.project_id) } }
                                     td class="mono small" title=[run.commit.as_deref()] {
                                         (short_sha(run))
+                                    }
+                                    td class="small" {
+                                        (run.author.as_deref().unwrap_or("—"))
                                     }
                                     td class="small" {
                                         // Who or what started this run; runs from
@@ -149,6 +152,9 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
             }
             @if let Some(sha) = &run.commit {
                 (views::code_field("Commit", sha))
+            }
+            @if let Some(author) = &run.author {
+                (views::field("Author", author))
             }
             (views::code_field("Started (WIB)", &views::jakarta_time(&run.started_at)))
             @if let Some(finished) = &run.finished_at {

@@ -176,6 +176,16 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         .and_then(github::payload_sha)
         .map(str::to_string);
 
+    // The author of that pushed commit, when the payload carried one. A
+    // manual run has no payload; a merge delivery is normalized without a
+    // head commit, so this is None there too — both fall back to the checkout.
+    let pushed_author = trigger
+        .payload
+        .as_ref()
+        .filter(|payload| github::ref_matches(payload, &p.branch))
+        .and_then(github::payload_author)
+        .map(str::to_string);
+
     // Single-flight per project: a webhook and a manual trigger must not race
     // `git pull` and `docker compose up` on the same checkout. `try_lock`
     // rather than `lock().await`, so a run that hangs (there is no timeout yet)
@@ -237,6 +247,9 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         // Best guess while the run is in flight: the pushed sha when the
         // webhook carried one, otherwise unknown until the deploy finishes.
         commit: pushed_sha.clone(),
+        // Same best-guess treatment as `commit`: the pushed commit's author
+        // when the payload named one, otherwise unknown until the sync lands.
+        author: pushed_author.clone(),
         triggered_by: trigger.source.clone(),
         // Filled in once the final message has been attempted below.
         telegram: None,
@@ -251,6 +264,12 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
     let start_sha = match pushed_sha.clone() {
         Some(sha) => Some(sha),
         None => head_sha(&p.path).await,
+    };
+    // The author to announce at the start: the pushed commit's when the
+    // payload named one, otherwise whoever the checkout is sitting on.
+    let start_author = match pushed_author.clone() {
+        Some(author) => Some(author),
+        None => head_author(&p.path).await,
     };
     if let Some(reporter) = reporter.as_mut() {
         reporter.set_run_url(&id);
@@ -271,6 +290,7 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
                 &p.name,
                 &id,
                 start_sha.as_deref(),
+                start_author.as_deref(),
                 trigger.source.as_deref(),
                 &mut log,
             )
@@ -281,6 +301,13 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
     // synced run re-reads HEAD after the pull, which may have moved past the
     // sha announced above; a no-sync run deploys exactly that HEAD.
     let mut commit = if sync_source { pushed_sha.clone() } else { start_sha };
+    // Its author, tracked the same way: re-read from the checkout after a
+    // sync so a moved HEAD names the commit that actually deployed.
+    let mut author = if sync_source {
+        pushed_author.clone()
+    } else {
+        start_author.clone()
+    };
 
     let (status, state, message) = if sync_source {
         match sync_project(p, &mut log, &log_path, cancel.notify()).await {
@@ -303,6 +330,9 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
                 // is left pending forever.
                 if let Some(head) = head_sha(&p.path).await {
                     commit = Some(head.clone());
+                    if let Some(a) = head_author(&p.path).await {
+                        author = Some(a);
+                    }
                     if let Some(reporter) = reporter.as_mut() {
                         reporter.pending(&head, Some(&mut log)).await;
                     }
@@ -325,6 +355,7 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         status,
         message.clone(),
         commit,
+        author,
         trigger.source.clone(),
     )?;
     if let Some(reporter) = reporter.as_mut() {
@@ -407,6 +438,25 @@ async fn head_sha(path: &str) -> Option<String> {
     }
     let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
     (!sha.is_empty()).then_some(sha)
+}
+
+/// The author of the commit currently checked out, read with `git log` the
+/// same way [`head_sha`] reads the sha. `None` when there is no checkout yet
+/// or `git` is unusable — the run records and messages fall back to "unknown".
+async fn head_author(path: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["log", "-1", "--format=%an"])
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 async fn sync_project(
@@ -669,6 +719,7 @@ fn finalize(
     status: &str,
     message: String,
     commit: Option<String>,
+    author: Option<String>,
     triggered_by: Option<String>,
 ) -> Result<RunRecord> {
     let finished_at = crate::util::now_iso();
@@ -683,6 +734,7 @@ fn finalize(
         duration_ms,
         message,
         commit,
+        author,
         triggered_by,
         telegram: None,
     };
@@ -945,7 +997,7 @@ mod tests {
         writeln!(log, "Successfully tagged site:latest").unwrap();
 
         notifier
-            .started("Site", "a1b2c3d4e5f6", None, Some("push by alice"), &mut log)
+            .started("Site", "a1b2c3d4e5f6", None, None, Some("push by alice"), &mut log)
             .await;
         let failed = crate::state::RunRecord {
             id: "a1b2c3d4e5f6".into(),
@@ -956,6 +1008,7 @@ mod tests {
             duration_ms: 100,
             message: "error: pull failed".into(),
             commit: None,
+            author: None,
             triggered_by: Some("push by alice".into()),
             telegram: None,
         };
