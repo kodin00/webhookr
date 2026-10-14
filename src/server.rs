@@ -189,7 +189,13 @@ async fn webhook(
         );
     };
 
+    eprintln!("webhookr: webhook received for {} ({id})", project.name);
+
     if !verify_secret(&project, &body, &headers) {
+        eprintln!(
+            "webhookr: signature verification failed for {} (mode {})",
+            project.name, project.verify_mode
+        );
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid signature" })),
@@ -208,9 +214,38 @@ async fn webhook(
         .and_then(|value| value.to_str().ok());
     let (kind, payload) = github::classify(event, &body);
 
+    // One line per delivery saying what came in, parsed — never the raw body,
+    // which could carry anything a sender chose to put in it. `branch` is where
+    // the change landed (the base branch for a merge); `merge_source`, set only
+    // on a merge, is the branch it came from.
+    let payload_ref = payload.as_ref();
+    let branch = payload_ref
+        .and_then(|p| p.r#ref.as_deref())
+        .map(|r| r.strip_prefix("refs/heads/").unwrap_or(r));
+    eprintln!(
+        "webhookr: {}: event '{}', kind {}, branch {}, merge from {}, commit {}, by {}, repo {}",
+        project.name,
+        event.unwrap_or("none"),
+        kind.as_str(),
+        branch.unwrap_or("-"),
+        payload_ref
+            .and_then(|p| p.merge_source.as_deref())
+            .unwrap_or("-"),
+        payload_ref.and_then(github::payload_sha).unwrap_or("-"),
+        payload_ref.and_then(github::payload_actor).unwrap_or("-"),
+        payload_ref
+            .and_then(github::payload_slug)
+            .map_or_else(|| "-".to_string(), |slug| format!("{}/{}", slug.owner, slug.repo)),
+    );
+
     // A `ping` never deploys; with a non-empty filter, only the selected kinds
     // (and a token-mode sender) deploy. Either way GitHub gets a 2xx and no run.
     if !kind.triggers_on(&project.trigger_events) {
+        eprintln!(
+            "webhookr: '{}' is not in trigger_events for {}; skipping",
+            kind.as_str(),
+            project.name
+        );
         return (
             StatusCode::OK,
             Json(json!({
@@ -228,6 +263,7 @@ async fn webhook(
         payload,
     };
 
+    eprintln!("webhookr: dispatching run for {}", project.name);
     std::mem::drop(tokio::spawn(async move {
         if let Err(error) = executor::run_project_with(&project, trigger).await {
             // Includes the single-flight rejection when a run is already going.

@@ -138,6 +138,12 @@ pub struct PushPayload {
     pub after: Option<String>,
     #[serde(default)]
     pub r#ref: Option<String>,
+    /// The source (head) branch of a merged PR. Set only on the normalized
+    /// payload [`merge_payload`] builds for a `Merge` delivery — a `push`
+    /// has no such branch, so the field stays `None` there. Kept so the daemon
+    /// can log and (later) filter on which branch a merge came from.
+    #[serde(default)]
+    pub merge_source: Option<String>,
     #[serde(default)]
     pub deleted: Option<bool>,
     #[serde(default)]
@@ -229,6 +235,10 @@ pub struct PullRequest {
     /// The branch a merge lands on; used to build the normalized push `ref`.
     #[serde(default)]
     pub base: Option<PrBranch>,
+    /// The branch the merge comes from; recorded as the normalized push
+    /// payload's `merge_source`.
+    #[serde(default)]
+    pub head: Option<PrBranch>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -311,7 +321,7 @@ pub fn payload_slug(payload: &PushPayload) -> Option<RepoSlug> {
 ///
 /// `sender` names the account the event happened as and is present on every
 /// GitHub delivery; `pusher` covers a `push` whose sender is absent or blank.
-fn payload_actor(payload: &PushPayload) -> Option<&str> {
+pub fn payload_actor(payload: &PushPayload) -> Option<&str> {
     let login = payload
         .sender
         .as_ref()
@@ -433,17 +443,22 @@ pub fn classify(event: Option<&str>, body: &[u8]) -> (TriggerKind, Option<PushPa
 
 /// Build the [`PushPayload`] view of a merged-PR delivery, so the executor and
 /// reporter handle a merge like a push: the merge commit is `after`, the base
-/// branch is the `ref`, and the repository/sender carry through.
+/// branch is the `ref`, the PR's source branch is `merge_source`, and the
+/// repository/sender carry through.
 fn merge_payload(pr: PullRequestPayload) -> PushPayload {
     let pull_request = pr.pull_request.as_ref();
     let merge_commit_sha = pull_request.and_then(|pr| pr.merge_commit_sha.clone());
     let base_ref = pull_request
         .and_then(|pr| pr.base.as_ref())
         .and_then(|b| b.r#ref.clone());
+    let head_ref = pull_request
+        .and_then(|pr| pr.head.as_ref())
+        .and_then(|h| h.r#ref.clone());
 
     PushPayload {
         after: merge_commit_sha,
         r#ref: base_ref.map(|r| format!("refs/heads/{r}")),
+        merge_source: head_ref,
         deleted: Some(false),
         repository: pr.repository,
         sender: pr.sender,
@@ -1065,6 +1080,7 @@ mod tests {
             Some("2222222222222222222222222222222222222222")
         );
         assert_eq!(payload.r#ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(payload.merge_source.as_deref(), Some("feature"));
         assert!(ref_matches(&payload, "main"));
         assert_eq!(payload_slug(&payload), slug("github.com", "me", "site"));
         assert_eq!(trigger_label(&kind, Some(&payload)), "merge by carol");
