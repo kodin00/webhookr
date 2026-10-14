@@ -45,11 +45,15 @@ pub struct ProjectForm {
     pub compose_profiles: String,
     #[serde(default)]
     pub verify_mode: String,
-    /// Which deployment triggers are ticked: `push` and/or `merge`. Sent as
-    /// repeated form values with the same name, so a `Vec`. Empty (none ticked)
-    /// is the all-events default.
+    /// Which deployment triggers are ticked. Two independent checkboxes, not
+    /// one multi-value control: a urlencoded body cannot carry repeated keys
+    /// into a `Vec` field, and a lone `trigger_events=push` is a string, not a
+    /// sequence — a single field there failed to deserialize at all. Neither
+    /// ticked is the all-events default.
     #[serde(default)]
-    pub trigger_events: Vec<String>,
+    pub trigger_push: Option<String>,
+    #[serde(default)]
+    pub trigger_merge: Option<String>,
     /// Present when the "report commit statuses" checkbox is ticked.
     #[serde(default)]
     pub status_reports: Option<String>,
@@ -106,6 +110,14 @@ impl ProjectForm {
             submitted_status_token.to_string()
         };
 
+        let mut trigger_events = Vec::new();
+        if self.trigger_push.is_some() {
+            trigger_events.push("push".to_string());
+        }
+        if self.trigger_merge.is_some() {
+            trigger_events.push("merge".to_string());
+        }
+
         let compose_file = if self.compose_file.trim().is_empty() {
             "compose.yaml".to_string()
         } else {
@@ -133,12 +145,7 @@ impl ProjectForm {
             secret,
             verify_mode,
             repository: self.repository.trim().to_string(),
-            trigger_events: self
-                .trigger_events
-                .iter()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .collect(),
+            trigger_events,
             git_token,
             deploy_preset,
             compose_file,
@@ -168,7 +175,16 @@ impl ProjectForm {
             compose_file: project.compose_file.clone(),
             compose_profiles: project.compose_profiles.join(", "),
             verify_mode: project.verify_mode.clone(),
-            trigger_events: project.trigger_events.clone(),
+            trigger_push: project
+                .trigger_events
+                .iter()
+                .any(|e| e == "push")
+                .then(|| "1".to_string()),
+            trigger_merge: project
+                .trigger_events
+                .iter()
+                .any(|e| e == "merge")
+                .then(|| "1".to_string()),
             status_reports: project.status_reports.then(|| "1".to_string()),
             // Never echo a stored token back into the page.
             status_token: String::new(),
@@ -222,7 +238,8 @@ mod tests {
             compose_file: String::new(),
             compose_profiles: " web , , worker\nextra ".into(),
             verify_mode: "github".into(),
-            trigger_events: Vec::new(),
+            trigger_push: None,
+            trigger_merge: None,
             status_reports: None,
             status_token: String::new(),
             clear_status_token: None,
@@ -262,28 +279,64 @@ mod tests {
     }
 
     #[test]
-    fn trigger_events_round_trip_and_trim() {
+    fn ticked_checkboxes_select_triggers() {
         let mut form = form();
-        form.trigger_events = vec![" push ".into(), "merge".into(), "".into()];
+        form.trigger_push = Some("1".into());
+        form.trigger_merge = Some("1".into());
         let project = form.to_project(None).unwrap();
         assert_eq!(project.trigger_events, vec!["push", "merge"]);
 
-        // An empty selection is the all-events default and survives an edit.
-        let rebuilt = ProjectForm::from_project(&project)
-            .to_project(Some(&project))
-            .unwrap();
-        assert_eq!(rebuilt.trigger_events, vec!["push", "merge"]);
+        // The edit page re-ticks from the stored list, and an edit that
+        // unticks both falls back to the all-events default.
+        let rebuilt = ProjectForm::from_project(&project);
+        assert!(rebuilt.trigger_push.is_some() && rebuilt.trigger_merge.is_some());
+        assert_eq!(
+            rebuilt.to_project(Some(&project)).unwrap().trigger_events,
+            vec!["push", "merge"]
+        );
 
-        let cleared = ProjectForm::from_project(&project);
         let cleared = ProjectForm {
-            trigger_events: Vec::new(),
-            ..cleared
+            trigger_push: None,
+            trigger_merge: None,
+            ..ProjectForm::from_project(&project)
         };
         assert!(cleared
             .to_project(Some(&project))
             .unwrap()
             .trigger_events
             .is_empty());
+    }
+
+    #[test]
+    fn trigger_checkboxes_deserialize_from_a_form_body() {
+        // Regression against the wire format the checkboxes actually send.
+        // A single `trigger_events: Vec<String>` field could not read it:
+        // `trigger_events=push` deserialized as a string ("invalid type:
+        // string, expected a sequence"), and ticking both boxes sent the key
+        // twice, which the struct rejected as a duplicate field.
+        let body = "name=My+Site&repository=https://example.com/site.git&\
+                    path=/tmp/webhookr-form-test&branch=main&command=./deploy.sh&\
+                    trigger_push=1&trigger_merge=1";
+        let form = serde_urlencoded::from_str::<ProjectForm>(body).unwrap();
+        assert_eq!(
+            form.to_project(None).unwrap().trigger_events,
+            vec!["push", "merge"]
+        );
+
+        let body = "name=My+Site&repository=https://example.com/site.git&\
+                    path=/tmp/webhookr-form-test&branch=main&command=./deploy.sh&\
+                    trigger_merge=1";
+        let form = serde_urlencoded::from_str::<ProjectForm>(body).unwrap();
+        assert_eq!(
+            form.to_project(None).unwrap().trigger_events,
+            vec!["merge"]
+        );
+
+        // Neither ticked: the field is simply absent from the body.
+        let body = "name=My+Site&repository=https://example.com/site.git&\
+                    path=/tmp/webhookr-form-test&branch=main&command=./deploy.sh";
+        let form = serde_urlencoded::from_str::<ProjectForm>(body).unwrap();
+        assert!(form.to_project(None).unwrap().trigger_events.is_empty());
     }
 
     #[test]

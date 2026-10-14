@@ -252,7 +252,8 @@ pub async fn new_form() -> Result<Markup, WebError> {
         compose_file: "compose.yaml".to_string(),
         compose_profiles: String::new(),
         verify_mode: "github".to_string(),
-        trigger_events: Vec::new(),
+        trigger_push: None,
+        trigger_merge: None,
         status_reports: None,
         status_token: String::new(),
         clear_status_token: None,
@@ -545,8 +546,8 @@ fn project_form(
                     "every delivery (the default)."
                 }
                 label class="checkbox" {
-                    input type="checkbox" name="trigger_events" value="push"
-                          checked[form.trigger_events.iter().any(|e| e == "push")];
+                    input type="checkbox" name="trigger_push" value="1"
+                          checked[form.trigger_push.is_some()];
                     span { "Push" }
                     span class="hint" {
                         "A push to the configured branch — including the merge commit pushed "
@@ -554,8 +555,8 @@ fn project_form(
                     }
                 }
                 label class="checkbox" {
-                    input type="checkbox" name="trigger_events" value="merge"
-                          checked[form.trigger_events.iter().any(|e| e == "merge")];
+                    input type="checkbox" name="trigger_merge" value="1"
+                          checked[form.trigger_merge.is_some()];
                     span { "Merge" }
                     span class="hint" {
                         "A pull request closed and merged. Needs the pull_request event enabled "
@@ -636,7 +637,8 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
             .unwrap_or_else(|| "docker-compose.yml".to_string()),
         compose_profiles: query.compose_profiles.unwrap_or_default(),
         verify_mode: String::new(),
-        trigger_events: Vec::new(),
+        trigger_push: None,
+        trigger_merge: None,
         status_reports: None,
         status_token: String::new(),
         clear_status_token: None,
