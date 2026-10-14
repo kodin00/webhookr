@@ -633,7 +633,7 @@ impl App {
 
     /// Check for a newer published build and install it.
     ///
-    /// Shells out to `webhookr self-update` rather than calling the updater
+    /// Shells out to `webhookr update` rather than calling the updater
     /// here, for the same reason [`Self::trigger_project`] does: this loop is
     /// synchronous and running on an async runtime's thread, so the async work
     /// belongs in a child process. Blocking for the download is acceptable —
@@ -645,7 +645,7 @@ impl App {
             return;
         };
         let output = std::process::Command::new(exe)
-            .arg("self-update")
+            .arg("update")
             .stdin(std::process::Stdio::null())
             .output();
 

@@ -26,7 +26,7 @@ From the app: **Settings → Version → Update and restart** in the web UI, or
 
 ```sh
 webhookr version       # what is running, and what is published
-webhookr self-update   # replace this binary with the published build
+webhookr update        # replace this binary with the published build
 ```
 
 Re-running the install one-liner also works — it overwrites the binary,
@@ -126,10 +126,9 @@ Run `webhookr --help` for the same list.
 | `webhookr key --id <ID> [--rotate]` | Show the project's secret (and webhook URL); `--rotate` generates a new one. |
 | `webhookr logs --id <ID> [--lines <N>]` | Tail the latest run's log (default 50 lines). |
 | `webhookr run --id <ID> [--no-pull]` | Pull the latest source, then run the deployment; `--no-pull` deploys the checkout as-is. |
-| `webhookr update --id <ID>` | Clone or fast-forward the source, then deploy it. |
 | `webhookr cloudflare [--hostname hooks.example.com] [--admin-hostname deploy.example.com]` | Provision a Cloudflare Tunnel; at least one hostname required. Reads `CLOUDFLARE_API_TOKEN` or `--api-token`. |
 | `webhookr version [--offline]` | Show the running build and compare it with the published one. |
-| `webhookr self-update [--check]` | Replace this binary with the published build; `--check` only reports. |
+| `webhookr update [--check]` | Replace this binary with the published build; `--check` only reports. |
 
 ## Deployment presets
 

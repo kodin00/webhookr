@@ -134,7 +134,7 @@ impl Trigger {
 }
 
 /// Clone or fast-forward the source, then deploy it. Manual entry point
-/// (`webhookr run` / `webhookr update`, and the TUI through them).
+/// (`webhookr run`, and the TUI through it).
 pub async fn run_project(p: &ProjectConfig) -> Result<RunRecord> {
     run(p, true, Trigger::manual("cli")).await
 }

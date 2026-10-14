@@ -140,22 +140,17 @@ pub enum Commands {
         #[arg(long)]
         no_pull: bool,
     },
-    /// Clone or pull the latest source, then deploy it
+    /// Replace this binary with the latest published build
     Update {
+        /// Report what would change without downloading anything
         #[arg(long)]
-        id: String,
+        check: bool,
     },
     /// Show the running build and check for a newer published one
     Version {
         /// Skip the check against the published release
         #[arg(long)]
         offline: bool,
-    },
-    /// Replace this binary with the latest published build
-    SelfUpdate {
-        /// Report what would change without downloading anything
-        #[arg(long)]
-        check: bool,
     },
     /// Provision a Cloudflare Tunnel and public hostname
     Cloudflare {
@@ -276,9 +271,8 @@ async fn handle(cmd: Commands) -> Result<()> {
         Commands::Key { id, rotate } => cmd_key(id, rotate),
         Commands::Logs { id, lines } => cmd_logs(id, lines),
         Commands::Run { id, no_pull } => cmd_run(id, no_pull).await,
-        Commands::Update { id } => cmd_update(id).await,
+        Commands::Update { check } => cmd_update(check).await,
         Commands::Version { offline } => cmd_version(offline).await,
-        Commands::SelfUpdate { check } => cmd_self_update(check).await,
         Commands::Cloudflare {
             api_token,
             hostname,
@@ -620,12 +614,36 @@ async fn cmd_run(id: String, no_pull: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_update(id: String) -> Result<()> {
-    let cfg = config::load_config()?;
-    let p = cfg.get(&id).context(format!("unknown project id: {id}"))?;
-    let record = executor::run_project(p).await?;
+async fn cmd_update(check: bool) -> Result<()> {
+    let current = update::Build::current();
+    if check {
+        let latest = update::latest().await?;
+        println!("running:   {}", current.label());
+        println!("published: {}", latest.label());
+        println!(
+            "{}",
+            if latest == current {
+                "up to date"
+            } else {
+                "an update is available"
+            }
+        );
+        return Ok(());
+    }
 
-    print_run_result(record);
+    match update::install().await? {
+        update::Outcome::UpToDate(build) => {
+            println!("already running the published build: {}", build.label());
+        }
+        update::Outcome::Replaced { from, to, path } => {
+            println!("replaced {}", path.display());
+            println!("  was: {}", from.label());
+            println!("  now: {}", to.label());
+            // This process is the CLI, not the daemon. Restarting the service
+            // needs privileges this may not have, and is the operator's call.
+            println!("restart the daemon to run it: sudo systemctl restart webhookr");
+        }
+    }
     Ok(())
 }
 
@@ -708,44 +726,11 @@ async fn cmd_version(offline: bool) -> Result<()> {
         Ok(latest) if latest == current => println!("published: {} (up to date)", latest.label()),
         Ok(latest) => {
             println!("published: {}", latest.label());
-            println!("an update is available; run 'webhookr self-update'");
+            println!("an update is available; run 'webhookr update'");
         }
         // Being unable to reach GitHub is not a failure of this command: the
         // running build is still reported, which is the part that matters.
         Err(error) => println!("published: could not check ({error:#})"),
-    }
-    Ok(())
-}
-
-async fn cmd_self_update(check: bool) -> Result<()> {
-    let current = update::Build::current();
-    if check {
-        let latest = update::latest().await?;
-        println!("running:   {}", current.label());
-        println!("published: {}", latest.label());
-        println!(
-            "{}",
-            if latest == current {
-                "up to date"
-            } else {
-                "an update is available"
-            }
-        );
-        return Ok(());
-    }
-
-    match update::install().await? {
-        update::Outcome::UpToDate(build) => {
-            println!("already running the published build: {}", build.label());
-        }
-        update::Outcome::Replaced { from, to, path } => {
-            println!("replaced {}", path.display());
-            println!("  was: {}", from.label());
-            println!("  now: {}", to.label());
-            // This process is the CLI, not the daemon. Restarting the service
-            // needs privileges this may not have, and is the operator's call.
-            println!("restart the daemon to run it: sudo systemctl restart webhookr");
-        }
     }
     Ok(())
 }
