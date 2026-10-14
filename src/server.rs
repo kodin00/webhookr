@@ -257,6 +257,30 @@ async fn webhook(
         );
     }
 
+    // The branch gates. With a branch configured, only deliveries on that
+    // branch start a run — a push must be to it, a merge must land on it —
+    // and with `merge_sources` listed, a merge must additionally come from one
+    // of them. Payload-less triggers (a manual run, a token-mode sender) have
+    // nothing to check and pass through. Skipped deliveries still get a 2xx:
+    // the delivery was fine, it just was not a trigger.
+    if let Some(reason) = github::trigger_allowed(
+        &kind,
+        payload.as_ref(),
+        &project.branch,
+        &project.merge_sources,
+    ) {
+        eprintln!("webhookr: {reason} for {}; skipping", project.name);
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "project": id,
+                "started": false,
+                "reason": reason,
+            })),
+        );
+    }
+
     let trigger = executor::Trigger {
         // The kind, with the payload's actor, becomes the run's "triggered by".
         source: Some(github::trigger_label(&kind, payload.as_ref())),

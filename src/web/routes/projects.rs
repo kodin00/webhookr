@@ -254,6 +254,7 @@ pub async fn new_form() -> Result<Markup, WebError> {
         verify_mode: "github".to_string(),
         trigger_push: None,
         trigger_merge: None,
+        merge_sources: String::new(),
         status_reports: None,
         status_token: String::new(),
         clear_status_token: None,
@@ -563,6 +564,16 @@ fn project_form(
                         "in your GitHub webhook settings; a ping never triggers a deploy."
                     }
                 }
+
+                label {
+                    span { "Merge from branches" span class="optional" { "optional" } }
+                    input type="text" name="merge_sources" value=(form.merge_sources)
+                          placeholder="develop, staging";
+                    span class="hint" {
+                        "Only merges whose pull request came from these branches trigger a "
+                        "deploy. Comma-separated; empty means any merge."
+                    }
+                }
             }
 
             fieldset {
@@ -639,6 +650,8 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
         verify_mode: String::new(),
         trigger_push: None,
         trigger_merge: None,
+        // The deploy-fields preview never renders the trigger fields.
+        merge_sources: String::new(),
         status_reports: None,
         status_token: String::new(),
         clear_status_token: None,

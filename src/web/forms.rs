@@ -54,6 +54,13 @@ pub struct ProjectForm {
     pub trigger_push: Option<String>,
     #[serde(default)]
     pub trigger_merge: Option<String>,
+    /// PR source branches whose merges may trigger a deploy. Comma- or
+    /// newline-separated in the form; split here. A single comma-separated
+    /// value is what a urlencoded body carries well — repeated keys are the
+    /// thing it cannot feed a list field (see the checkboxes above). Empty
+    /// means any merge.
+    #[serde(default)]
+    pub merge_sources: String,
     /// Present when the "report commit statuses" checkbox is ticked.
     #[serde(default)]
     pub status_reports: Option<String>,
@@ -146,6 +153,7 @@ impl ProjectForm {
             verify_mode,
             repository: self.repository.trim().to_string(),
             trigger_events,
+            merge_sources: split_profiles(&self.merge_sources),
             git_token,
             deploy_preset,
             compose_file,
@@ -185,6 +193,7 @@ impl ProjectForm {
                 .iter()
                 .any(|e| e == "merge")
                 .then(|| "1".to_string()),
+            merge_sources: project.merge_sources.join(", "),
             status_reports: project.status_reports.then(|| "1".to_string()),
             // Never echo a stored token back into the page.
             status_token: String::new(),
@@ -240,6 +249,7 @@ mod tests {
             verify_mode: "github".into(),
             trigger_push: None,
             trigger_merge: None,
+            merge_sources: String::new(),
             status_reports: None,
             status_token: String::new(),
             clear_status_token: None,
@@ -337,6 +347,45 @@ mod tests {
                     path=/tmp/webhookr-form-test&branch=main&command=./deploy.sh";
         let form = serde_urlencoded::from_str::<ProjectForm>(body).unwrap();
         assert!(form.to_project(None).unwrap().trigger_events.is_empty());
+    }
+
+    #[test]
+    fn merge_sources_split_and_round_trip() {
+        let mut form = form();
+        form.merge_sources = " develop , , release\nstaging ".into();
+        let project = form.to_project(None).unwrap();
+        assert_eq!(project.merge_sources, vec!["develop", "release", "staging"]);
+
+        // The edit page rejoins them, and an edit that clears the field drops
+        // to the any-merge default.
+        let rebuilt = ProjectForm::from_project(&project);
+        assert_eq!(rebuilt.merge_sources, "develop, release, staging");
+        assert_eq!(
+            rebuilt.to_project(Some(&project)).unwrap().merge_sources,
+            vec!["develop", "release", "staging"]
+        );
+
+        let cleared = ProjectForm {
+            merge_sources: String::new(),
+            ..ProjectForm::from_project(&project)
+        };
+        assert!(cleared
+            .to_project(Some(&project))
+            .unwrap()
+            .merge_sources
+            .is_empty());
+    }
+
+    #[test]
+    fn merge_sources_deserialize_from_a_comma_separated_form_body() {
+        let body = "name=My+Site&repository=https://example.com/site.git&\
+                    path=/tmp/webhookr-form-test&branch=main&command=./deploy.sh&\
+                    merge_sources=develop%2Cstaging";
+        let form = serde_urlencoded::from_str::<ProjectForm>(body).unwrap();
+        assert_eq!(
+            form.to_project(None).unwrap().merge_sources,
+            vec!["develop", "staging"]
+        );
     }
 
     #[test]

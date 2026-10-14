@@ -166,9 +166,11 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
     let mut reporter = github::Reporter::for_project(p, trigger.payload.as_ref());
 
     // The pushed sha is only usable when the push was to the branch this
-    // project deploys. webhookr does not filter deliveries by branch, so a push
-    // to `dev` still deploys `main` — reporting against the `dev` commit would
-    // be a lie. When the ref does not match we fall back to post-sync HEAD.
+    // project deploys. Webhook deliveries are branch-gated in the handler, but
+    // the paths that bypass it (token-mode senders, an empty project branch)
+    // still arrive here with an off-branch payload — reporting against its
+    // commit would be a lie. When the ref does not match we fall back to
+    // post-sync HEAD.
     let pushed_sha = trigger
         .payload
         .as_ref()

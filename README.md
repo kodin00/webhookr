@@ -264,8 +264,13 @@ before running anything.
 
 ### Deployment triggers
 
-By default a project deploys on **every** signed delivery GitHub sends. Narrow
-it per project by picking which events trigger a deploy:
+Deliveries are branch-aware: a `push` only triggers when it targets the
+project's configured branch, and a merge only when it lands on that branch. A
+push to some other branch no longer causes a redundant deploy of the configured
+one.
+
+By default a project deploys on **every** such delivery. Narrow it per project
+by picking which events trigger a deploy:
 
 - **Push** — a `push` to the configured branch, including the merge commit
   pushed after a PR merge.
@@ -278,10 +283,15 @@ never triggers a deploy. If both are selected, a PR merge fires two deliveries;
 the second is refused by webhookr's one-run-at-a-time lock, so only one deploy
 starts.
 
+Merges can be narrowed further by source branch: **Merge from branches** lists
+the PR head branches whose merges may trigger a deploy — e.g. set it to
+`develop` and only merges from `develop` deploy. Empty (the default) accepts
+any merge; the push trigger is not affected by it.
+
 Set triggers in any of the three surfaces — web admin UI (**Deployment
 triggers** on the project form), CLI (`webhookr add --trigger-event push
---trigger-event merge`, or omit on `edit` to leave unchanged), or the TUI
-wizard's **Triggers** step.
+--trigger-event merge --merge-source develop`, or omit on `edit` to leave
+unchanged), or the TUI wizard's **Triggers** step (Tab edits the branch list).
 
 ## GitHub commit status
 

@@ -280,10 +280,12 @@ fn is_sha(value: &str) -> bool {
 
 /// Whether this push was to the branch the project actually deploys.
 ///
-/// webhookr does not filter deliveries by branch, so a push to `dev` still
-/// triggers a `main` deploy. Without this check we would post a status against a
-/// commit that is not on the branch we checked out. An empty branch never
-/// matches: it is permitted in config, but only for projects that never pull.
+/// The webhook handler gates deliveries on this — a push to `dev` no longer
+/// starts a `main` deploy. The executor still checks it for the paths that
+/// bypass the handler's gate (token-mode senders, an empty project branch):
+/// without the check we would post a status against a commit that is not on
+/// the branch we checked out. An empty branch never matches: it is permitted
+/// in config, but only for projects that never pull.
 pub fn ref_matches(payload: &PushPayload, branch: &str) -> bool {
     let branch = branch.trim();
     !branch.is_empty()
@@ -292,6 +294,67 @@ pub fn ref_matches(payload: &PushPayload, branch: &str) -> bool {
             .as_deref()
             .and_then(|reference| reference.strip_prefix("refs/heads/"))
             == Some(branch)
+}
+
+/// A branch name as config spells it: whitespace trimmed, a `refs/heads/`
+/// dressing stripped, so `develop` and `refs/heads/develop` are the same
+/// branch wherever names are compared.
+pub fn branch_name(value: &str) -> &str {
+    value
+        .trim()
+        .strip_prefix("refs/heads/")
+        .unwrap_or(value.trim())
+}
+
+/// Whether a delivery may start a run, given the project's branch and
+/// `merge_sources` rules. `None` means allow; `Some(reason)` is a short skip
+/// reason for the log line and the `started: false` body.
+///
+/// Two gates, applied to what the payload itself says:
+///
+/// * **Branch.** With a branch configured, a push must be to it and a merge
+///   must land on it — the normalized merge payload's `ref` *is* the base
+///   branch, so [`ref_matches`] covers both. This is what stops a push to
+///   `dev` from redeploying `main`. A payload-less trigger (a manual run, a
+///   token-mode sender) has nothing to check and passes; an empty project
+///   branch (a never-pull project) can never match a ref, so it skips the
+///   gate rather than refuse everything.
+/// * **Merge source.** With `merge_sources` listed, a [`TriggerKind::Merge`]
+///   must additionally come from one of those PR head branches — the "deploy
+///   only what merges in from `develop`" rule. A merge that carries no source
+///   branch cannot be verified against the list and is refused.
+pub fn trigger_allowed(
+    kind: &TriggerKind,
+    payload: Option<&PushPayload>,
+    branch: &str,
+    merge_sources: &[String],
+) -> Option<&'static str> {
+    let payload = match payload {
+        Some(payload) => payload,
+        // Nothing to check: a manual run or a token-mode sender chose to send.
+        None => return None,
+    };
+
+    if !ref_matches(payload, branch) && !branch.trim().is_empty() {
+        return Some("delivery is not on the project's branch");
+    }
+
+    if matches!(kind, TriggerKind::Merge) && !merge_sources.is_empty() {
+        let from_listed_source = payload
+            .merge_source
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|source| {
+                merge_sources
+                    .iter()
+                    .any(|allowed| source == branch_name(allowed))
+            });
+        if !from_listed_source {
+            return Some("merge is not from one of the project's merge_sources");
+        }
+    }
+
+    None
 }
 
 /// The repository a push came from.
@@ -1137,6 +1200,112 @@ mod tests {
 
         // A non-merge PR action never deploys when specific events are selected.
         assert!(!TriggerKind::Other("pull_request".into()).triggers_on(&both));
+    }
+
+    #[test]
+    fn only_deliveries_on_the_project_branch_may_trigger() {
+        let no_sources: Vec<String> = Vec::new();
+
+        // A push to the configured branch passes.
+        let on_main = parse_push(br#"{"ref":"refs/heads/main"}"#).unwrap();
+        assert_eq!(
+            trigger_allowed(&TriggerKind::Push, Some(&on_main), "main", &no_sources),
+            None
+        );
+
+        // A push to any other branch does not — the `dev` push must not
+        // redeploy `main`.
+        assert_eq!(
+            trigger_allowed(&TriggerKind::Push, Some(&on_main), "release", &no_sources),
+            Some("delivery is not on the project's branch")
+        );
+
+        // A merge lands on its base branch, so the same gate covers it: the
+        // normalized payload's ref is `refs/heads/main`.
+        let (kind, payload) = classify(
+            Some("pull_request"),
+            br#"{"action":"closed","pull_request":{"merged":true,
+                "merge_commit_sha":"2222222222222222222222222222222222222222",
+                "base":{"ref":"main"},"head":{"ref":"feature"}}}"#,
+        );
+        let payload = payload.unwrap();
+        assert_eq!(kind, TriggerKind::Merge);
+        assert_eq!(
+            trigger_allowed(&kind, Some(&payload), "main", &no_sources),
+            None,
+            "a merge onto the target branch passes with no source filter"
+        );
+        assert_eq!(
+            trigger_allowed(&kind, Some(&payload), "release", &no_sources),
+            Some("delivery is not on the project's branch")
+        );
+
+        // An empty project branch (a never-pull project) cannot match a ref,
+        // so the gate is skipped rather than refusing everything.
+        assert_eq!(trigger_allowed(&TriggerKind::Push, Some(&on_main), "", &no_sources), None);
+
+        // A payload-less trigger (a manual run, a token-mode sender) passes.
+        assert_eq!(trigger_allowed(&TriggerKind::Push, None, "main", &no_sources), None);
+        assert_eq!(trigger_allowed(&TriggerKind::Webhook, None, "main", &no_sources), None);
+    }
+
+    #[test]
+    fn merge_sources_narrow_which_merges_may_trigger() {
+        let develop_only = vec!["develop".to_string()];
+        let (kind, payload) = classify(
+            Some("pull_request"),
+            br#"{"action":"closed","pull_request":{"merged":true,
+                "merge_commit_sha":"2222222222222222222222222222222222222222",
+                "base":{"ref":"main"},"head":{"ref":"develop"}}}"#,
+        );
+        let payload = payload.unwrap();
+
+        // From a listed source (either spelling of it) — allowed.
+        assert_eq!(
+            trigger_allowed(&kind, Some(&payload), "main", &develop_only),
+            None
+        );
+        let dressed = vec!["refs/heads/develop".to_string()];
+        assert_eq!(trigger_allowed(&kind, Some(&payload), "main", &dressed), None);
+
+        // The branch gate still applies first, whatever the source.
+        assert_eq!(
+            trigger_allowed(&kind, Some(&payload), "release", &develop_only),
+            Some("delivery is not on the project's branch")
+        );
+
+        // From an unlisted source — refused.
+        let (_, hotfix) = classify(
+            Some("pull_request"),
+            br#"{"action":"closed","pull_request":{"merged":true,
+                "merge_commit_sha":"2222222222222222222222222222222222222222",
+                "base":{"ref":"main"},"head":{"ref":"hotfix/typo"}}}"#,
+        );
+        assert_eq!(
+            trigger_allowed(&TriggerKind::Merge, hotfix.as_ref(), "main", &develop_only),
+            Some("merge is not from one of the project's merge_sources")
+        );
+
+        // A merge that carries no source branch cannot be verified — refused
+        // rather than assumed fine.
+        let (_, headless) = classify(
+            Some("pull_request"),
+            br#"{"action":"closed","pull_request":{"merged":true,
+                "merge_commit_sha":"2222222222222222222222222222222222222222",
+                "base":{"ref":"main"}}}"#,
+        );
+        assert_eq!(
+            trigger_allowed(&TriggerKind::Merge, headless.as_ref(), "main", &develop_only),
+            Some("merge is not from one of the project's merge_sources")
+        );
+
+        // The source rule never reaches non-merge kinds: a push is judged by
+        // its branch alone.
+        let push = parse_push(br#"{"ref":"refs/heads/main"}"#).unwrap();
+        assert_eq!(
+            trigger_allowed(&TriggerKind::Push, Some(&push), "main", &develop_only),
+            None
+        );
     }
 
     #[test]

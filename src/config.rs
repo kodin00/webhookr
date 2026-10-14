@@ -214,6 +214,13 @@ pub struct ProjectConfig {
     /// event enabled in the repo's webhook settings).
     #[serde(default)]
     pub trigger_events: Vec<String>,
+    /// PR source branches whose merges may start a run. Empty (the default)
+    /// accepts any merge that lands on the configured branch; listing names
+    /// narrows it to merges from those head branches — the "deploy only what
+    /// merges in from `develop`" rule. A `refs/heads/` prefix is tolerated and
+    /// stripped on comparison, so both spellings of a branch match.
+    #[serde(default)]
+    pub merge_sources: Vec<String>,
 }
 
 impl ProjectConfig {
@@ -244,6 +251,7 @@ impl ProjectConfig {
             status_token: String::new(),
             status_context: String::new(),
             trigger_events: Vec::new(),
+            merge_sources: Vec::new(),
         }
     }
 
@@ -313,6 +321,19 @@ impl ProjectConfig {
                 other => bail!("trigger_events may only contain 'push' or 'merge', got {other:?}"),
             }
         }
+        // `merge_sources` names PR head branches, and like `branch` they can
+        // reach git positionally in some flows, so a leading '-' is refused.
+        // An entry that is blank once the `refs/heads/` dressing is stripped
+        // is a stray comma or a typo, and would silently match nothing.
+        for source in &self.merge_sources {
+            let name = crate::github::branch_name(source);
+            if name.is_empty() {
+                bail!("merge_sources may not contain empty branch names");
+            }
+            if name.starts_with('-') {
+                bail!("merge_sources branch names may not start with '-'");
+            }
+        }
         // Sent verbatim to GitHub as a JSON string and shown as a label beside
         // the commit, so it has to be a short single line.
         //
@@ -343,6 +364,17 @@ impl ProjectConfig {
             "all events".to_string()
         } else {
             self.trigger_events.join(", ")
+        }
+    }
+
+    /// One-line label for the project's merge-source filter, for the CLI and
+    /// the admin UI. Empty reads as "any source": any merge landing on the
+    /// target branch starts a run.
+    pub fn merge_sources_label(&self) -> String {
+        if self.merge_sources.is_empty() {
+            "any source".to_string()
+        } else {
+            self.merge_sources.join(", ")
         }
     }
 
@@ -875,6 +907,34 @@ mod tests {
     }
 
     #[test]
+    fn merge_sources_accept_branch_names_and_reject_junk() {
+        let mut project = ProjectConfig::new(
+            "site".into(),
+            "Site".into(),
+            "/tmp".into(),
+            "main".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+
+        // Empty is the default — any merge on the target branch triggers.
+        assert!(project.validate().is_ok());
+
+        // A refs/heads/ dressing is tolerated; so is surrounding whitespace.
+        project.merge_sources = vec!["develop".into(), "refs/heads/staging".into()];
+        assert!(project.validate().is_ok());
+
+        // A name that is blank once dressed down is a stray comma, not a branch.
+        project.merge_sources = vec!["refs/heads/".into()];
+        assert!(project.validate().is_err());
+
+        // Like `branch`, the name must not read as a git flag.
+        project.merge_sources = vec!["--upload-pack=x".into()];
+        assert!(project.validate().is_err());
+    }
+
+    #[test]
     fn clone_target_may_not_exist_yet() {
         let project = ProjectConfig {
             id: "site".into(),
@@ -893,6 +953,7 @@ mod tests {
             status_token: String::new(),
             status_context: String::new(),
             trigger_events: Vec::new(),
+            merge_sources: Vec::new(),
         };
         project.validate().unwrap();
     }

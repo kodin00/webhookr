@@ -83,6 +83,10 @@ pub enum Commands {
         /// (the default) deploys on every delivery.
         #[arg(long = "trigger-event")]
         trigger_events: Vec<String>,
+        /// PR source branch whose merge may trigger a deploy; repeat for
+        /// multiple. Empty (the default) accepts any merge.
+        #[arg(long = "merge-source")]
+        merge_sources: Vec<String>,
     },
     /// Edit an existing project
     Edit {
@@ -110,6 +114,10 @@ pub enum Commands {
         /// leaves the stored triggers unchanged.
         #[arg(long = "trigger-event")]
         trigger_events: Vec<String>,
+        /// PR source branch whose merge may trigger a deploy; repeat for
+        /// multiple. Absent leaves the stored sources unchanged.
+        #[arg(long = "merge-source")]
+        merge_sources: Vec<String>,
     },
     /// Remove a project
     Remove {
@@ -229,6 +237,7 @@ async fn handle(cmd: Commands) -> Result<()> {
             compose_file,
             compose_profiles,
             trigger_events,
+            merge_sources,
         } => cmd_add(
             name,
             id,
@@ -241,6 +250,7 @@ async fn handle(cmd: Commands) -> Result<()> {
             compose_file,
             compose_profiles,
             trigger_events,
+            merge_sources,
         ),
         Commands::Edit {
             id,
@@ -254,6 +264,7 @@ async fn handle(cmd: Commands) -> Result<()> {
             compose_file,
             compose_profiles,
             trigger_events,
+            merge_sources,
         } => cmd_edit(
             id,
             name,
@@ -266,6 +277,7 @@ async fn handle(cmd: Commands) -> Result<()> {
             compose_file,
             compose_profiles,
             trigger_events,
+            merge_sources,
         ),
         Commands::Remove { id, yes } => cmd_remove(id, yes),
         Commands::Key { id, rotate } => cmd_key(id, rotate),
@@ -334,6 +346,7 @@ fn print_project(p: &ProjectConfig) {
     println!("  repository:  {}", display_or_dash(&p.repository));
     println!("  deployment:  {}", p.preset_label());
     println!("  triggers:    {}", p.triggers_label());
+    println!("  merges from: {}", p.merge_sources_label());
     // Read-only: commit status reporting is configured in the web admin UI,
     // like the access token it shares, but a CLI-only operator should still be
     // able to see whether it is on.
@@ -441,6 +454,7 @@ fn cmd_add(
     compose_file: String,
     compose_profiles: Vec<String>,
     trigger_events: Vec<String>,
+    merge_sources: Vec<String>,
 ) -> Result<()> {
     let name = required(name, "name")?;
     let path = required(path, "path")?;
@@ -468,6 +482,7 @@ fn cmd_add(
     project.compose_file = compose_file;
     project.compose_profiles = compose_profiles;
     project.trigger_events = trigger_events;
+    project.merge_sources = merge_sources;
     project.validate()?;
 
     let mut cfg = config::load_config()?;
@@ -499,6 +514,7 @@ fn cmd_edit(
     compose_file: Option<String>,
     compose_profiles: Vec<String>,
     trigger_events: Vec<String>,
+    merge_sources: Vec<String>,
 ) -> Result<()> {
     let mut cfg = config::load_config()?;
     {
@@ -534,6 +550,9 @@ fn cmd_edit(
         }
         if !trigger_events.is_empty() {
             p.trigger_events = trigger_events;
+        }
+        if !merge_sources.is_empty() {
+            p.merge_sources = merge_sources;
         }
         p.validate()?;
     }

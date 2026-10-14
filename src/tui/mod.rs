@@ -169,6 +169,10 @@ struct Wizard {
     verify: usize, // 0 = github, 1 = token
     trigger_push: bool,
     trigger_merge: bool,
+    /// PR source branches whose merges may trigger a deploy, comma-separated.
+    merge_sources: Input,
+    /// Whether the Triggers step's merge-sources field owns the keys (Tab).
+    merge_edit: bool,
     browser: Option<DirBrowser>,
     error: Option<String>,
     secret: String,
@@ -190,6 +194,8 @@ impl Wizard {
             verify: 0,
             trigger_push: false,
             trigger_merge: false,
+            merge_sources: Input::new(""),
+            merge_edit: false,
             browser: None,
             error: None,
             secret: util::generate_secret(),
@@ -211,6 +217,8 @@ impl Wizard {
             verify: if p.verify_mode == "token" { 1 } else { 0 },
             trigger_push: p.trigger_events.iter().any(|e| e == "push"),
             trigger_merge: p.trigger_events.iter().any(|e| e == "merge"),
+            merge_sources: Input::new(&p.merge_sources.join(",")),
+            merge_edit: false,
             browser: None,
             error: None,
             secret: p.secret.clone(),
@@ -924,12 +932,17 @@ impl App {
             },
             Step::Triggers => match key {
                 KeyCode::Esc => w.step = Step::Verify,
-                KeyCode::Char('1') => w.trigger_push = !w.trigger_push,
-                KeyCode::Char('2') => w.trigger_merge = !w.trigger_merge,
+                KeyCode::Tab => w.merge_edit = !w.merge_edit,
+                // The number keys only toggle while the merge-sources field
+                // is unfocused; editing, they are text.
+                KeyCode::Char('1') if !w.merge_edit => w.trigger_push = !w.trigger_push,
+                KeyCode::Char('2') if !w.merge_edit => w.trigger_merge = !w.trigger_merge,
                 KeyCode::Enter => {
                     w.error = None;
+                    w.merge_edit = false;
                     w.step = Step::Confirm;
                 }
+                key if w.merge_edit => edit_input(key, &mut w.merge_sources),
                 _ => {}
             },
             Step::Confirm => match key {
@@ -980,6 +993,7 @@ impl App {
                             }
                             events
                         },
+                        merge_sources: parse_profiles(w.merge_sources.value()),
                         path: w.path.value().trim().to_string(),
                         branch: w.branch.value().trim().to_string(),
                         command: w.command.value().trim().to_string(),
@@ -1648,7 +1662,7 @@ impl App {
                 "a pull request closed and merged",
             ),
         ];
-        let items: Vec<ListItem> = opts
+        let mut items: Vec<ListItem> = opts
             .iter()
             .map(|(key, on, name, desc)| {
                 let mark = if **on { "[x] " } else { "[ ] " };
@@ -1664,6 +1678,37 @@ impl App {
                 ]))
             })
             .collect();
+        // The merge-sources field shares this step: Tab moves the keys between
+        // the toggles and the text input, whose cursor shows while editing.
+        let label = if w.merge_edit {
+            "merge from branches (editing)"
+        } else {
+            "merge from branches"
+        };
+        let value = w.merge_sources.value();
+        let mut merge_line = vec![
+            Span::styled("(tab) ", Style::default().fg(MUTED)),
+            Span::styled(
+                label.to_string(),
+                if w.merge_edit {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            ),
+            Span::raw("   "),
+        ];
+        merge_line.extend(if value.trim().is_empty() {
+            vec![Span::styled(
+                "any (the default)".to_string(),
+                Style::default().fg(MUTED),
+            )]
+        } else if w.merge_edit {
+            input_line(value, w.merge_sources.cursor).spans
+        } else {
+            vec![Span::raw(value.to_string())]
+        });
+        items.push(ListItem::new(Line::from(merge_line)));
         let note = if w.trigger_push || w.trigger_merge {
             "selected events only deploy; everything else is ignored"
         } else {
@@ -2203,7 +2248,12 @@ fn wizard_hints(w: &Wizard) -> Line<'static> {
             Step::Path => key_hints(&[("tab", "browse"), ("enter", "next"), ("esc", "back")]),
             Step::Preset => key_hints(&[("j/k", "choose"), ("enter", "next"), ("esc", "back")]),
             Step::Verify => key_hints(&[("j/k", "toggle"), ("enter", "next"), ("esc", "back")]),
-            Step::Triggers => key_hints(&[("1/2", "toggle"), ("enter", "next"), ("esc", "back")]),
+            Step::Triggers => key_hints(&[
+                ("1/2", "toggle"),
+                ("tab", "edit branches"),
+                ("enter", "next"),
+                ("esc", "back"),
+            ]),
             Step::Confirm => key_hints(&[("enter", "save"), ("esc", "back")]),
         }
     }
