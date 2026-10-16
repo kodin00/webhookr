@@ -80,6 +80,19 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
         .find(|r| r.status == "running")
         .map(|r| r.id.clone());
     let hook_url = config::webhook_url(&cfg, &project.id);
+    // Tokens now come from the linked github key (set in Settings). Show the
+    // key's label when one is linked; fall back to "stored (legacy)" for a
+    // pre-existing per-project token, or "none" for a public repo.
+    let credentials = match cfg.github_key(&project) {
+        Some(key) => key.label.as_str(),
+        None => {
+            if !project.git_token.is_empty() {
+                "stored (legacy)"
+            } else {
+                "none (public repo)"
+            }
+        }
+    };
 
     let body = html! {
         section class="page-head" {
@@ -117,12 +130,7 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
             (views::code_field("Path", &project.path))
             @if !project.repository.is_empty() {
                 (views::code_field("Repository", &project.repository))
-            }
-            @if !project.repository.is_empty() {
-                (views::field(
-                    "Access token",
-                    if project.git_token.is_empty() { "none (public repo)" } else { "stored" },
-                ))
+                (views::field("GitHub key", credentials))
             }
             (views::code_field("Branch", &project.branch))
             (views::field("Deployment", project.preset_label()))
@@ -148,7 +156,7 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
 
             @if project.status_reports {
                 (views::code_field("Commit status", &project.effective_status_context()))
-                @if let Some(problem) = project.status_report_problem() {
+                @if let Some(problem) = cfg.status_report_problem(&project) {
                     div class="field" {
                         span class="field-label" {}
                         span class="field-value warn-inline" { (problem) }
@@ -243,8 +251,8 @@ pub async fn new_form() -> Result<Markup, WebError> {
         name: String::new(),
         id: String::new(),
         repository: String::new(),
-        git_token: String::new(),
-        clear_git_token: None,
+        repository_pick: String::new(),
+        github_key_id: String::new(),
         path: String::new(),
         branch: "main".to_string(),
         command: String::new(),
@@ -256,20 +264,11 @@ pub async fn new_form() -> Result<Markup, WebError> {
         trigger_merge: None,
         merge_sources: String::new(),
         status_reports: None,
-        status_token: String::new(),
-        clear_status_token: None,
         status_context: String::new(),
     };
     Ok(views::page(
         "Add project",
-        project_form(
-            "Add project",
-            "/projects",
-            &blank,
-            None,
-            None,
-            StoredSecrets::default(),
-        ),
+        project_form("Add project", "/projects", &blank, None, None),
     ))
 }
 
@@ -284,7 +283,6 @@ pub async fn edit_form(Path(id): Path<String>) -> Result<Markup, WebError> {
             &form,
             Some(&project.id),
             None,
-            StoredSecrets::of(&project),
         ),
     ))
 }
@@ -304,7 +302,6 @@ pub async fn create(Form(form): Form<ProjectForm>) -> Result<Response, WebError>
                         &form,
                         None,
                         Some(&forms::explain(&error)),
-                        StoredSecrets::default(),
                     ),
                 ),
             )
@@ -333,7 +330,6 @@ pub async fn create(Form(form): Form<ProjectForm>) -> Result<Response, WebError>
                     &form,
                     None,
                     Some(&forms::explain(&error)),
-                    StoredSecrets::default(),
                 ),
             ),
         )
@@ -360,7 +356,6 @@ pub async fn update(
                         &form,
                         Some(&id),
                         Some(&forms::explain(&error)),
-                        StoredSecrets::of(&existing),
                     ),
                 ),
             )
@@ -375,26 +370,6 @@ pub async fn update(
     Ok(Redirect::to(&format!("/projects/{id}")).into_response())
 }
 
-/// Which of a project's tokens are already on file.
-///
-/// A struct rather than a pair of positional `bool`s: the form has several call
-/// sites, and two adjacent bare booleans are the kind of argument that silently
-/// swaps places during an edit.
-#[derive(Debug, Default, Clone, Copy)]
-struct StoredSecrets {
-    git_token: bool,
-    status_token: bool,
-}
-
-impl StoredSecrets {
-    fn of(project: &ProjectConfig) -> Self {
-        Self {
-            git_token: !project.git_token.is_empty(),
-            status_token: !project.status_token.is_empty(),
-        }
-    }
-}
-
 /// The add/edit form: every field the TUI's nine-step wizard collects, at once.
 fn project_form(
     title: &str,
@@ -402,19 +377,7 @@ fn project_form(
     form: &ProjectForm,
     existing_id: Option<&str>,
     error: Option<&str>,
-    stored: StoredSecrets,
 ) -> Markup {
-    let kept = "stored — leave blank to keep it";
-    let token_placeholder = if stored.git_token {
-        kept
-    } else {
-        "ghp_… or github_pat_…"
-    };
-    let status_token_placeholder = if stored.status_token {
-        kept
-    } else {
-        "blank reuses the access token above"
-    };
     // The context the project will actually report under, so the placeholder
     // shows the real default rather than a generic example.
     let context_placeholder = match existing_id {
@@ -448,31 +411,14 @@ fn project_form(
                     }
                 }
 
-                label {
-                    span { "Repository URL" span class="optional" { "optional" } }
-                    input type="text" name="repository" value=(form.repository)
-                          placeholder="https://github.com/me/site.git";
-                    span class="hint" {
-                        "If set and the path below does not exist yet, webhookr clones it on the first run."
-                    }
-                }
-
-                label {
-                    span { "Access token" span class="optional" { "private repos only" } }
-                    input type="password" name="git_token" autocomplete="off"
-                          placeholder=(token_placeholder);
-                    span class="hint" {
-                        "A GitHub personal access token with repo read access. Used for clone "
-                        "and pull over HTTPS, handed to git through a credential helper so it "
-                        "never lands in the process list or in .git/config."
-                    }
-                }
-                @if stored.git_token {
-                    label class="checkbox" {
-                        input type="checkbox" name="clear_git_token" value="1";
-                        span { "Remove the stored token" }
-                    }
-                }
+                // The repository picker: a list of the user's GitHub repos
+                // (fetched from the shared github keys) loads here on page
+                // load, with a manual-URL fallback. `hx-include` sends the
+                // current form values so the fragment can pre-fill the URL
+                // and key on edit or after a validation re-render.
+                div id="repo-picker"
+                     hx-get="/f/github-repos" hx-trigger="load"
+                     hx-include="closest form" hx-swap="innerHTML" {}
 
                 label {
                     span { "Path on this server" }
@@ -586,25 +532,8 @@ fn project_form(
                 }
                 span class="hint" {
                     "GitHub shows the pending dot, green check or red X beside the "
-                    "deployed commit on the repository page."
-                }
-
-                label {
-                    span { "Status token" span class="optional" { "optional" } }
-                    input type="password" name="status_token" autocomplete="off"
-                          placeholder=(status_token_placeholder);
-                    span class="hint" {
-                        "Needs write access to commit statuses: repo:status on a classic "
-                        "token, or \"Commit statuses: write\" on a fine-grained one. Leave "
-                        "blank to reuse the access token above — a token that can only read "
-                        "contents cannot write statuses, so the two may need to differ."
-                    }
-                }
-                @if stored.status_token {
-                    label class="checkbox" {
-                        input type="checkbox" name="clear_status_token" value="1";
-                        span { "Remove the stored status token" }
-                    }
+                    "deployed commit on the repository page. Statuses are posted with "
+                    "the linked GitHub key (set in Settings)."
                 }
 
                 label {
@@ -636,8 +565,8 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
         name: String::new(),
         id: String::new(),
         repository: String::new(),
-        git_token: String::new(),
-        clear_git_token: None,
+        repository_pick: String::new(),
+        github_key_id: String::new(),
         path: String::new(),
         branch: String::new(),
         command: query.command.unwrap_or_default(),
@@ -653,8 +582,6 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
         // The deploy-fields preview never renders the trigger fields.
         merge_sources: String::new(),
         status_reports: None,
-        status_token: String::new(),
-        clear_status_token: None,
         status_context: String::new(),
     };
     deploy_fields_markup(&form)
@@ -760,6 +687,114 @@ pub async fn slug_preview(Query(query): Query<SlugQuery>) -> Markup {
 #[derive(Deserialize)]
 pub struct SlugQuery {
     pub name: Option<String>,
+}
+
+// ----- repo picker fragment ----------------------------------------------
+
+/// Fragment: the repository picker.
+///
+/// Loaded into `#repo-picker` on the project form via `hx-get` on page load.
+/// `hx-include="closest form"` sends the current form values so the manual URL
+/// and key `<select>` can be pre-filled on edit or after a validation re-render.
+///
+/// Each repo renders as a radio whose value encodes both the clone URL and the
+/// owning key id as `"clone_url\tkey_id"`; [`ProjectForm::to_project`] splits
+/// that pair. A separate manual URL field (`name="repository"`) takes
+/// precedence when filled, paired with a `<select>` of all github keys for the
+/// manual-URL case. No inline JavaScript is needed — the CSP forbids it.
+pub async fn github_repos(
+    Query(query): Query<RepoPickerQuery>,
+) -> Result<maud::Markup, WebError> {
+    let cfg = config::load_config()?;
+    let current_repo = query.repository.as_deref().unwrap_or("");
+    let current_key = query.github_key_id.as_deref().unwrap_or("");
+
+    // Fetch repos from every configured github key, best-effort: a key whose
+    // token is bad or rate-limited should not blank out the others.
+    let mut repos = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for key in &cfg.github_keys {
+        match crate::github::list_repos(&key.token, &key.host, &key.id, &key.label).await {
+            Ok(mut list) => repos.append(&mut list),
+            Err(err) => errors.push(format!("{}: {err}", key.label)),
+        }
+    }
+
+    Ok(html! {
+        @if cfg.github_keys.is_empty() {
+            p class="hint" {
+                "No GitHub keys configured — add one in Settings, or type a repository URL below."
+            }
+        } @else {
+            @if !repos.is_empty() {
+                label {
+                    span { "Your repositories" }
+                    div class="radio-group" {
+                        @for repo in &repos {
+                            @let encoded = format!("{}\t{}", repo.clone_url, repo.key_id);
+                            label class="radio" {
+                                input type="radio" name="repository_pick"
+                                      value=(encoded)
+                                      checked[!current_repo.is_empty()
+                                              && current_repo == repo.clone_url];
+                                span class="radio-text" {
+                                    (repo.full_name)
+                                    @if repo.private {
+                                        span class="muted small" { " (private)" }
+                                    }
+                                    span class="muted small" { " — " (repo.key_label) }
+                                }
+                            }
+                        }
+                    }
+                    span class="hint" {
+                        "Pick a repository to link its GitHub key for clone, pull and commit statuses."
+                    }
+                }
+                p class="hint" { "— or type a URL —" }
+            }
+            @for err in &errors {
+                p class="hint warn" { (err) }
+            }
+        }
+
+        label {
+            span { "Repository URL" span class="optional" { "optional" } }
+            input type="url" name="repository" value=(current_repo)
+                  placeholder="https://github.com/owner/repo.git";
+            span class="hint" {
+                "If set and the path below does not exist yet, webhookr clones it on the first run."
+            }
+        }
+
+        @if !cfg.github_keys.is_empty() {
+            label {
+                span { "GitHub key" span class="optional" { "for a typed URL" } }
+                select name="github_key_id" {
+                    option value="" selected[current_key.is_empty()] {
+                        "public repo / none"
+                    }
+                    @for key in &cfg.github_keys {
+                        option value=(key.id) selected[current_key == key.id] {
+                            (key.label)
+                        }
+                    }
+                }
+                span class="hint" {
+                    "Used for clone, pull and commit statuses when you type a URL above."
+                }
+            }
+        }
+    })
+}
+
+/// The subset of the form the repo picker needs to pre-fill its fields. Sent by
+/// `hx-include="closest form"`, so every other field arrives too and is simply
+/// ignored.
+#[derive(Deserialize)]
+pub struct RepoPickerQuery {
+    pub repository: Option<String>,
+    pub github_key_id: Option<String>,
 }
 
 // ----- destructive actions ----------------------------------------------

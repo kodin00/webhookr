@@ -57,6 +57,11 @@ pub fn pages() -> Router<AppState> {
         // POST even though it changes no state: the CSRF guard exempts GET,
         // and a prefetched link must not post to a Telegram chat.
         .route("/settings/telegram-test", post(settings::telegram_test))
+        // GitHub account credentials shared across projects: managed on the
+        // Settings page so a PAT is not pasted into every project.
+        .route("/settings/github-keys/add", post(settings::github_keys_add))
+        .route("/settings/github-keys/{id}/delete", post(settings::github_keys_delete))
+        .route("/settings/github-keys/{id}/test", post(settings::github_keys_test))
 }
 
 /// htmx fragments: bare markup, no page chrome.
@@ -70,6 +75,7 @@ pub fn fragments() -> Router<AppState> {
         .route("/f/path-check", get(browse::check))
         .route("/f/browse", get(browse::list))
         .route("/f/browse/select", get(browse::select))
+        .route("/f/github-repos", get(projects::github_repos))
 }
 
 /// HTML 404 for anything unrouted.
