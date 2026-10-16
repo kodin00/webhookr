@@ -125,6 +125,144 @@ pub fn api_base(host: &str) -> String {
     }
 }
 
+// ----- repository discovery -----------------------------------------------
+
+/// A repository visible to a github key, for the project-form repo picker.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoEntry {
+    /// Id of the [`crate::config::GithubKey`] that can access this repo, so the
+    /// form can link the project to the key that owns it.
+    pub key_id: String,
+    /// Label of that key, for the dropdown.
+    pub key_label: String,
+    /// `owner/repo`, for display.
+    pub full_name: String,
+    /// HTTPS clone URL, stored verbatim into [`crate::config::ProjectConfig::repository`].
+    pub clone_url: String,
+    pub private: bool,
+}
+
+#[derive(Deserialize)]
+struct ApiRepo {
+    full_name: String,
+    clone_url: String,
+    private: bool,
+}
+
+#[derive(Deserialize)]
+struct ApiUser {
+    login: String,
+}
+
+/// Pull the URL of the `rel="next"` link out of a GitHub `Link` header value.
+fn extract_next_link(header: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let part = part.trim();
+        if !part.contains(r#"rel="next""#) {
+            return None;
+        }
+        let url = part.strip_prefix('<')?.split_once('>').map(|(u, _)| u)?;
+        Some(url.to_string())
+    })
+}
+
+/// `GET /user/repos?type=owner`: the repositories the token's account owns, in
+/// updated-desc order so recently-touched repos come first. Follows the `Link`
+/// header for a few pages and caps the total, so an account with hundreds of
+/// repos does not stall the form.
+///
+/// `api_base` is resolved from `host` via [`api_base`]; like [`post_status`] it
+/// is never an environment variable, because redirecting token-bearing requests
+/// to an arbitrary host is a credential-exfiltration primitive.
+pub async fn list_repos(
+    token: &str,
+    host: &str,
+    key_id: &str,
+    key_label: &str,
+) -> Result<Vec<RepoEntry>> {
+    let client = CLIENT.as_ref().context("no HTTP client available")?;
+    let base = api_base(host);
+    let mut url = format!(
+        "{base}/user/repos?type=owner&per_page=100&sort=updated&direction=desc"
+    );
+    let mut out = Vec::new();
+    for _ in 0..5 {
+        let response = client
+            .get(&url)
+            .bearer_auth(token)
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", API_VERSION)
+            .send()
+            .await
+            .context("request to list repositories failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            let hint = match status.as_u16() {
+                401 => " (the token was rejected)",
+                403 => " (the token cannot list repositories)",
+                _ => "",
+            };
+            let detail = response.text().await.unwrap_or_default();
+            bail!("HTTP {status}{hint}: {}", api_message(&detail));
+        }
+        let next = response
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .and_then(extract_next_link);
+        let entries: Vec<ApiRepo> = response
+            .json()
+            .await
+            .context("could not parse the repository list")?;
+        for repo in entries {
+            out.push(RepoEntry {
+                key_id: key_id.to_string(),
+                key_label: key_label.to_string(),
+                full_name: repo.full_name,
+                clone_url: repo.clone_url,
+                private: repo.private,
+            });
+            if out.len() >= 300 {
+                return Ok(out);
+            }
+        }
+        match next {
+            Some(next_url) => url = next_url,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// `GET /user`: the authenticated account's login, used to label a key and to
+/// validate a token before it is saved.
+pub async fn whoami(token: &str, host: &str) -> Result<String> {
+    let client = CLIENT.as_ref().context("no HTTP client available")?;
+    let url = format!("{}/user", api_base(host));
+    let response = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("accept", "application/vnd.github+json")
+        .header("x-github-api-version", API_VERSION)
+        .send()
+        .await
+        .context("request to fetch the github user failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        let hint = match status.as_u16() {
+            401 => " (the token was rejected)",
+            _ => "",
+        };
+        let detail = response.text().await.unwrap_or_default();
+        bail!("HTTP {status}{hint}: {}", api_message(&detail));
+    }
+    let user: ApiUser = response
+        .json()
+        .await
+        .context("could not parse the github user")?;
+    Ok(user.login)
+}
+
 // ----- webhook payload -----------------------------------------------------
 
 /// The parts of a GitHub `push` payload a status report needs.
@@ -734,11 +872,15 @@ impl Reporter {
     ///
     /// The reason is printed once per run when reporting is switched on but
     /// unusable, since that is a configuration mistake worth surfacing.
-    pub fn for_project(project: &ProjectConfig, payload: Option<&PushPayload>) -> Option<Self> {
+    pub fn for_project(
+        app: &crate::config::AppConfig,
+        project: &ProjectConfig,
+        payload: Option<&PushPayload>,
+    ) -> Option<Self> {
         if !project.status_reports {
             return None;
         }
-        if let Some(problem) = project.status_report_problem() {
+        if let Some(problem) = app.status_report_problem(project) {
             eprintln!(
                 "webhookr: not reporting commit status for {}: {problem}",
                 project.id
@@ -749,7 +891,8 @@ impl Reporter {
             .and_then(payload_slug)
             .or_else(|| parse_repo(&project.repository))?;
         let api_base = api_base(&slug.host);
-        Some(Self::with_api_base(project, slug, api_base))
+        let token = app.status_token_for(project);
+        Some(Self::with_api_base(project, slug, api_base, token))
     }
 
     /// [`Self::for_project`] with the API base supplied, so a test can aim it at
@@ -758,10 +901,11 @@ impl Reporter {
         project: &ProjectConfig,
         slug: RepoSlug,
         api_base: String,
+        token: &str,
     ) -> Self {
         Self {
             api_base,
-            token: project.effective_status_token().to_string(),
+            token: token.to_string(),
             slug,
             context: project.effective_status_context(),
             target_url: None,

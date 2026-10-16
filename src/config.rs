@@ -182,6 +182,13 @@ pub struct ProjectConfig {
     /// into the checkout's `.git/config`.
     #[serde(default)]
     pub git_token: String,
+    /// Id of a [`GithubKey`] in [`AppConfig::github_keys`] whose token
+    /// authenticates clone/pull and commit-status reporting for this project.
+    /// Empty keeps the legacy per-project [`Self::git_token`] /
+    /// [`Self::status_token`] behavior, so a config written before shared
+    /// github keys existed works unchanged.
+    #[serde(default)]
+    pub github_key_id: String,
     /// Deployment preset: `custom`, `compose_build`, `compose_pull`, or `compose_up`.
     #[serde(default = "default_deploy_preset")]
     pub deploy_preset: String,
@@ -244,6 +251,7 @@ impl ProjectConfig {
             verify_mode,
             repository: String::new(),
             git_token: String::new(),
+            github_key_id: String::new(),
             deploy_preset: default_deploy_preset(),
             compose_file: default_compose_file(),
             compose_profiles: Vec::new(),
@@ -389,6 +397,7 @@ impl ProjectConfig {
 
     /// Token to use for the Statuses API: the dedicated one, else the
     /// repository access token, which is enough when one PAT covers both.
+    #[allow(dead_code)]
     pub fn effective_status_token(&self) -> &str {
         let dedicated = self.status_token.trim();
         if dedicated.is_empty() {
@@ -417,6 +426,7 @@ impl ProjectConfig {
     /// logged once per run. Deliberately kept out of [`Self::validate`], which
     /// the executor calls before every deploy — a rule there would let a
     /// misconfigured status report block the deploy it was meant to report on.
+    #[allow(dead_code)]
     pub fn status_report_problem(&self) -> Option<String> {
         if !self.status_reports {
             return None;
@@ -608,6 +618,32 @@ impl TelegramConfig {
     }
 }
 
+fn default_github_host() -> String {
+    "github.com".to_string()
+}
+
+/// A GitHub account credential stored once at the app level and referenced by
+/// projects via [`ProjectConfig::github_key_id`], so a single PAT is not pasted
+/// into every project. Multiple keys means multiple accounts, and the project
+/// form's repo picker aggregates repos from all of them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GithubKey {
+    /// Stable id referenced by [`ProjectConfig::github_key_id`].
+    pub id: String,
+    /// Human-friendly label: a name the user chose, or the account login
+    /// auto-filled when the key is tested.
+    #[serde(default)]
+    pub label: String,
+    /// Host as written for a remote, e.g. `github.com` (the default) or a
+    /// GitHub Enterprise host. Empty is treated as `github.com`.
+    #[serde(default = "default_github_host")]
+    pub host: String,
+    /// Personal access token. A secret: stored in `config.json` (owner-only) and
+    /// never echoed back into the settings form (blank means "keep stored").
+    #[serde(default)]
+    pub token: String,
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -624,6 +660,10 @@ pub struct AppConfig {
     /// Telegram deploy notifications.
     #[serde(default)]
     pub telegram: TelegramConfig,
+    /// GitHub account credentials shared across projects. Each project
+    /// references one by id via [`ProjectConfig::github_key_id`].
+    #[serde(default)]
+    pub github_keys: Vec<GithubKey>,
 }
 
 impl Default for AppConfig {
@@ -635,6 +675,7 @@ impl Default for AppConfig {
             cloudflare: None,
             web: WebConfig::default(),
             telegram: TelegramConfig::default(),
+            github_keys: Vec::new(),
         }
     }
 }
@@ -659,6 +700,82 @@ impl AppConfig {
     pub fn remove(&mut self, id: &str) -> Option<ProjectConfig> {
         match self.projects.iter().position(|x| x.id == id) {
             Some(i) => Some(self.projects.remove(i)),
+            None => None,
+        }
+    }
+
+    /// The github key a project links to, if any.
+    pub fn github_key(&self, project: &ProjectConfig) -> Option<&GithubKey> {
+        let id = project.github_key_id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        self.github_keys.iter().find(|k| k.id == id)
+    }
+
+    /// Token for cloning/pulling a project's repository: the linked github key's
+    /// token when one is set and non-empty, else the legacy per-project
+    /// [`ProjectConfig::git_token`].
+    pub fn git_token_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a str {
+        if let Some(key) = self.github_key(project) {
+            let token = key.token.trim();
+            if !token.is_empty() {
+                return token;
+            }
+        }
+        project.git_token.trim()
+    }
+
+    /// Token for the Statuses API: a dedicated legacy
+    /// [`ProjectConfig::status_token`], then the linked github key, then the
+    /// legacy [`ProjectConfig::git_token`].
+    pub fn status_token_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a str {
+        let dedicated = project.status_token.trim();
+        if !dedicated.is_empty() {
+            return dedicated;
+        }
+        self.git_token_for(project)
+    }
+
+    /// App-level [`ProjectConfig::status_report_problem`]: the same advisory,
+    /// but aware of shared github keys so a key-linked project is not wrongly
+    /// reported as missing a token.
+    pub fn status_report_problem(&self, project: &ProjectConfig) -> Option<String> {
+        if !project.status_reports {
+            return None;
+        }
+        if project.repository.trim().is_empty() {
+            return Some(
+                "set a repository URL, so webhookr knows which repository to report to"
+                    .to_string(),
+            );
+        }
+        if crate::github::parse_repo(&project.repository).is_none() {
+            return Some(format!(
+                "{} is not a repository URL webhookr can report to",
+                project.repository
+            ));
+        }
+        if self.status_token_for(project).is_empty() {
+            return Some(
+                "set a github key in Settings, or an access token, that can write commit statuses"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Insert or replace a github key keyed by `id`.
+    pub fn upsert_key(&mut self, key: GithubKey) {
+        match self.github_keys.iter_mut().find(|k| k.id == key.id) {
+            Some(existing) => *existing = key,
+            None => self.github_keys.push(key),
+        }
+    }
+
+    pub fn remove_key(&mut self, id: &str) -> Option<GithubKey> {
+        match self.github_keys.iter().position(|k| k.id == id) {
+            Some(i) => Some(self.github_keys.remove(i)),
             None => None,
         }
     }
@@ -946,6 +1063,7 @@ mod tests {
             verify_mode: "github".into(),
             repository: "https://github.com/example/site.git".into(),
             git_token: String::new(),
+            github_key_id: String::new(),
             deploy_preset: "compose_up".into(),
             compose_file: "deploy/compose.yaml".into(),
             compose_profiles: vec!["web".into()],
@@ -1139,5 +1257,58 @@ mod tests {
         project.deploy_preset = "compose_up".into();
         project.compose_file = "../compose.yaml".into();
         assert!(project.validate().is_err());
+    }
+
+    #[test]
+    fn shared_github_key_supplies_tokens_with_legacy_fallback() {
+        use super::{AppConfig, GithubKey};
+
+        let mut app = AppConfig::default();
+        let mut project = ProjectConfig::new(
+            "site".into(),
+            "Site".into(),
+            "/tmp".into(),
+            "main".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        project.repository = "https://github.com/me/site.git".into();
+        project.status_reports = true;
+
+        // No key linked: legacy per-project token is the source.
+        project.git_token = "ghp_legacy".into();
+        assert_eq!(app.git_token_for(&project), "ghp_legacy");
+        assert_eq!(app.status_token_for(&project), "ghp_legacy");
+        assert!(app.status_report_problem(&project).is_none());
+
+        // A dedicated status token wins over the git token.
+        project.status_token = "ghp_status".into();
+        assert_eq!(app.status_token_for(&project), "ghp_status");
+        assert_eq!(app.git_token_for(&project), "ghp_legacy");
+
+        // Linking a key overrides the legacy git token, but a dedicated status
+        // token still wins for statuses.
+        app.github_keys.push(GithubKey {
+            id: "key-1".into(),
+            label: "personal".into(),
+            host: "github.com".into(),
+            token: "ghp_key".into(),
+        });
+        project.github_key_id = "key-1".into();
+        assert_eq!(app.git_token_for(&project), "ghp_key");
+        assert_eq!(app.status_token_for(&project), "ghp_status");
+
+        // With no legacy token and no dedicated status token, the key covers both.
+        project.git_token = String::new();
+        project.status_token = String::new();
+        assert_eq!(app.git_token_for(&project), "ghp_key");
+        assert_eq!(app.status_token_for(&project), "ghp_key");
+        assert!(app.status_report_problem(&project).is_none());
+
+        // An empty key id (a public-repo project) falls back to the empty legacy
+        // token — no credentials, which is correct for a public repo.
+        project.github_key_id = String::new();
+        assert_eq!(app.git_token_for(&project), "");
     }
 }

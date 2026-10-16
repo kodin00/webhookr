@@ -966,6 +966,10 @@ impl App {
                         .as_ref()
                         .map(|existing| existing.git_token.clone())
                         .unwrap_or_default();
+                    let github_key_id = stored
+                        .as_ref()
+                        .map(|existing| existing.github_key_id.clone())
+                        .unwrap_or_default();
                     let (status_reports, status_token, status_context) = stored
                         .as_ref()
                         .map(|existing| {
@@ -980,6 +984,7 @@ impl App {
                         id,
                         name,
                         git_token,
+                        github_key_id,
                         status_reports,
                         status_token,
                         status_context,

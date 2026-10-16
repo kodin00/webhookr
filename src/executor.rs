@@ -163,7 +163,11 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
 
     // Built before the lock: the refusal path below reports too, and it has
     // neither a run id nor a log file to hang the report on.
-    let mut reporter = github::Reporter::for_project(p, trigger.payload.as_ref());
+    // Tokens now live on the app (shared github keys) rather than the project,
+    // so the reporter resolves the status token against the live config. The
+    // git credential helper does the same in `sync_project`.
+    let app = crate::config::load_config().unwrap_or_default();
+    let mut reporter = github::Reporter::for_project(&app, p, trigger.payload.as_ref());
 
     // The pushed sha is only usable when the push was to the branch this
     // project deploys. Webhook deliveries are branch-gated in the handler, but
@@ -467,6 +471,13 @@ async fn sync_project(
     log_path: &Path,
     cancel: &Notify,
 ) -> std::result::Result<SyncOutcome, String> {
+    // The clone/fetch token is resolved against the live config so a project
+    // linked to a shared github key authenticates with that key's token, and a
+    // legacy project with a per-project token still works. Local file remotes
+    // (the test fixtures) carry no token and need no auth.
+    let token = crate::config::load_config()
+        .map(|app| app.git_token_for(p).to_string())
+        .unwrap_or_else(|_| p.git_token.trim().to_string());
     let path = Path::new(&p.path);
     if !path.exists() {
         if p.repository.trim().is_empty() {
@@ -482,7 +493,7 @@ async fn sync_project(
             .parent()
             .map(|parent| parent.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
-        let mut command = git_command(p);
+        let mut command = git_command(&token);
         command.args([
             "clone",
             "--branch",
@@ -513,7 +524,7 @@ async fn sync_project(
     ];
     for (step, args) in git_steps {
         let label = format!("git {step}");
-        let mut command = git_command(p);
+        let mut command = git_command(&token);
         command.args(&args);
         match exec(command, &p.path, &label, log, cancel).await {
             Err(error) => return Err(format!("failed to run {label}: {error:#}")),
@@ -576,9 +587,9 @@ async fn deploy(p: &ProjectConfig, log: &mut std::fs::File, cancel: &Notify) -> 
 /// like `https://token@github.com/...` would expose it to every user on the
 /// box) and out of the checkout's `.git/config`, so it is not persisted to disk
 /// by git and does not survive in a repository someone later copies.
-fn git_command(project: &ProjectConfig) -> Command {
+fn git_command(token: &str) -> Command {
     let mut command = Command::new("git");
-    let token = project.git_token.trim();
+    let token = token.trim();
     if !token.is_empty() {
         command
             // Clear inherited helpers first, so a system-wide helper cannot
@@ -933,6 +944,7 @@ mod tests {
                 repo: "site".into(),
             },
             "http://127.0.0.1:1".into(),
+            &project.status_token,
         );
 
         let log_path = root.join("run.log");
