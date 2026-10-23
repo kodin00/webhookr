@@ -21,15 +21,19 @@ pub struct ProjectForm {
     pub name: String,
     #[serde(default)]
     pub id: String,
+    /// Manual repository URL. Empty when the user picks from the radio list
+    /// rendered by the `/f/github-repos` fragment; non-empty takes precedence
+    /// over [`Self::repository_pick`].
     #[serde(default)]
     pub repository: String,
-    /// Blank on edit means "leave the stored token alone", so the form never
-    /// has to round-trip the secret back through the browser.
+    /// Encoded `"clone_url\tkey_id"` from the repo picker radio list. Empty
+    /// when the user types a URL manually instead.
     #[serde(default)]
-    pub git_token: String,
-    /// Set by a checkbox to explicitly clear a stored token.
+    pub repository_pick: String,
+    /// Id of the shared GitHub key to link to, for the manual-URL case. The
+    /// radio list carries its own key id inside [`Self::repository_pick`].
     #[serde(default)]
-    pub clear_git_token: Option<String>,
+    pub github_key_id: String,
     #[serde(default)]
     pub path: String,
     #[serde(default = "default_branch")]
@@ -64,13 +68,6 @@ pub struct ProjectForm {
     /// Present when the "report commit statuses" checkbox is ticked.
     #[serde(default)]
     pub status_reports: Option<String>,
-    /// Blank on edit means "leave the stored token alone", exactly as
-    /// [`Self::git_token`] does.
-    #[serde(default)]
-    pub status_token: String,
-    /// Set by a checkbox to explicitly clear a stored status token.
-    #[serde(default)]
-    pub clear_status_token: Option<String>,
     #[serde(default)]
     pub status_context: String,
 }
@@ -99,23 +96,33 @@ impl ProjectForm {
             None => util::generate_secret(),
         };
 
-        let submitted_token = self.git_token.trim();
-        let git_token = if self.clear_git_token.is_some() {
-            String::new()
-        } else if submitted_token.is_empty() {
-            existing.map(|p| p.git_token.clone()).unwrap_or_default()
-        } else {
-            submitted_token.to_string()
+        // The repo picker offers a radio list (encoded as "url\tkey_id") and a
+        // manual URL field with a separate keys `<select>`. A typed URL wins
+        // over a radio pick; a radio pick carries its own key id. The form no
+        // longer edits tokens — they are carried forward from the existing
+        // project so a legacy per-project token survives until the project is
+        // migrated to a shared github key.
+        let (repository, github_key_id) = {
+            let manual = self.repository.trim();
+            if !manual.is_empty() {
+                (manual.to_string(), self.github_key_id.trim().to_string())
+            } else {
+                let pick = self.repository_pick.trim();
+                match pick.rsplit_once('\t') {
+                    Some((url, key_id)) => {
+                        (url.trim().to_string(), key_id.trim().to_string())
+                    }
+                    None => (pick.to_string(), self.github_key_id.trim().to_string()),
+                }
+            }
         };
 
-        let submitted_status_token = self.status_token.trim();
-        let status_token = if self.clear_status_token.is_some() {
-            String::new()
-        } else if submitted_status_token.is_empty() {
-            existing.map(|p| p.status_token.clone()).unwrap_or_default()
-        } else {
-            submitted_status_token.to_string()
-        };
+        let git_token = existing
+            .map(|p| p.git_token.clone())
+            .unwrap_or_default();
+        let status_token = existing
+            .map(|p| p.status_token.clone())
+            .unwrap_or_default();
 
         let mut trigger_events = Vec::new();
         if self.trigger_push.is_some() {
@@ -151,10 +158,11 @@ impl ProjectForm {
             command: self.command.trim().to_string(),
             secret,
             verify_mode,
-            repository: self.repository.trim().to_string(),
+            repository,
             trigger_events,
             merge_sources: split_profiles(&self.merge_sources),
             git_token,
+            github_key_id,
             deploy_preset,
             compose_file,
             compose_profiles: split_profiles(&self.compose_profiles),
@@ -173,9 +181,8 @@ impl ProjectForm {
             name: project.name.clone(),
             id: project.id.clone(),
             repository: project.repository.clone(),
-            // Never echo the stored token back into the page.
-            git_token: String::new(),
-            clear_git_token: None,
+            repository_pick: String::new(),
+            github_key_id: project.github_key_id.clone(),
             path: project.path.clone(),
             branch: project.branch.clone(),
             command: project.command.clone(),
@@ -195,9 +202,6 @@ impl ProjectForm {
                 .then(|| "1".to_string()),
             merge_sources: project.merge_sources.join(", "),
             status_reports: project.status_reports.then(|| "1".to_string()),
-            // Never echo a stored token back into the page.
-            status_token: String::new(),
-            clear_status_token: None,
             status_context: project.status_context.clone(),
         }
     }
@@ -238,8 +242,8 @@ mod tests {
             name: "My Site".into(),
             id: String::new(),
             repository: "https://example.com/site.git".into(),
-            git_token: String::new(),
-            clear_git_token: None,
+            repository_pick: String::new(),
+            github_key_id: String::new(),
             path: "/tmp/webhookr-form-test".into(),
             branch: "main".into(),
             command: "./deploy.sh".into(),
@@ -251,8 +255,6 @@ mod tests {
             trigger_merge: None,
             merge_sources: String::new(),
             status_reports: None,
-            status_token: String::new(),
-            clear_status_token: None,
             status_context: String::new(),
         }
     }
@@ -386,39 +388,6 @@ mod tests {
             form.to_project(None).unwrap().merge_sources,
             vec!["develop", "staging"]
         );
-    }
-
-    #[test]
-    fn a_stored_status_token_survives_an_edit_unless_cleared() {
-        let mut created = form();
-        created.status_reports = Some("1".into());
-        created.status_token = "ghp_statuses".into();
-        let original = created.to_project(None).unwrap();
-        assert!(original.status_reports);
-        assert_eq!(original.status_token, "ghp_statuses");
-
-        // The edit form never renders the token, so it comes back blank. That
-        // must mean "keep it", not "clear it".
-        let rebuilt = ProjectForm::from_project(&original);
-        assert!(rebuilt.status_token.is_empty(), "the token must not be echoed back");
-        assert_eq!(
-            rebuilt.to_project(Some(&original)).unwrap().status_token,
-            "ghp_statuses"
-        );
-
-        // Ticking the clear checkbox does clear it.
-        let mut cleared = ProjectForm::from_project(&original);
-        cleared.clear_status_token = Some("1".into());
-        assert!(cleared
-            .to_project(Some(&original))
-            .unwrap()
-            .status_token
-            .is_empty());
-
-        // Unticking the enable checkbox switches reporting off.
-        let mut off = ProjectForm::from_project(&original);
-        off.status_reports = None;
-        assert!(!off.to_project(Some(&original)).unwrap().status_reports);
     }
 
     #[test]

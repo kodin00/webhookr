@@ -1,6 +1,7 @@
 //! Server settings and Cloudflare Tunnel provisioning.
 
 use axum::{
+    extract::Path,
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
     Form,
@@ -224,6 +225,57 @@ fn settings_body(
                 None => p class="muted" { "Not configured." }
             }
             p { a class="button" href="/settings/cloudflare" { "Configure tunnel" } }
+        }
+
+        section class="card" {
+            h2 { "GitHub accounts" }
+            p class="hint" {
+                "Access tokens stored once here and referenced by projects, so a \
+                 single PAT is not pasted into every project."
+            }
+            @for key in &cfg.github_keys {
+                div class="key-entry" {
+                    (views::field("Label", &key.label))
+                    (views::field("Host", &key.host))
+                    (views::field("Token", "stored"))
+                    p {
+                        button type="button" class="button"
+                               hx-post=(format!("/settings/github-keys/{}/test", key.id))
+                               hx-target=(format!("#test-{}", key.id)) { "Test" }
+                        span id=(format!("test-{}", key.id)) {}
+                        form method="post"
+                             action=(format!("/settings/github-keys/{}/delete", key.id)) {
+                            button type="submit" class="button"
+                                   hx-confirm="Delete this GitHub account?" { "Delete" }
+                        }
+                    }
+                }
+            }
+            @if cfg.github_keys.is_empty() {
+                p class="muted" { "No GitHub accounts stored yet." }
+            }
+            form method="post" action="/settings/github-keys/add" class="form" {
+                fieldset {
+                    legend { "Add an account" }
+                    label {
+                        span { "Label" span class="optional" { "optional" } }
+                        input type="text" name="label"
+                              placeholder="auto-filled from the token if left blank";
+                    }
+                    label {
+                        span { "Host" }
+                        input type="text" name="host" placeholder="github.com";
+                    }
+                    label {
+                        span { "Token" }
+                        input type="password" name="token" required autocomplete="off"
+                              placeholder="ghp_… or github_pat_…";
+                    }
+                }
+                div class="form-actions" {
+                    button type="submit" class="button primary" { "Add account" }
+                }
+            }
         }
 
         (version_card(checked))
@@ -504,6 +556,106 @@ fn cloudflare_body(cfg: &config::AppConfig, error: Option<&str>) -> Markup {
                  hostname before using it."
             }
         }
+    }
+}
+
+// ----- GitHub accounts ---------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct GithubKeyForm {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub host: String,
+    pub token: String,
+}
+
+/// Add a GitHub account key. A fresh id is generated; a blank host defaults to
+/// `github.com`; a blank label is best-effort filled from `whoami`, so a network
+/// failure never blocks the save — the token is what matters.
+pub async fn github_keys_add(Form(form): Form<GithubKeyForm>) -> Result<Response, WebError> {
+    let token = form.token.trim().to_string();
+    if token.is_empty() {
+        let cfg = config::load_config()?;
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            views::page(
+                "Settings",
+                settings_body(&cfg, None, Some("A GitHub access token is required."), None, None),
+            ),
+        )
+            .into_response());
+    }
+
+    let host = {
+        let host = form.host.trim();
+        if host.is_empty() {
+            "github.com".to_string()
+        } else {
+            host.to_string()
+        }
+    };
+
+    let id = crate::util::generate_secret();
+    let label = {
+        let label = form.label.trim();
+        if !label.is_empty() {
+            label.to_string()
+        } else {
+            // Best-effort: name the key after the account login. A network
+            // failure here is not a reason to refuse the save.
+            crate::github::whoami(&token, &host)
+                .await
+                .unwrap_or_else(|_| host.clone())
+        }
+    };
+
+    let outcome = config::update_config(|cfg| {
+        cfg.upsert_key(config::GithubKey {
+            id: id.clone(),
+            label: label.clone(),
+            host: host.clone(),
+            token: token.clone(),
+        });
+        Ok(())
+    });
+
+    match outcome {
+        Ok(()) => Ok(Redirect::to("/settings").into_response()),
+        Err(error) => {
+            let cfg = config::load_config()?;
+            Ok((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                views::page(
+                    "Settings",
+                    settings_body(&cfg, None, Some(&format!("{error:#}")), None, None),
+                ),
+            )
+                .into_response())
+        }
+    }
+}
+
+pub async fn github_keys_delete(Path(id): Path<String>) -> Result<Response, WebError> {
+    config::update_config(|cfg| {
+        cfg.remove_key(&id);
+        Ok(())
+    })?;
+    Ok(Redirect::to("/settings").into_response())
+}
+
+/// Validate a stored key by asking GitHub who the token belongs to. Returns a
+/// small fragment swapped into the card by the Test button.
+pub async fn github_keys_test(Path(id): Path<String>) -> Result<Markup, WebError> {
+    let cfg = config::load_config()?;
+    let key = cfg.github_keys.iter().find(|k| k.id == id);
+    let Some(key) = key else {
+        return Ok(html! { span class="warn-inline" { "key not found" } });
+    };
+
+    match crate::github::whoami(&key.token, &key.host).await {
+        Ok(login) => Ok(html! { span class="hint good" { "✓ @" (login) } }),
+        Err(error) => Ok(html! { span class="warn-inline" { (format!("{error:#}")) } }),
     }
 }
 
