@@ -135,6 +135,7 @@ Run `webhookr --help` for the same list.
 | `webhookr logs --id <ID> [--lines <N>]` | Tail the latest run's log (default 50 lines). |
 | `webhookr run --id <ID> [--no-pull]` | Pull the latest source, then run the deployment; `--no-pull` deploys the checkout as-is. |
 | `webhookr rollback <ID> [--to <RUN-OR-SHA>] [--no-db] [--yes]` | Roll a project back to a past successful run — the most recent, or the run id / commit sha `--to` names. `--no-db` skips the database restore; prompts unless `--yes`. |
+| `webhookr backup <ID>` | Dump the project's database right now, outside any deploy run — the same dump a pre-deploy backup takes. |
 | `webhookr cloudflare [--hostname hooks.example.com] [--admin-hostname deploy.example.com]` | Provision a Cloudflare Tunnel; at least one hostname required. Reads `CLOUDFLARE_API_TOKEN` or `--api-token`. |
 | `webhookr version [--offline]` | Show the running build and compare it with the published one. |
 | `webhookr update [--check]` | Replace this binary with the published build; `--check` only reports. |
@@ -207,7 +208,11 @@ Backups are the data half of a rollback, configured per project in the
 
 Dumps live under the state dir in `backups/<project>/`. Credentials resolve
 inside the container (`$POSTGRES_USER`, `$MYSQL_ROOT_PASSWORD`, …) — never
-stored or logged by webhookr.
+stored or logged by webhookr. The project page shows the detected database,
+every saved dump with its date and size, and a **Back up now** button for a
+manual dump outside any deploy (`webhookr backup <ID>` does the same from the
+shell; either is how you seed history for a project whose deploys predate
+backups). A manual dump counts against `keep` like any other.
 
 A rollback with a database first takes a `pre-rollback` safety dump of the
 current state, then restores the dump taken immediately before the run being

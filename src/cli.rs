@@ -166,6 +166,11 @@ pub enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    /// Dump the project's database now, outside any deploy run
+    Backup {
+        /// Project id
+        id: String,
+    },
     /// Replace this binary with the latest published build
     Update {
         /// Report what would change without downloading anything
@@ -302,6 +307,7 @@ async fn handle(cmd: Commands) -> Result<()> {
         Commands::Logs { id, lines } => cmd_logs(id, lines),
         Commands::Run { id, no_pull } => cmd_run(id, no_pull).await,
         Commands::Rollback { id, to, no_db, yes } => cmd_rollback(id, to, no_db, yes).await,
+        Commands::Backup { id } => cmd_backup(id).await,
         Commands::Update { check } => cmd_update(check).await,
         Commands::Version { offline } => cmd_version(offline).await,
         Commands::Cloudflare {
@@ -816,6 +822,18 @@ async fn cmd_rollback(id: String, to: Option<String>, no_db: bool, yes: bool) ->
 
     let record = executor::rollback_project(p, &target, restore_db).await?;
     print_run_result(record);
+    Ok(())
+}
+
+/// Dump a project's database on demand — the same dump a pre-deploy backup
+/// takes, but outside any run. Useful before hand-edited schema changes, or
+/// to seed history for a project whose deploys predate backups existing.
+async fn cmd_backup(id: String) -> Result<()> {
+    let cfg = config::load_config()?;
+    let p = cfg.get(&id).context(format!("unknown project id: {id}"))?;
+    let backup = executor::manual_backup(p).await?;
+    println!("backed up: {}", backup.file);
+    println!("size:      {} bytes", backup.size);
     Ok(())
 }
 

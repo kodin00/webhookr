@@ -67,7 +67,13 @@ pub async fn list() -> Result<Markup, WebError> {
     Ok(views::page("Projects", body))
 }
 
-pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
+pub async fn detail(
+    Path(id): Path<String>,
+    Query(started): Query<DetailQuery>,
+) -> Result<Markup, WebError> {
+    // Present only right after the "Back up now" button redirects back, so
+    // the operator knows why the list below has not changed yet.
+    let backup_started = started.backed_up.is_some();
     let (cfg, project) = load_project(&id)?;
     let runs: Vec<_> = state::load_runs()
         .into_iter()
@@ -93,6 +99,20 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
                 "none (public repo)"
             }
         }
+    };
+    // Probed per view rather than cached: one `docker compose config` keeps
+    // this card honest about what a rollback here would actually restore.
+    let database = backup::database_for(&project).await;
+    let backups = backup::load_index(&project.id);
+    let database_label = match &database {
+        Some(db) => format!("{} — service “{}”", db.kind.as_str(), db.service),
+        None if project.database.mode == "off" => "off — rollbacks restore code only".to_string(),
+        None => "none detected — rollbacks restore code only".to_string(),
+    };
+    let backups_label = if project.database.backups {
+        format!("on, keeping the newest {}", project.database.keep)
+    } else {
+        "off".to_string()
     };
 
     let body = html! {
@@ -145,6 +165,64 @@ pub async fn detail(Path(id): Path<String>) -> Result<Markup, WebError> {
                 span class="field-label" { "Runs" }
                 span class="field-value" {
                     pre class="log cmd-preview" { (config::deploy_command_preview(&project)) }
+                }
+            }
+        }
+
+        section class="card" {
+            h2 { "Database & backups" }
+            (views::field("Database", &database_label))
+            (views::field("Pre-deploy backups", &backups_label))
+            @if backup_started {
+                // The dump runs in the background, so the list below cannot
+                // have changed yet — say so instead of looking like a no-op.
+                p class="warn-inline" {
+                    "Manual backup started — it appears in the list below when the dump "
+                    "finishes (failures are narrated in manual.log under the project's "
+                    "backups directory)."
+                }
+            }
+            @if database.is_some() {
+                form method="post" action={ "/projects/" (project.id) "/backup" } {
+                    button type="submit" class="button small" { "Back up now" }
+                }
+            }
+            @if backups.is_empty() {
+                p class="muted" {
+                    "No backups yet — the next deploy with backups on takes one"
+                    @if database.is_none() {
+                        " (none will be taken until a database is detected or configured)"
+                    }
+                    "."
+                }
+            } @else {
+                div class="table-scroll" {
+                    table {
+                        thead { tr {
+                            th { "Saved" } th { "Engine" } th { "Taken" } th { "File" } th { "Size" }
+                        } }
+                        tbody {
+                            @for backup in &backups {
+                                tr {
+                                    td class="mono small" title=(backup.created_at) {
+                                        (views::jakarta_time(&backup.created_at))
+                                    }
+                                    td class="small" { (backup.kind) }
+                                    td class="small" {
+                                        (backup.label)
+                                        @if !backup.before_run.is_empty() {
+                                            " — "
+                                            // The run whose undo restores this
+                                            // dump; one hop to see what it was.
+                                            a href={ "/runs/" (backup.before_run) } { "view run" }
+                                        }
+                                    }
+                                    td class="mono small" { (backup.file) }
+                                    td class="mono small" { (human_size(backup.size)) }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1005,6 +1083,13 @@ async fn trigger(id: &str, sync_source: bool) -> Result<Response, WebError> {
 
 /// The confirm page's query: which run to roll back to.
 #[derive(Deserialize)]
+/// The project page's query flags. `backed-up` is set by the "Back up now"
+/// redirect so the page can say a dump is on its way before it lands.
+pub struct DetailQuery {
+    pub backed_up: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct RollbackQuery {
     pub to: Option<String>,
 }
@@ -1218,6 +1303,24 @@ pub async fn rollback(
     // No new record: almost always the single-flight guard refusing a
     // concurrent run. Point at the project so the state is visible.
     Ok(Redirect::to(&format!("/projects/{id}")).into_response())
+}
+
+/// Start a manual database dump in the background and return to the project
+/// page. Fire-and-forget on purpose: a big database's dump runs for minutes,
+/// and holding the request open for it would only time out at a reverse
+/// proxy. The dump lands in the backups card (and `manual.log` in the
+/// project's backups directory narrates failures).
+pub async fn backup_now(Path(id): Path<String>) -> Result<Response, WebError> {
+    let (_, project) = load_project(&id)?;
+    tokio::spawn(async move {
+        if let Err(error) = executor::manual_backup(&project).await {
+            eprintln!(
+                "webhookr: manual backup of {} failed: {error:#}",
+                project.id
+            );
+        }
+    });
+    Ok(Redirect::to(&format!("/projects/{id}?backed-up=1")).into_response())
 }
 
 /// Bytes as KiB/MiB for the confirm page: dump sizes span orders of

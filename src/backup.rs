@@ -190,7 +190,8 @@ pub struct Backup {
     /// Engine the dump came from (`postgres`, `mysql`, `mariadb`).
     pub kind: String,
     /// Why the dump exists: `pre-deploy`, `pre-rollback` (the safety dump a
-    /// rollback takes of the current state before overwriting it).
+    /// rollback takes of the current state before overwriting it), or `manual`
+    /// (the project page's "Back up now" button / `webhookr backup`).
     pub label: String,
     /// Dump size in bytes, for the confirm page.
     pub size: u64,
@@ -901,6 +902,214 @@ mod tests {
         assert!(load_index("site").is_empty());
         assert!(dir.join(super::INDEX_FILE).exists());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Whether a container runtime answers, so docker-dependent tests can skip
+    /// (with a note) instead of failing on machines without one.
+    async fn docker_available() -> bool {
+        tokio::process::Command::new("docker")
+            .arg("info")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// Run `docker compose <args>` inside the stack's directory. Compose
+    /// derives its project name from the directory, which is unique per test
+    /// run, so `down -v` cleans up exactly this stack.
+    async fn compose(root: &std::path::Path, args: &[&str]) -> String {
+        let output = tokio::process::Command::new("docker")
+            .arg("compose")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .await
+            .expect("docker compose runs");
+        assert!(
+            output.status.success(),
+            "docker compose {:?} failed:\n{}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// One SQL statement through the stack's psql, `-t -A` so the result is
+    /// bare rows — assertable without parsing table borders.
+    async fn psql(root: &std::path::Path, sql: &str) -> String {
+        let output = tokio::process::Command::new("docker")
+            .args([
+                "compose", "exec", "-T", "db", "psql", "-U", "app", "-d", "appdb", "-t", "-A",
+                "-c", sql,
+            ])
+            .current_dir(root)
+            .output()
+            .await
+            .expect("psql runs");
+        assert!(
+            output.status.success(),
+            "psql {sql} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// The rollback data contract, end to end against a real Postgres: dump
+    /// the good state, let a "bad deploy" mutate the database (new rows and a
+    /// whole new table), restore, and the good state is back — the bad rows
+    /// gone and the junk table dropped by the schema reset. Skips, with a
+    /// note, when no docker is available: a machine without a container
+    /// runtime cannot run it, and CI always can.
+    #[tokio::test]
+    // The std guard spans the test's awaits on purpose: it must cover the
+    // whole WEBHOOKR_STATE_DIR set/unset window, and nothing on this thread
+    // re-locks it.
+    #[allow(clippy::await_holding_lock)]
+    async fn dump_and_restore_round_trip_a_real_postgres() {
+        if !docker_available().await {
+            eprintln!("skipping: docker is not available on this machine");
+            return;
+        }
+        let _state_dir = crate::util::STATE_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct UnsetStateDir;
+        impl Drop for UnsetStateDir {
+            fn drop(&mut self) {
+                std::env::remove_var("WEBHOOKR_STATE_DIR");
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("webhookr-dbround-{}", crate::util::new_run_id()));
+        fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEBHOOKR_STATE_DIR", &root);
+        let _unset = UnsetStateDir;
+
+        // A minimal stack shaped like a real compose project: the database is
+        // reached only through its service, exactly as dump/restore do it.
+        fs::write(
+            root.join("compose.yaml"),
+            "services:\n  db:\n    image: postgres:16-alpine\n    environment:\n      \
+             POSTGRES_USER: app\n      POSTGRES_PASSWORD: round-trip-only\n      \
+             POSTGRES_DB: appdb\n",
+        )
+        .unwrap();
+
+        let mut project = ProjectConfig::new(
+            "dbsite".into(),
+            "DB Site".into(),
+            root.to_string_lossy().into_owned(),
+            "main".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        project.deploy_preset = "compose_up".into();
+        project.compose_file = "compose.yaml".into();
+        project.database.mode = "manual".into();
+        project.database.kind = "postgres".into();
+        project.database.service = "db".into();
+        project.database.backups = true;
+        project.database.keep = 3;
+
+        compose(&root, &["up", "-d", "--quiet-pull"]).await;
+        // Postgres takes a moment to accept connections after the container
+        // reports up; pg_isready inside the service is the authoritative
+        // probe, polled so a slow first-time image pull cannot flake it.
+        let mut ready = false;
+        for _ in 0..90 {
+            let ok = tokio::process::Command::new("docker")
+                .args(["compose", "exec", "-T", "db", "pg_isready", "-U", "app"])
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if ok {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert!(ready, "postgres never became ready");
+
+        // The "previously good deploy" the dump must capture.
+        psql(
+            &root,
+            "CREATE TABLE items (name text); INSERT INTO items VALUES ('good-state');",
+        )
+        .await;
+
+        let db = super::database_for(&project)
+            .await
+            .expect("manual mode resolves without probing");
+        assert_eq!(db.kind, DbKind::Postgres);
+        assert_eq!(db.service, "db");
+
+        let log_path = root.join("roundtrip.log");
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        let cancel = tokio::sync::Notify::new();
+
+        let backup = super::dump(&project, &db, "run-1", "pre-deploy", &mut log, &cancel)
+            .await
+            .expect("dump succeeds");
+        let dump_text = fs::read_to_string(backups_dir("dbsite").join(&backup.file)).unwrap();
+        assert!(
+            dump_text.contains("good-state"),
+            "the dump must carry the good state's data"
+        );
+        assert!(
+            super::backup_before_run("dbsite", "run-1").is_some(),
+            "the manifest must answer the lookup a rollback makes"
+        );
+
+        // The "bad deploy": rows the rollback must remove, and a table the
+        // schema reset must drop.
+        psql(
+            &root,
+            "INSERT INTO items VALUES ('bad-state'); CREATE TABLE migration_junk (x int);",
+        )
+        .await;
+        assert_eq!(
+            psql(&root, "SELECT count(*) FROM items;").await.trim(),
+            "2",
+            "precondition: the bad state really landed"
+        );
+
+        super::restore(&project, &db, &backup, &mut log, &cancel)
+            .await
+            .expect("restore succeeds");
+
+        assert_eq!(
+            psql(&root, "SELECT name FROM items ORDER BY name;").await,
+            "good-state\n",
+            "the restore must bring back exactly the dumped state"
+        );
+        assert_eq!(
+            psql(
+                &root,
+                "SELECT to_regclass('public.migration_junk') IS NULL;"
+            )
+            .await
+            .trim(),
+            "t",
+            "the schema reset must have dropped the bad deploy's table"
+        );
+
+        compose(&root, &["down", "-v", "--remove-orphans"]).await;
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -45,6 +45,9 @@ pub fn pages() -> Router<AppState> {
             post(projects::rotate_secret),
         )
         .route("/projects/{id}/deploy", post(projects::deploy))
+        // A manual database dump outside any run; like the deploy trigger it
+        // only starts work, the result lands in the project's backups list.
+        .route("/projects/{id}/backup", post(projects::backup_now))
         // Rollback on the delete_confirm pattern: the GET confirm page changes
         // nothing (safe to prefetch and to share), the POST replays the run.
         .route(

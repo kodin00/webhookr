@@ -183,6 +183,44 @@ pub async fn deploy_project_with(p: &ProjectConfig, trigger: Trigger) -> Result<
     run(p, SyncMode::AsIs, trigger).await
 }
 
+/// Take a database dump of `p` right now, outside any deploy run.
+///
+/// The project lock is held for the dump so a manual backup can never
+/// interleave with a rollback's restore on the same database; a deploy in
+/// flight is waited out rather than refused (its own pre-deploy dump is
+/// already done by the time it holds the lock this long). Output lands in
+/// `backups/<project>/manual.log`, which is the only place a manual backup is
+/// narrated — there is no run record for a backup that deploys nothing.
+pub async fn manual_backup(p: &ProjectConfig) -> Result<crate::backup::Backup> {
+    p.validate()?;
+    let db = crate::backup::database_for(p).await.with_context(|| {
+        format!(
+            "no database detected for {} — set mode to manual on the project's edit page, \
+             or turn backups off",
+            p.id
+        )
+    })?;
+    let lock = project_lock(&p.id);
+    let _guard = lock.lock().await;
+
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::backup::backups_dir(&p.id).join("manual.log"))
+        .with_context(|| format!("could not open the manual backup log for {}", p.id))?;
+    writeln!(
+        log,
+        "# manual backup of {} ({}) started {}",
+        p.name,
+        db.kind.as_str(),
+        crate::util::now_iso()
+    )?;
+    // A fresh signal that nothing ever trips: a manual backup runs to
+    // completion, it is not cancellable like a run's steps.
+    let cancel = tokio::sync::Notify::new();
+    crate::backup::dump(p, &db, "", "manual", &mut log, &cancel).await
+}
+
 /// Roll the checkout back to the commit a past run deployed, redeploy it, and
 /// (when `restore_db`) restore the database dump taken immediately before that
 /// run. Manual entry point (`webhookr rollback`); callers default the database
