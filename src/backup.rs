@@ -58,6 +58,14 @@ pub struct DbInfo {
     pub kind: DbKind,
     /// Compose service running the database (e.g. `db`).
     pub service: String,
+    /// The compose files (relative to the project path) the database was
+    /// resolved through. Dump and restore re-run `docker compose` against
+    /// exactly these files, so a backup can never touch a different stack
+    /// than the one detection probed.
+    pub compose_files: Vec<String>,
+    /// Compose profiles that were part of the resolution (compose presets
+    /// only; a scanned stack is probed exactly as it stands).
+    pub profiles: Vec<String>,
 }
 
 /// The database a project has, if any.
@@ -65,9 +73,12 @@ pub struct DbInfo {
 /// `auto` asks Compose itself (`docker compose -f … config --format json`)
 /// which services run a known database image — delegating the parsing means
 /// `env_file`, variables and `extends` all resolve the same way they do at
-/// deploy time. `manual` trusts the operator's `kind`/`service`. `off` (and
-/// any detection failure) is `None`: no backups, and a rollback restores code
-/// only.
+/// deploy time. A compose preset names the file to probe; a custom-command
+/// deploy is opaque (its command decides what Compose sees), so the checkout
+/// is scanned for the canonical compose file names instead. `manual` trusts
+/// the operator's `kind`/`service` and resolves files the same way. `off`
+/// (and any detection failure) is `None`: no backups, and a rollback
+/// restores code only.
 pub async fn database_for(p: &ProjectConfig) -> Option<DbInfo> {
     match p.database.mode.as_str() {
         "off" => None,
@@ -81,46 +92,141 @@ pub async fn database_for(p: &ProjectConfig) -> Option<DbInfo> {
                 _ => DbKind::Postgres,
             },
             service: p.database.service.clone(),
+            compose_files: resolve_compose_files(p),
+            profiles: if p.uses_compose() {
+                p.compose_profiles.clone()
+            } else {
+                Vec::new()
+            },
         }),
-        // Only a compose deployment has a file to probe; a custom-command
-        // project has nothing `docker compose config` could resolve.
-        "auto" if p.uses_compose() => detect_via_compose(p).await,
+        "auto" => detect_via_compose(p).await,
         _ => None,
     }
 }
 
+/// The compose files a project's database lives in.
+///
+/// A compose preset names its file, so that is authoritative. A custom
+/// command is opaque — its command may wrap Compose in files of its own —
+/// so the checkout is scanned for the canonical names Compose itself would
+/// discover, shallowest first. Empty (nothing found) is legal: `docker
+/// compose` then falls back to its own default lookup at the project root.
+fn resolve_compose_files(p: &ProjectConfig) -> Vec<String> {
+    if p.uses_compose() {
+        vec![p.compose_file.clone()]
+    } else {
+        scan_compose_files(&p.path)
+    }
+}
+
+/// The canonical Compose file names, in the order Compose itself prefers
+/// them within one directory.
+const COMPOSE_FILE_NAMES: [&str; 4] = [
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+];
+
+/// Scan a checkout for compose files, shallowest first (path as tiebreak).
+///
+/// Deliberately conservative, because this runs on every project-page render:
+/// only the canonical names, hidden directories and dependency trees skipped,
+/// depth and result count capped so a huge checkout cannot turn the page into
+/// a filesystem walk.
+fn scan_compose_files(root: &str) -> Vec<String> {
+    /// How deep to descend from the checkout root.
+    const MAX_DEPTH: usize = 4;
+    /// How many candidates to hand back; more than a couple of stacks in one
+    /// repo is a monorepo, and probing eight files is plenty.
+    const MAX_FILES: usize = 8;
+    /// Directories that never hold the real stack but can be enormous.
+    const SKIP_DIRS: [&str; 3] = ["node_modules", "target", "vendor"];
+
+    let mut found: Vec<(usize, String)> = Vec::new();
+    let mut queue: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from(root), 0)];
+    while let Some((dir, depth)) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if file_type.is_dir() {
+                if depth < MAX_DEPTH
+                    && !name.starts_with('.')
+                    && !SKIP_DIRS.contains(&name.as_ref())
+                {
+                    queue.push((entry.path(), depth + 1));
+                }
+            } else if COMPOSE_FILE_NAMES.contains(&name.as_ref()) {
+                if let Ok(relative) = entry.path().strip_prefix(root) {
+                    found.push((depth, relative.to_string_lossy().into_owned()));
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+        .into_iter()
+        .take(MAX_FILES)
+        .map(|(_, file)| file)
+        .collect()
+}
+
 /// Ask Compose which services the project really runs, and look for a known
-/// database among them.
+/// database among them — one candidate file at a time, first hit wins.
 ///
 /// Any failure — no docker on PATH, a non-zero exit from a broken compose
-/// file, unparseable output — is `None`: detection is best-effort by
-/// contract, and a rollback then restores code only, which is honest.
+/// file, unparseable output — moves on to the next candidate and finally
+/// `None`: detection is best-effort by contract, and a rollback then
+/// restores code only, which is honest.
 async fn detect_via_compose(p: &ProjectConfig) -> Option<DbInfo> {
-    let mut args = vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        p.compose_file.clone(),
-    ];
-    for profile in &p.compose_profiles {
-        args.extend(["--profile".to_string(), profile.clone()]);
-    }
-    args.extend([
-        "config".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
-    ]);
+    let compose_files = resolve_compose_files(p);
+    let profiles = if p.uses_compose() {
+        p.compose_profiles.clone()
+    } else {
+        Vec::new()
+    };
+    for file in &compose_files {
+        let mut args = vec!["compose".to_string(), "-f".to_string(), file.clone()];
+        for profile in &profiles {
+            args.extend(["--profile".to_string(), profile.clone()]);
+        }
+        args.extend([
+            "config".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ]);
 
-    let output = Command::new("docker")
-        .args(&args)
-        .current_dir(&p.path)
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        let output = Command::new("docker")
+            .args(&args)
+            .current_dir(&p.path)
+            .output()
+            .await
+            .ok();
+        let Some(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        if let Some((kind, service)) = detect_service(&String::from_utf8_lossy(&output.stdout)) {
+            return Some(DbInfo {
+                kind,
+                service,
+                // One file, the one that actually resolved the database —
+                // not every candidate: dump/restore re-run compose against
+                // exactly what was probed here.
+                compose_files: vec![file.clone()],
+                profiles,
+            });
+        }
     }
-    let (kind, service) = detect_service(&String::from_utf8_lossy(&output.stdout))?;
-    Some(DbInfo { kind, service })
+    None
 }
 
 /// Find a known database service in `docker compose config --format json`
@@ -281,7 +387,7 @@ pub async fn dump(
 
     let mut command = Command::new("docker");
     command
-        .args(compose_exec_args(p, &db.service, dump_command(db.kind)))
+        .args(compose_exec_args(db, dump_command(db.kind)))
         .current_dir(&p.path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(dump_file))
@@ -369,7 +475,7 @@ pub async fn restore(
     if matches!(db.kind, DbKind::Mysql | DbKind::Mariadb) {
         match exec_step(
             p,
-            &db.service,
+            db,
             r#"test -n "$MYSQL_DATABASE""#,
             "database scope check",
             None,
@@ -389,7 +495,7 @@ pub async fn restore(
 
     match exec_step(
         p,
-        &db.service,
+        db,
         reset_command(db.kind),
         "database reset",
         None,
@@ -409,7 +515,7 @@ pub async fn restore(
         .with_context(|| format!("failed to open {}", dump_path.display()))?;
     match exec_step(
         p,
-        &db.service,
+        db,
         restore_command(db.kind),
         "database restore",
         Some(dump),
@@ -491,7 +597,7 @@ async fn settle(
 /// (and of the MySQL scope probe). Cancel-aware through [`settle`].
 async fn exec_step(
     p: &ProjectConfig,
-    service: &str,
+    db: &DbInfo,
     inner: &str,
     label: &str,
     stdin: Option<File>,
@@ -508,7 +614,7 @@ async fn exec_step(
 
     let mut command = Command::new("docker");
     command
-        .args(compose_exec_args(p, service, inner))
+        .args(compose_exec_args(db, inner))
         .current_dir(&p.path)
         .stdin(match stdin {
             // Restore pipes the dump file in through here.
@@ -525,26 +631,27 @@ async fn exec_step(
 }
 
 /// The argv that reaches the database's container: the compose base built
-/// exactly the way `executor::deploy` builds its own (`-f` plus profiles, so
+/// from the files detection resolved (`-f` per file plus profiles, so
 /// `env_file`, variables and `extends` resolve at backup time precisely as
-/// they did at deploy time), then `exec -T <service> sh -c <inner>`.
+/// they did at detection time), then `exec -T <service> sh -c <inner>`.
+/// With no resolved files Compose's own default lookup in the project root
+/// applies — the same rule the scan itself follows.
 ///
 /// `-T` matters twice over: it keeps compose from allocating a TTY, which
 /// would mangle a piped dump with CRs and echo, and it is what lets stdin
 /// flow from a redirected file during restore.
-fn compose_exec_args(p: &ProjectConfig, service: &str, inner: &str) -> Vec<String> {
-    let mut args = vec![
-        "compose".to_string(),
-        "-f".to_string(),
-        p.compose_file.clone(),
-    ];
-    for profile in &p.compose_profiles {
+fn compose_exec_args(db: &DbInfo, inner: &str) -> Vec<String> {
+    let mut args = vec!["compose".to_string()];
+    for file in &db.compose_files {
+        args.extend(["-f".to_string(), file.clone()]);
+    }
+    for profile in &db.profiles {
         args.extend(["--profile".to_string(), profile.clone()]);
     }
     args.extend([
         "exec".to_string(),
         "-T".to_string(),
-        service.to_string(),
+        db.service.clone(),
         "sh".to_string(),
         "-c".to_string(),
         inner.to_string(),
@@ -780,16 +887,23 @@ mod tests {
 
     #[tokio::test]
     async fn manual_and_off_modes_resolve_without_docker() {
+        // An empty directory, not /tmp: `auto` on a custom-command project
+        // now scans the checkout, and a scan of the shared temp dir could
+        // find another test's compose file (or take arbitrarily long).
+        let root =
+            std::env::temp_dir().join(format!("webhookr-empty-{}", crate::util::new_run_id()));
+        fs::create_dir_all(&root).unwrap();
         let mut p = ProjectConfig::new(
             "site".into(),
             "Site".into(),
-            "/tmp".into(),
+            root.to_string_lossy().into_owned(),
             "main".into(),
             "true".into(),
             "secret".into(),
             "github".into(),
         );
-        // Custom preset: `auto` has no compose file to probe, so no database.
+        // Custom preset with an empty checkout: the scan finds no candidates,
+        // so `auto` answers none — docker or no docker.
         p.database.mode = "auto".into();
         assert!(super::database_for(&p).await.is_none());
 
@@ -804,6 +918,103 @@ mod tests {
             .expect("manual is trusted verbatim");
         assert_eq!(db.kind, DbKind::Mariadb);
         assert_eq!(db.service, "mydb");
+        // Manual resolves files like auto does: nothing scanned in an empty
+        // checkout, so Compose's own root lookup will apply at dump time.
+        assert!(db.compose_files.is_empty());
+        assert!(db.profiles.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The scan a custom-command project's `auto` mode rides on: canonical
+    /// names only, shallowest first, hidden and dependency trees skipped.
+    #[test]
+    fn scan_finds_canonical_compose_files_shallowest_first() {
+        let root =
+            std::env::temp_dir().join(format!("webhookr-scan-{}", crate::util::new_run_id()));
+        for dir in ["docker", "deep/a/b", "node_modules", ".hidden"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        // The names that must not count, next to ones that must.
+        fs::write(root.join("compose.yaml"), "services: {}").unwrap();
+        fs::write(root.join("docker/docker-compose.yml"), "services: {}").unwrap();
+        fs::write(root.join("deep/a/b/docker-compose.yaml"), "services: {}").unwrap();
+        fs::write(root.join("node_modules/docker-compose.yml"), "x").unwrap();
+        fs::write(root.join(".hidden/compose.yaml"), "x").unwrap();
+        // A compose file with a non-canonical name: real stacks use these as
+        // extra `-f` files, but a scan that matched them would second-guess
+        // the deploy command's own file choices.
+        fs::create_dir_all(root.join("deploy")).unwrap();
+        fs::write(root.join("deploy/observability-compose.yml"), "x").unwrap();
+
+        assert_eq!(
+            super::scan_compose_files(&root.to_string_lossy()),
+            vec![
+                "compose.yaml".to_string(),
+                "docker/docker-compose.yml".to_string(),
+                "deep/a/b/docker-compose.yaml".to_string(),
+            ],
+            "canonical names only, shallowest first, skips honored"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Dump/restore must address exactly the stack detection resolved: one
+    /// `-f` per resolved file, profiles preserved, and no `-f` at all when
+    /// nothing resolved (Compose's own default lookup then applies).
+    #[test]
+    fn exec_args_follow_the_resolved_stack() {
+        let db = super::DbInfo {
+            kind: DbKind::Postgres,
+            service: "db".into(),
+            compose_files: vec!["docker/docker-compose.yml".into()],
+            profiles: Vec::new(),
+        };
+        assert_eq!(
+            super::compose_exec_args(&db, "pg_dump"),
+            vec![
+                "compose",
+                "-f",
+                "docker/docker-compose.yml",
+                "exec",
+                "-T",
+                "db",
+                "sh",
+                "-c",
+                "pg_dump",
+            ]
+        );
+
+        let preset = super::DbInfo {
+            kind: DbKind::Postgres,
+            service: "db".into(),
+            compose_files: vec!["compose.yaml".into()],
+            profiles: vec!["observability".into()],
+        };
+        assert_eq!(
+            super::compose_exec_args(&preset, "psql")[..7],
+            [
+                "compose",
+                "-f",
+                "compose.yaml",
+                "--profile",
+                "observability",
+                "exec",
+                "-T"
+            ]
+        );
+
+        let unresolved = super::DbInfo {
+            kind: DbKind::Postgres,
+            service: "db".into(),
+            compose_files: Vec::new(),
+            profiles: Vec::new(),
+        };
+        assert_eq!(
+            super::compose_exec_args(&unresolved, "psql")[..4],
+            ["compose", "exec", "-T", "db"]
+        );
     }
 
     #[test]

@@ -202,7 +202,7 @@ Backups are the data half of a rollback, configured per project in the
 
 | Setting | What it does |
 | --- | --- |
-| Mode | `auto` (default) — detect the database by asking `docker compose config` which services run Postgres, PostGIS, MySQL, or MariaDB; `manual` — you name the engine (`kind`) and compose `service`; `off` — no backups, rollbacks are code-only. |
+| Mode | `auto` (default) — detect the database by asking `docker compose config` which services run Postgres, PostGIS, MySQL, or MariaDB. Compose presets probe the configured file; a **custom-command** project gets its checkout scanned (shallowest-first) for compose files under the canonical names (`compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`), and the first one defining a known database wins. `manual` — you name the engine (`kind`) and compose `service`; `off` — no backups, rollbacks are code-only. |
 | Backups | On by default. Every forward deploy dumps the database **before** touching git, and a failed dump fails the deploy before any code change. |
 | Keep | How many dumps to keep per project (default 5); the oldest are pruned once a new one lands. |
 
