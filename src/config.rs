@@ -155,6 +155,61 @@ pub fn deploy_command_preview(project: &ProjectConfig) -> String {
     }
 }
 
+/// How a project's database is treated by pre-deploy backups and rollback
+/// restores.
+///
+/// Detection is best-effort: compose presets are probed through
+/// `docker compose config`, and anything else (or a detection the operator
+/// disagrees with) is spelled out by hand with `manual`. `off` disables both
+/// halves — no dumps are taken and a rollback restores code only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DatabaseConfig {
+    /// `auto` (detect from the compose file), `manual` (use `kind` +
+    /// `service` below), or `off`.
+    #[serde(default = "default_db_mode")]
+    pub mode: String,
+    /// Database engine for `manual` mode: `postgres`, `mysql`, or `mariadb`.
+    /// Ignored in `auto`/`off` (detection fills it in at backup time).
+    #[serde(default)]
+    pub kind: String,
+    /// Name of the compose service running the database, for `manual` mode.
+    #[serde(default)]
+    pub service: String,
+    /// Whether forward deploys dump the database before touching git. This is
+    /// what makes a rollback able to restore data, so a failed dump fails the
+    /// deploy *before* any code change.
+    #[serde(default = "default_db_backups")]
+    pub backups: bool,
+    /// How many dumps to keep per project; the oldest are pruned after each
+    /// new one lands.
+    #[serde(default = "default_db_keep")]
+    pub keep: usize,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_db_mode(),
+            kind: String::new(),
+            service: String::new(),
+            backups: default_db_backups(),
+            keep: default_db_keep(),
+        }
+    }
+}
+
+fn default_db_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_db_backups() -> bool {
+    true
+}
+
+fn default_db_keep() -> usize {
+    5
+}
+
 /// One webhook-triggered deploy target.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectConfig {
@@ -228,6 +283,11 @@ pub struct ProjectConfig {
     /// stripped on comparison, so both spellings of a branch match.
     #[serde(default)]
     pub merge_sources: Vec<String>,
+    /// Database handling for this project: pre-deploy backups and the restore
+    /// half of a rollback. All-default (`auto`, detection at backup time)
+    /// keeps every config written before rollbacks existed working unchanged.
+    #[serde(default)]
+    pub database: DatabaseConfig,
 }
 
 impl ProjectConfig {
@@ -260,6 +320,7 @@ impl ProjectConfig {
             status_context: String::new(),
             trigger_events: Vec::new(),
             merge_sources: Vec::new(),
+            database: DatabaseConfig::default(),
         }
     }
 
@@ -341,6 +402,31 @@ impl ProjectConfig {
             if name.starts_with('-') {
                 bail!("merge_sources branch names may not start with '-'");
             }
+        }
+        // The database block drives pre-deploy backups and rollback restores.
+        // A typo in `mode` would silently pick an arbitrary reading, and
+        // `service` reaches the docker compose command line, so it gets the
+        // same leading-'-' refusal as `branch`.
+        match self.database.mode.as_str() {
+            "auto" | "manual" | "off" => {}
+            other => bail!("database mode must be 'auto', 'manual', or 'off', got {other:?}"),
+        }
+        if self.database.mode == "manual" {
+            match self.database.kind.as_str() {
+                "postgres" | "mysql" | "mariadb" => {}
+                other => {
+                    bail!("database kind must be 'postgres', 'mysql', or 'mariadb', got {other:?}")
+                }
+            }
+            if self.database.service.trim().is_empty() {
+                bail!("manual database mode needs the compose service name");
+            }
+            if self.database.service.starts_with('-') {
+                bail!("database service may not start with '-'");
+            }
+        }
+        if self.database.keep == 0 {
+            bail!("database keep must be at least 1 (0 would prune every backup)");
         }
         // Sent verbatim to GitHub as a JSON string and shown as a label beside
         // the commit, so it has to be a short single line.
@@ -433,8 +519,7 @@ impl ProjectConfig {
         }
         if self.repository.trim().is_empty() {
             return Some(
-                "set a repository URL, so webhookr knows which repository to report to"
-                    .to_string(),
+                "set a repository URL, so webhookr knows which repository to report to".to_string(),
             );
         }
         if crate::github::parse_repo(&self.repository).is_none() {
@@ -746,8 +831,7 @@ impl AppConfig {
         }
         if project.repository.trim().is_empty() {
             return Some(
-                "set a repository URL, so webhookr knows which repository to report to"
-                    .to_string(),
+                "set a repository URL, so webhookr knows which repository to report to".to_string(),
             );
         }
         if crate::github::parse_repo(&project.repository).is_none() {
@@ -811,8 +895,8 @@ pub(crate) fn write_atomic(path: &Path, text: &str, owner_only: bool) -> Result<
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
 
     let write = |tmp: &Path| -> Result<()> {
-        let mut file = fs::File::create(tmp)
-            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        let mut file =
+            fs::File::create(tmp).with_context(|| format!("failed to create {}", tmp.display()))?;
         file.write_all(text.as_bytes())
             .with_context(|| format!("failed to write {}", tmp.display()))?;
         file.sync_all()
@@ -824,8 +908,7 @@ pub(crate) fn write_atomic(path: &Path, text: &str, owner_only: bool) -> Result<
         if owner_only {
             set_owner_only(&tmp)?;
         }
-        fs::rename(&tmp, path)
-            .with_context(|| format!("failed to replace {}", path.display()))
+        fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))
     }) {
         let _ = fs::remove_file(&tmp);
         return Err(error);
@@ -904,7 +987,7 @@ pub fn ensure_dirs() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, ProjectConfig};
+    use super::{AppConfig, DatabaseConfig, ProjectConfig};
 
     #[test]
     fn old_config_deserializes_with_deployment_defaults() {
@@ -981,9 +1064,10 @@ mod tests {
         assert!(!AppConfig::default().web.enabled);
         assert!(!super::WebConfig::default().enabled);
         // A hand-edited partial block still loads, and still binds loopback.
-        let partial: AppConfig =
-            serde_json::from_str(r#"{"listen_addr":"0.0.0.0:9000","projects":[],"web":{"enabled":true}}"#)
-                .unwrap();
+        let partial: AppConfig = serde_json::from_str(
+            r#"{"listen_addr":"0.0.0.0:9000","projects":[],"web":{"enabled":true}}"#,
+        )
+        .unwrap();
         assert!(partial.web.enabled);
         assert_eq!(partial.web.listen_addr, "127.0.0.1:9001");
     }
@@ -1020,7 +1104,10 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect();
-        assert!(project.validate().is_err(), "a typo silently matches nothing");
+        assert!(
+            project.validate().is_err(),
+            "a typo silently matches nothing"
+        );
     }
 
     #[test]
@@ -1072,6 +1159,7 @@ mod tests {
             status_context: String::new(),
             trigger_events: Vec::new(),
             merge_sources: Vec::new(),
+            database: DatabaseConfig::default(),
         };
         project.validate().unwrap();
     }
@@ -1137,10 +1225,7 @@ mod tests {
 
         project.repository = "https://github.com/me/site.git".into();
         project.validate().unwrap();
-        assert!(
-            project.status_report_problem().is_some(),
-            "still no token"
-        );
+        assert!(project.status_report_problem().is_some(), "still no token");
 
         project.git_token = "ghp_repo".into();
         project.validate().unwrap();

@@ -53,7 +53,10 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
                         tbody {
                             @for run in &runs {
                                 tr {
-                                    td { (views::status_badge(Some(run))) }
+                                    td {
+                                        (views::status_badge(Some(run)))
+                                        (rollback_badge(run))
+                                    }
                                     td { a href={ "/projects/" (run.project_id) } { (run.project_id) } }
                                     td class="mono small" title=[run.commit.as_deref()] {
                                         (short_sha(run))
@@ -103,6 +106,19 @@ fn short_sha(run: &RunRecord) -> String {
     }
 }
 
+/// The marker shown beside a run's status when the run was itself a rollback.
+///
+/// `rollback_to` is set only on runs a rollback produced, so its presence is
+/// the whole test. The neutral badge colour keeps it informational — the
+/// outcome it accompanies is whatever the deploy itself did, which the status
+/// badge already says.
+fn rollback_badge(run: &RunRecord) -> Markup {
+    match run.rollback_to.as_deref() {
+        Some(_) => html! { " " span class="badge badge-none" { "rollback" } },
+        None => html! {},
+    }
+}
+
 /// Whether the chat was actually notified about this run, and if not, why.
 ///
 /// Rendered from the record rather than the log because the page stops
@@ -141,14 +157,31 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
                         button type="submit" class="button danger" { "Cancel" }
                     }
                 }
+                // Only a successful run with a recorded commit has something
+                // to replay. The link carries no hx-confirm because it lands
+                // on a confirm page that spells out the database side too.
+                @if run.status == "success" && run.commit.is_some() {
+                    a class="button danger"
+                       href={ "/projects/" (run.project_id) "/rollback?to=" (run.id) } {
+                        "Rollback to this run"
+                    }
+                }
                 a class="button" href={ "/runs/" (run.id) "/raw" } { "Raw log" }
             }
         }
         section class="card" {
-            (views::field("Status", &run.status))
+            div class="field" {
+                span class="field-label" { "Status" }
+                span class="field-value" { (run.status) (rollback_badge(&run)) }
+            }
             (views::field("Project", &run.project_id))
             @if let Some(trigger) = run.triggered_by.as_deref() {
                 (views::field("Triggered by", trigger))
+            }
+            // The target this rollback replayed, so the trail reads
+            // "rolled back to <run>" without hunting through the history.
+            @if let Some(target) = run.rollback_to.as_deref() {
+                (views::code_field("Rolled back to", target))
             }
             @if let Some(sha) = &run.commit {
                 (views::code_field("Commit", sha))
@@ -224,7 +257,10 @@ pub async fn raw(Path(run_id): Path<String>) -> Result<Response, WebError> {
     let run = find_run(&run_id)?;
     let text = state::read_run_log(&run.id);
     Ok((
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         text,
     )
         .into_response())

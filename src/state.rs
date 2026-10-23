@@ -56,6 +56,10 @@ pub struct RunRecord {
     /// the field existed.
     #[serde(default)]
     pub telegram: Option<TelegramDelivery>,
+    /// The run id a rollback run rolled the project back to. Absent on normal
+    /// runs and on runs recorded before rollbacks existed.
+    #[serde(default)]
+    pub rollback_to: Option<String>,
 }
 
 /// Outcome of a run's final Telegram notification.
@@ -225,6 +229,7 @@ mod tests {
             author: None,
             triggered_by: None,
             telegram: None,
+            rollback_to: None,
         }
     }
 

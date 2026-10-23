@@ -52,8 +52,16 @@ const MENU: [(&str, &str, &str); 11] = [
     ("C", "Cloudflare tunnel", "Publish port 9000 at a hostname"),
     ("-", "Remove project", "Delete a configured route"),
     ("#", "View run log", "Read output from the latest run"),
-    ("W", "Web admin UI", "Toggle the browser dashboard on or off"),
-    ("^", "Update webhookr", "Check for a newer build and install it"),
+    (
+        "W",
+        "Web admin UI",
+        "Toggle the browser dashboard on or off",
+    ),
+    (
+        "^",
+        "Update webhookr",
+        "Check for a newer build and install it",
+    ),
 ];
 
 /// Launch the interactive management TUI (blocks until the user quits).
@@ -700,8 +708,7 @@ impl App {
                 ));
             }
             Ok(()) => {
-                self.last_msg =
-                    Some("web UI disabled — restart the daemon to stop it".to_string());
+                self.last_msg = Some("web UI disabled — restart the daemon to stop it".to_string());
             }
             Err(error) => {
                 self.config.web.enabled = !enabling;
@@ -720,10 +727,30 @@ impl App {
     fn handle_list(&mut self, key: KeyCode, mode: ListMode) -> Result<()> {
         match key {
             KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
-            KeyCode::Char('j') | KeyCode::Down => self.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
+            // `on_key` swaps the screen out for `Menu` before dispatching, so
+            // every arm that is not an explicit exit must put the list back —
+            // navigation included, or one j/k press would kick the operator
+            // out of the screen they are navigating.
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.select_next();
+                self.screen = Screen::List { mode };
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.select_prev();
+                self.screen = Screen::List { mode };
+            }
+            // Rollback targets the run the list is showing for the
+            // highlighted route, so it lives on the inspect screen; the
+            // one-shot action modes each exist to do a single thing on
+            // Enter. Back to the menu afterwards, because `last_msg` — the
+            // "started" / "can only roll back to a successful run" feedback —
+            // is drawn there.
+            KeyCode::Char('r') if matches!(mode, ListMode::Browse) => {
+                self.rollback_selected();
+                self.screen = Screen::Menu;
+            }
             KeyCode::Enter => self.activate_project(mode),
-            _ => {}
+            _ => self.screen = Screen::List { mode },
         }
         Ok(())
     }
@@ -766,6 +793,56 @@ impl App {
             "{} started for {} — check the run log",
             args[0], p.id
         ));
+    }
+
+    /// Roll the highlighted route back to its newest run.
+    ///
+    /// The list shows exactly one run per route — the newest — so that run is
+    /// the rollback target: `r` redeploys the commit it recorded, through a
+    /// `webhookr rollback` child process for the same reason
+    /// [`Self::trigger_project`] shells out (this loop is synchronous on an
+    /// async runtime thread, so the awaits belong in the child). The database
+    /// decision rides along as a flag rather than being pre-flighted here:
+    /// `--yes` because the child's stdin is null and an interactive restore
+    /// prompt could never be answered, `--no-db` when the project has backups
+    /// off. A dump the restore cannot find then fails the rollback run
+    /// itself, which the next refresh surfaces in the list.
+    fn rollback_selected(&mut self) {
+        let Some(i) = self.selected_index() else {
+            return;
+        };
+        let p = &self.config.projects[i];
+        // Refreshed on every loop tick, so this is the very run whose status
+        // is drawn beside the route. Only a successful run with a recorded
+        // commit can be replayed; anything else gets the message instead of a
+        // child process doomed to refuse.
+        let rollbackable = self
+            .last_runs
+            .get(&p.id)
+            .filter(|run| run.status == "success" && run.commit.is_some());
+        let Some(run) = rollbackable else {
+            self.last_msg = Some("can only roll back to a successful run".to_string());
+            return;
+        };
+        let run_id = run.id.clone();
+        let db_flag = if p.database.backups {
+            "--yes"
+        } else {
+            "--no-db"
+        };
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe)
+                .arg("rollback")
+                .arg(&p.id)
+                .arg("--to")
+                .arg(&run_id)
+                .arg(db_flag)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        self.last_msg = Some(format!("rollback started for {} — check the run log", p.id));
     }
 
     fn open_log(&mut self, i: usize) {
@@ -980,6 +1057,13 @@ impl App {
                             )
                         })
                         .unwrap_or_default();
+                    // The wizard has no database fields; carry forward the
+                    // stored block so editing here never silently turns
+                    // backups off.
+                    let database = stored
+                        .as_ref()
+                        .map(|existing| existing.database.clone())
+                        .unwrap_or_default();
                     let project = ProjectConfig {
                         id,
                         name,
@@ -1008,6 +1092,7 @@ impl App {
                         deploy_preset: PRESETS[w.preset].0.to_string(),
                         compose_file: w.compose_file.value().trim().to_string(),
                         compose_profiles: parse_profiles(w.compose_profiles.value()),
+                        database,
                     };
                     match project.validate() {
                         Ok(()) => {
@@ -1406,7 +1491,7 @@ impl App {
         f.render_widget(detail, h[1]);
 
         let hint = match mode {
-            ListMode::Browse => vec![("j/k", "move"), ("esc", "back")],
+            ListMode::Browse => vec![("j/k", "move"), ("r", "rollback"), ("esc", "back")],
             ListMode::Edit => vec![("enter", "edit"), ("esc", "back")],
             ListMode::Run => vec![("enter", "run"), ("esc", "back")],
             ListMode::Update => vec![("enter", "update"), ("esc", "back")],

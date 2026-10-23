@@ -9,6 +9,7 @@ use axum::{
 use maud::{html, Markup};
 use serde::Deserialize;
 
+use crate::backup;
 use crate::config::{self, ProjectConfig, PRESETS};
 use crate::executor;
 use crate::state;
@@ -265,6 +266,11 @@ pub async fn new_form() -> Result<Markup, WebError> {
         merge_sources: String::new(),
         status_reports: None,
         status_context: String::new(),
+        db_mode: String::new(),
+        db_kind: String::new(),
+        db_service: String::new(),
+        db_backups: None,
+        db_keep: String::new(),
     };
     Ok(views::page(
         "Add project",
@@ -384,6 +390,20 @@ fn project_form(
         Some(id) => format!("webhookr/{id}"),
         None => "webhookr/<slug>".to_string(),
     };
+    // The database section's display defaults: a blank mode/keep (a fresh
+    // form, or a validation re-render that never saw a value) shows as
+    // auto/5 — what a save would actually store — rather than an empty
+    // control that quietly means the same thing.
+    let db_mode = if form.db_mode.trim().is_empty() {
+        "auto"
+    } else {
+        form.db_mode.trim()
+    };
+    let db_keep = if form.db_keep.trim().is_empty() {
+        "5"
+    } else {
+        form.db_keep.trim()
+    };
     html! {
         section class="page-head" { h1 { (title) } }
         @if let Some(error) = error { (views::alert("error", error)) }
@@ -458,6 +478,70 @@ fn project_form(
                     }
                 }
                 div id="deploy-fields" { (deploy_fields_markup(form)) }
+            }
+
+            fieldset {
+                legend { "Database" }
+                span class="hint" {
+                    "\"auto\" detects the Postgres/MySQL/MariaDB service in the compose file, "
+                    "and powers the pre-deploy backups a rollback restores from."
+                }
+                label {
+                    span { "Mode" }
+                    select name="db_mode" {
+                        option value="auto" selected[db_mode == "auto"] {
+                            "Auto-detect from the compose file"
+                        }
+                        option value="manual" selected[db_mode == "manual"] {
+                            "Manual — name the service below"
+                        }
+                        option value="off" selected[db_mode == "off"] {
+                            "Off — no backups, code-only rollbacks"
+                        }
+                    }
+                }
+                label {
+                    span { "Engine" span class="optional" { "manual mode only" } }
+                    select name="db_kind" {
+                        option value="postgres" selected[form.db_kind == "postgres"] {
+                            "Postgres"
+                        }
+                        option value="mysql" selected[form.db_kind == "mysql"] {
+                            "MySQL"
+                        }
+                        option value="mariadb" selected[form.db_kind == "mariadb"] {
+                            "MariaDB"
+                        }
+                    }
+                    span class="hint" {
+                        "Ignored in auto mode (detection decides at backup time) and when off."
+                    }
+                }
+                label {
+                    span { "Database service" span class="optional" { "manual mode only" } }
+                    input type="text" name="db_service" value=(form.db_service)
+                          placeholder="db";
+                    span class="hint" {
+                        "The compose service running the database, e.g. "
+                        code class="mono" { "db" } ". Ignored unless mode is manual."
+                    }
+                }
+                label class="checkbox" {
+                    input type="checkbox" name="db_backups" value="1"
+                          checked[form.db_backups.is_some()];
+                    span { "Back up the database before every deploy" }
+                    span class="hint" {
+                        "This is what makes a rollback able to restore data as well as "
+                        "code. A failed dump fails the deploy before any code changes."
+                    }
+                }
+                label {
+                    span { "Backups to keep" }
+                    input type="number" name="db_keep" value=(db_keep) min="1" step="1";
+                    span class="hint" {
+                        "Dumps kept per project; the oldest are pruned after each new one."
+                    }
+                }
             }
 
             fieldset {
@@ -583,6 +667,12 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
         merge_sources: String::new(),
         status_reports: None,
         status_context: String::new(),
+        // Nor the database section: the preview only answers for the preset.
+        db_mode: String::new(),
+        db_kind: String::new(),
+        db_service: String::new(),
+        db_backups: None,
+        db_keep: String::new(),
     };
     deploy_fields_markup(&form)
 }
@@ -702,9 +792,7 @@ pub struct SlugQuery {
 /// that pair. A separate manual URL field (`name="repository"`) takes
 /// precedence when filled, paired with a `<select>` of all github keys for the
 /// manual-URL case. No inline JavaScript is needed — the CSP forbids it.
-pub async fn github_repos(
-    Query(query): Query<RepoPickerQuery>,
-) -> Result<maud::Markup, WebError> {
+pub async fn github_repos(Query(query): Query<RepoPickerQuery>) -> Result<maud::Markup, WebError> {
     let cfg = config::load_config()?;
     let current_repo = query.repository.as_deref().unwrap_or("");
     let current_key = query.github_key_id.as_deref().unwrap_or("");
@@ -911,4 +999,239 @@ async fn trigger(id: &str, sync_source: bool) -> Result<Response, WebError> {
     // No new record: almost always the single-flight guard refusing a
     // concurrent run. Point at the project so the state is visible.
     Ok(Redirect::to(&format!("/projects/{id}")).into_response())
+}
+
+// ----- rollback ------------------------------------------------------------
+
+/// The confirm page's query: which run to roll back to.
+#[derive(Deserialize)]
+pub struct RollbackQuery {
+    pub to: Option<String>,
+}
+
+/// The confirm page's POST body: the chosen run, plus the restore checkbox.
+/// `restore_db` follows the checkbox-presence pattern (see
+/// [`ProjectForm::status_reports`]) — an unticked box sends no key at all.
+#[derive(Deserialize)]
+pub struct RollbackForm {
+    pub run_id: String,
+    pub restore_db: Option<String>,
+}
+
+/// Confirm rolling a project back to a recorded run.
+///
+/// A GET on purpose: the page itself changes nothing, and the destructive half
+/// is the POST from it — so a prefetched or shared link can only ever show the
+/// operator what is about to happen. That is also why the run page's rollback
+/// button needs no `hx-confirm` of its own.
+pub async fn rollback_form(
+    Path(id): Path<String>,
+    Query(query): Query<RollbackQuery>,
+) -> Result<Markup, WebError> {
+    let (_, project) = load_project(&id)?;
+
+    // The target run. An unknown (or missing) id is a broken link rather than
+    // a broken rule, so it 404s like any other unknown run.
+    let run_id = query.to.unwrap_or_default();
+    let run = state::load_runs()
+        .into_iter()
+        .find(|r| r.id == run_id.trim())
+        .ok_or_else(|| WebError::not_found("run"))?;
+
+    // A rollback replays the commit a run deployed, so the target must be a
+    // successful run of this project that recorded one. Anything else (a
+    // failed run, a run from before commits were recorded, another project's
+    // run) gets an explanation rather than a bare error — the run plainly
+    // exists, so the operator followed a real link to get here.
+    if run.project_id != project.id || run.status != "success" || run.commit.is_none() {
+        let body = html! {
+            section class="card" {
+                h1 { "Rollback " (project.name) }
+                p {
+                    "Rollback replays the commit a run deployed, so the target has to be "
+                    "a successful run of this project with a recorded commit. That run "
+                    "does not qualify, so there is nothing to roll back to."
+                }
+                div class="actions" {
+                    a class="button" href={ "/runs/" (run.id) } { "Back to the run" }
+                }
+            }
+        };
+        return Ok(views::page("Rollback", body));
+    }
+
+    // The data half, decided live rather than from a stored flag, so the page
+    // states what a rollback would do *now*: detection reads the current
+    // compose file, and the manifest says whether the dump this restore would
+    // replay still exists. Backups switched off in the project's database
+    // block skip detection entirely — there would be nothing to offer anyway.
+    let db = if project.database.backups {
+        backup::database_for(&project).await
+    } else {
+        None
+    };
+
+    let sha = run.commit.clone().unwrap_or_default();
+    // Char-boundary-safe, and the same seven characters GitHub prints.
+    let short: String = sha.chars().take(7).collect();
+
+    let body = html! {
+        section class="card" {
+            h1 { "Rollback " (project.name) }
+            p {
+                "The checkout returns to the commit this run deployed and the "
+                "deployment runs again from it. Later runs stay in the history."
+            }
+            (views::field("Roll back to", &short))
+            (views::code_field("Commit", &sha))
+            (views::field("Author", run.author.as_deref().unwrap_or("—")))
+            (views::code_field("Started (WIB)", &views::jakarta_time(&run.started_at)))
+            @if !run.message.is_empty() {
+                (views::field("Summary", &run.message))
+            }
+        }
+
+        section class="card" {
+            h2 { "Database" }
+            // The form wraps the whole section, not just the button: the
+            // restore checkbox below only posts if it sits inside the
+            // <form> element.
+            form method="post" action={ "/projects/" (project.id) "/rollback" } {
+                input type="hidden" name="run_id" value=(run.id);
+                @match db {
+                    None => {
+                        // Either detection found nothing or backups are off in
+                        // the project's database block — both mean there is no
+                        // data half to offer, so no checkbox either.
+                        p class="muted" {
+                            "No database backups configured — this rollback restores "
+                            "code only."
+                        }
+                    }
+                    Some(db) => {
+                        (views::field("Engine", db.kind.as_str()))
+                        (views::code_field("Service", &db.service))
+                        @match backup::backup_before_run(&project.id, &run.id) {
+                            Some(dump) => {
+                                (views::code_field(
+                                    "Backup taken (WIB)",
+                                    &views::jakarta_time(&dump.created_at),
+                                ))
+                                (views::code_field("Backup file", &dump.file))
+                                (views::field("Backup size", &human_size(dump.size)))
+                                label class="checkbox" {
+                                    input type="checkbox" name="restore_db" value="1"
+                                          checked;
+                                    span {
+                                        "Restore the database backup taken before that deploy"
+                                    }
+                                    span class="hint" {
+                                        "Untick to move only the code back; the database "
+                                        "keeps everything the deploys since then wrote."
+                                    }
+                                }
+                            }
+                            None => {
+                                // The run predates backups (or its dump was
+                                // pruned). Nothing to restore to that point,
+                                // so the checkbox is simply absent — an
+                                // absent checkbox cannot post restore_db.
+                                p class="warn-inline" {
+                                    "No backup was recorded before that run — the "
+                                    "database cannot be restored to that point. The "
+                                    "rollback will restore code only."
+                                }
+                            }
+                        }
+                    }
+                }
+                div class="actions" {
+                    button type="submit" class="button danger" { "Rollback now" }
+                    a class="button" href={ "/runs/" (run.id) } { "Cancel" }
+                }
+            }
+        }
+    };
+    Ok(views::page("Rollback", body))
+}
+
+/// Replay a recorded run: code to its commit, database to the dump taken
+/// before it. Everything the confirm page checked is re-checked here, because
+/// a POST can arrive stale (the history moved on) or hand-built.
+pub async fn rollback(
+    Path(id): Path<String>,
+    Form(params): Form<RollbackForm>,
+) -> Result<Response, WebError> {
+    let (_, project) = load_project(&id)?;
+
+    // The same rules the confirm page applied. A failure here is a bad
+    // request, not a missing page: the project exists, the message is about
+    // the run the form named.
+    let run = state::load_runs()
+        .into_iter()
+        .find(|r| r.id == params.run_id.trim())
+        .filter(|r| r.project_id == project.id && r.status == "success" && r.commit.is_some())
+        .ok_or_else(|| {
+            WebError::new(
+                StatusCode::BAD_REQUEST,
+                anyhow::anyhow!(
+                    "rollback needs a successful run of this project with a recorded commit"
+                ),
+            )
+        })?;
+
+    // Only when the (untickable) box was ticked. The executor re-checks that
+    // a usable dump exists, so a stale tick cannot restore a pruned file.
+    let restore_db = params.restore_db.is_some();
+
+    let before: std::collections::HashSet<String> =
+        state::load_runs().into_iter().map(|r| r.id).collect();
+
+    let handle = tokio::spawn(async move {
+        // Labelled so the run's history says a person chose to replay this
+        // deploy from the admin UI, as against a push, a manual run, or the CLI.
+        let trigger = executor::Trigger {
+            payload: None,
+            source: Some("rollback (web UI)".to_string()),
+        };
+        let result = executor::rollback_project_with(&project, &run, restore_db, trigger).await;
+        if let Err(error) = result {
+            eprintln!("webhookr: rollback failed to start: {error:#}");
+        }
+    });
+
+    // Give the executor a moment to register its `running` record so we can
+    // redirect straight to the live log instead of a stale list.
+    for _ in 0..20 {
+        if handle.is_finished() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if let Some(run) = state::load_runs()
+            .into_iter()
+            .find(|r| r.project_id == id && !before.contains(&r.id))
+        {
+            return Ok(Redirect::to(&format!("/runs/{}", run.id)).into_response());
+        }
+    }
+
+    // No new record: almost always the single-flight guard refusing a
+    // concurrent run. Point at the project so the state is visible.
+    Ok(Redirect::to(&format!("/projects/{id}")).into_response())
+}
+
+/// Bytes as KiB/MiB for the confirm page: dump sizes span orders of
+/// magnitude, and a raw byte count makes the operator do the math.
+fn human_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let size = bytes as f64;
+    if size >= KIB * KIB * KIB {
+        format!("{:.1} GiB", size / (KIB * KIB * KIB))
+    } else if size >= KIB * KIB {
+        format!("{:.1} MiB", size / (KIB * KIB))
+    } else if size >= KIB {
+        format!("{:.1} KiB", size / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }

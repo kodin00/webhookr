@@ -173,8 +173,8 @@ pub async fn install() -> Result<Outcome> {
 
     // Verify before anything touches the filesystem: this is a binary that is
     // about to be executed as the deploy user.
-    let expected =
-        expected_sum(&sums, asset).with_context(|| format!("{asset} is not listed in SHA256SUMS"))?;
+    let expected = expected_sum(&sums, asset)
+        .with_context(|| format!("{asset} is not listed in SHA256SUMS"))?;
     let actual = hex::encode(Sha256::digest(&bytes));
     if actual != expected {
         bail!("checksum mismatch for {asset}: expected {expected}, got {actual}");

@@ -1,9 +1,10 @@
 //! Command-line interface for webhookr.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
+use crate::backup;
 use crate::cloudflare;
 use crate::config::{self, ProjectConfig};
 use crate::executor;
@@ -148,6 +149,23 @@ pub enum Commands {
         #[arg(long)]
         no_pull: bool,
     },
+    /// Roll the project back to a previously successful run
+    Rollback {
+        /// Project id
+        id: String,
+        /// Run id or commit sha (a unique prefix works) to roll back to.
+        /// Absent picks the previous good deploy: the newest successful run
+        /// that is not the checkout's current HEAD.
+        #[arg(long)]
+        to: Option<String>,
+        /// Roll back code only; never restore the database
+        #[arg(long)]
+        no_db: bool,
+        /// Answer the restore prompt in advance; required to restore the
+        /// database when stdin is not a terminal
+        #[arg(long)]
+        yes: bool,
+    },
     /// Replace this binary with the latest published build
     Update {
         /// Report what would change without downloading anything
@@ -283,6 +301,7 @@ async fn handle(cmd: Commands) -> Result<()> {
         Commands::Key { id, rotate } => cmd_key(id, rotate),
         Commands::Logs { id, lines } => cmd_logs(id, lines),
         Commands::Run { id, no_pull } => cmd_run(id, no_pull).await,
+        Commands::Rollback { id, to, no_db, yes } => cmd_rollback(id, to, no_db, yes).await,
         Commands::Update { check } => cmd_update(check).await,
         Commands::Version { offline } => cmd_version(offline).await,
         Commands::Cloudflare {
@@ -633,6 +652,200 @@ async fn cmd_run(id: String, no_pull: bool) -> Result<()> {
     Ok(())
 }
 
+/// Roll a project back to a previously successful run.
+///
+/// The target always comes from recorded history, never live git state: a
+/// rollback replays a deploy webhookr already knows succeeded. `--to` is
+/// matched against run ids, then commit-sha prefixes, of this project's
+/// successful runs; without it the previous good deploy is chosen — the
+/// newest success whose commit is not the checkout's HEAD. Restoring the
+/// database is the one destructive step, so it gets the plan printed below,
+/// a y/N prompt on a TTY (skippable with `--yes`), and a refusal up front
+/// when the dump it would load does not exist: the executor would fail at
+/// that step only after already rewriting the checkout.
+async fn cmd_rollback(id: String, to: Option<String>, no_db: bool, yes: bool) -> Result<()> {
+    let cfg = config::load_config()?;
+    let p = cfg.get(&id).context(format!("unknown project id: {id}"))?;
+
+    // Only successful runs with a recorded commit can be replayed. The vec
+    // keeps `load_runs`'s newest-first order, so "first match" is "newest".
+    let candidates: Vec<state::RunRecord> = state::load_runs()
+        .into_iter()
+        .filter(|r| r.project_id == p.id && r.status == "success" && r.commit.is_some())
+        .collect();
+
+    let want = to.as_deref().map(|t| t.trim()).filter(|t| !t.is_empty());
+    let target = match want {
+        // Run ids are unique, so an exact id match settles it. Anything else
+        // is read as a commit sha prefix — operator input against their own
+        // history, so a short prefix is accepted rather than second-guessed;
+        // matching zero or several runs bails rather than guesses.
+        Some(want) => {
+            if let Some(run) = candidates.iter().find(|r| r.id == want) {
+                run.clone()
+            } else {
+                let matched: Vec<&state::RunRecord> = candidates
+                    .iter()
+                    .filter(|r| r.commit.as_deref().is_some_and(|c| c.starts_with(want)))
+                    .collect();
+                match matched.as_slice() {
+                    [only] => (*only).clone(),
+                    [] => bail!(
+                        "no successful run of {id} matches {want:?} as a run id or commit sha \
+                         prefix; only successful runs with a recorded commit can be rolled back to"
+                    ),
+                    many => bail!(
+                        "--to {want:?} is ambiguous; it matches {} successful runs: {}",
+                        many.len(),
+                        many.iter()
+                            .map(|r| {
+                                format!(
+                                    "{} ({})",
+                                    r.id,
+                                    r.commit.as_deref().map(short_sha).unwrap_or_default()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            }
+        }
+        // No target given: the previous good deploy. Comparing against HEAD is
+        // the whole point — "rolling back" to what is already checked out
+        // would just redeploy it. When HEAD cannot be read (no checkout yet,
+        // or git unusable) that filter is skipped and the newest recorded
+        // success is used.
+        None => {
+            let head = head_commit(&p.path);
+            match candidates
+                .iter()
+                .find(|r| head.as_deref() != r.commit.as_deref())
+            {
+                Some(run) => run.clone(),
+                None if candidates.is_empty() => bail!(
+                    "no successful runs with a recorded commit for {id}; nothing to roll back to"
+                ),
+                None => bail!(
+                    "the latest successful run of {id} is already checked out (HEAD {}); \
+                     pass --to <run-id|sha> to roll back to an earlier one",
+                    head.unwrap_or_default()
+                ),
+            }
+        }
+    };
+
+    // The data half: only when the operator hasn't refused it, the project
+    // takes pre-deploy backups, and a database is actually detectable.
+    // Anything less is a code-only rollback.
+    let db = if !no_db && p.database.backups {
+        backup::database_for(p).await
+    } else {
+        None
+    };
+    let restore_db = db.is_some();
+
+    println!("rollback {} to:", p.id);
+    println!("  {:<12} {}", "run:", target.id);
+    println!(
+        "  {:<12} {}",
+        "commit:",
+        target.commit.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  {:<12} {}",
+        "author:",
+        target.author.as_deref().unwrap_or("-")
+    );
+    println!("  {:<12} {}", "started:", target.started_at);
+    println!("  {:<12} {}", "message:", target.message);
+    match &db {
+        Some(db) => {
+            println!(
+                "  {:<12} {} (compose service `{}`)",
+                "database:",
+                db.kind.as_str(),
+                db.service
+            );
+            // The restore replays the dump taken immediately before the target
+            // run deployed — the data state "before the bad deploy". Without
+            // one there is nothing to load, so refuse and name the way out.
+            match backup::backup_before_run(&p.id, &target.id) {
+                Some(dump) => println!(
+                    "  {:<12} pre-deploy dump from {}",
+                    "restore:", dump.created_at
+                ),
+                None => bail!(
+                    "no pre-deploy dump exists for run {} — the restore would have nothing to \
+                     load (the run predates backups, or the dump was pruned). Re-run with \
+                     --no-db to roll back code only",
+                    target.id
+                ),
+            }
+        }
+        // Backups are on but no database was found: say so, so that "code
+        // only" reads as a decision rather than an oversight.
+        None if p.database.backups && !no_db => {
+            println!("  {:<12} none detected — code only", "database:");
+        }
+        None => {
+            println!("  {:<12} code only", "database:");
+        }
+    }
+
+    // Restoring overwrites everything the database has accumulated since the
+    // target run, so it is the one half of a rollback that gets a prompt;
+    // code-only rollbacks deploy pinned source and proceed unprompted, like
+    // `run`. A non-TTY caller (a script, the TUI's child process) cannot
+    // answer a prompt, so it must say `--yes` out loud instead.
+    if restore_db && !yes {
+        if io::stdin().is_terminal() {
+            print!(
+                "Restoring overwrites everything in the database since that run. Proceed? [y/N]: "
+            );
+            io::stdout().flush()?;
+            let answer = read_line()?.to_lowercase();
+            if answer != "y" && answer != "yes" {
+                println!("cancelled");
+                return Ok(());
+            }
+        } else {
+            bail!("--yes is required to restore the database non-interactively");
+        }
+    }
+
+    let record = executor::rollback_project(p, &target, restore_db).await?;
+    print_run_result(record);
+    Ok(())
+}
+
+/// The commit currently checked out in `path`, or `None` when there is no
+/// usable checkout (missing directory, not a repository, git unusable).
+///
+/// Reads local refs only — never handed the project's clone token — and a
+/// failure simply means the caller falls back to the newest recorded success
+/// instead of HEAD comparison.
+fn head_commit(path: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// First 8 characters of a sha: enough to tell ambiguous `--to` matches apart
+/// without pouring full 40-char shas into one line.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
 async fn cmd_update(check: bool) -> Result<()> {
     let current = update::Build::current();
     if check {
@@ -763,7 +976,8 @@ fn cmd_cloudflare(
     // Fall back to the hostname already recorded for the admin UI, so a plain
     // re-run does not silently drop the admin ingress rule.
     let admin = admin_hostname.or_else(|| cfg.web.hostname.clone());
-    let provisioned = cloudflare::provision(&api_token, hostname.as_deref(), admin.as_deref(), &cfg)?;
+    let provisioned =
+        cloudflare::provision(&api_token, hostname.as_deref(), admin.as_deref(), &cfg)?;
     let public_hostname = provisioned.config.hostname.clone();
     let admin_public = provisioned.config.admin_hostname.clone();
     cfg.web.hostname = admin_public.clone();

@@ -380,13 +380,11 @@ pub async fn self_update() -> Result<Response, WebError> {
     match update::install().await {
         Ok(update::Outcome::UpToDate(build)) => {
             let notice = format!("Already running the published build: {}", build.label());
-            Ok(
-                views::page(
-                    "Settings",
-                    settings_body(&cfg, Some(&notice), None, None, None),
-                )
-                .into_response(),
+            Ok(views::page(
+                "Settings",
+                settings_body(&cfg, Some(&notice), None, None, None),
             )
+            .into_response())
         }
         Ok(update::Outcome::Replaced { from, to, path }) => {
             println!(
@@ -405,13 +403,11 @@ pub async fn self_update() -> Result<Response, WebError> {
                 "Updated to {}. Restarting — reload this page in a few seconds.",
                 to.label()
             );
-            Ok(
-                views::page(
-                    "Settings",
-                    settings_body(&cfg, Some(&notice), None, None, None),
-                )
-                .into_response(),
+            Ok(views::page(
+                "Settings",
+                settings_body(&cfg, Some(&notice), None, None, None),
             )
+            .into_response())
         }
         Err(error) => Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -436,7 +432,10 @@ pub struct CloudflareForm {
 
 pub async fn cloudflare_form() -> Result<Markup, WebError> {
     let cfg = config::load_config()?;
-    Ok(views::page("Cloudflare Tunnel", cloudflare_body(&cfg, None)))
+    Ok(views::page(
+        "Cloudflare Tunnel",
+        cloudflare_body(&cfg, None),
+    ))
 }
 
 pub async fn cloudflare_save(Form(form): Form<CloudflareForm>) -> Result<Response, WebError> {
@@ -463,7 +462,12 @@ pub async fn cloudflare_save(Form(form): Form<CloudflareForm>) -> Result<Respons
     // for minutes, stalling the webhook listener sharing this process.
     let probe = cfg.clone();
     let provisioned = tokio::task::spawn_blocking(move || {
-        cloudflare::provision(&token, hostname_opt.as_deref(), admin_opt.as_deref(), &probe)
+        cloudflare::provision(
+            &token,
+            hostname_opt.as_deref(),
+            admin_opt.as_deref(),
+            &probe,
+        )
     })
     .await
     .map_err(|error| WebError::new(StatusCode::INTERNAL_SERVER_ERROR, error.into()))?;
@@ -581,7 +585,13 @@ pub async fn github_keys_add(Form(form): Form<GithubKeyForm>) -> Result<Response
             StatusCode::UNPROCESSABLE_ENTITY,
             views::page(
                 "Settings",
-                settings_body(&cfg, None, Some("A GitHub access token is required."), None, None),
+                settings_body(
+                    &cfg,
+                    None,
+                    Some("A GitHub access token is required."),
+                    None,
+                    None,
+                ),
             ),
         )
             .into_response());

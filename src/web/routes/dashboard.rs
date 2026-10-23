@@ -120,4 +120,3 @@ fn project_grid(cfg: &config::AppConfig) -> Markup {
         }
     }
 }
-

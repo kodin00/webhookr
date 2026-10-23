@@ -145,10 +145,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
             HeaderValue::from_static(CSP),
         );
         // Pages can contain webhook secrets; never let them sit in a cache.
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        );
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     response
 }

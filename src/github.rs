@@ -182,9 +182,7 @@ pub async fn list_repos(
 ) -> Result<Vec<RepoEntry>> {
     let client = CLIENT.as_ref().context("no HTTP client available")?;
     let base = api_base(host);
-    let mut url = format!(
-        "{base}/user/repos?type=owner&per_page=100&sort=updated&direction=desc"
-    );
+    let mut url = format!("{base}/user/repos?type=owner&per_page=100&sort=updated&direction=desc");
     let mut out = Vec::new();
     for _ in 0..5 {
         let response = client
@@ -501,15 +499,16 @@ pub fn trigger_allowed(
     }
 
     if matches!(kind, TriggerKind::Merge) && !merge_sources.is_empty() {
-        let from_listed_source = payload
-            .merge_source
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|source| {
-                merge_sources
-                    .iter()
-                    .any(|allowed| source == branch_name(allowed))
-            });
+        let from_listed_source =
+            payload
+                .merge_source
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|source| {
+                    merge_sources
+                        .iter()
+                        .any(|allowed| source == branch_name(allowed))
+                });
         if !from_listed_source {
             return Some("merge is not from one of the project's merge_sources");
         }
@@ -946,8 +945,7 @@ impl Reporter {
         let Ok(app) = config::load_config() else {
             return;
         };
-        self.target_url =
-            config::admin_base_url(&app).map(|base| format!("{base}/runs/{run_id}"));
+        self.target_url = config::admin_base_url(&app).map(|base| format!("{base}/runs/{run_id}"));
     }
 
     /// Announce that a deploy of `sha` has started. A sha already announced is
@@ -1089,7 +1087,10 @@ mod tests {
         assert_eq!(parsed, slug("github.com", "me", "site"));
 
         let rendered = format!("{parsed:?}");
-        assert!(!rendered.contains("ghp_SECRETVALUE"), "token leaked: {rendered}");
+        assert!(
+            !rendered.contains("ghp_SECRETVALUE"),
+            "token leaked: {rendered}"
+        );
         assert!(!rendered.contains('@'), "userinfo leaked: {rendered}");
 
         assert_eq!(
@@ -1161,10 +1162,8 @@ mod tests {
         assert_eq!(payload_sha(&deleted), None);
 
         // The zero sha is rejected on its own merits too.
-        let zeroes = parse_push(
-            br#"{"after":"0000000000000000000000000000000000000000"}"#,
-        )
-        .unwrap();
+        let zeroes =
+            parse_push(br#"{"after":"0000000000000000000000000000000000000000"}"#).unwrap();
         assert_eq!(payload_sha(&zeroes), None);
 
         // A `ping` parses into an empty payload rather than failing.
@@ -1412,10 +1411,16 @@ mod tests {
 
         // An empty project branch (a never-pull project) cannot match a ref,
         // so the gate is skipped rather than refusing everything.
-        assert_eq!(trigger_allowed(&TriggerKind::Push, Some(&on_main), "", &no_sources), None);
+        assert_eq!(
+            trigger_allowed(&TriggerKind::Push, Some(&on_main), "", &no_sources),
+            None
+        );
 
         // A payload-less token-mode sender chose to send and passes.
-        assert_eq!(trigger_allowed(&TriggerKind::Webhook, None, "main", &no_sources), None);
+        assert_eq!(
+            trigger_allowed(&TriggerKind::Webhook, None, "main", &no_sources),
+            None
+        );
 
         // A GitHub delivery whose body could not be read — here a `push` that
         // is not JSON at all — cannot be checked against the branch, so it
@@ -1487,7 +1492,10 @@ mod tests {
             None
         );
         let dressed = vec!["refs/heads/develop".to_string()];
-        assert_eq!(trigger_allowed(&kind, Some(&payload), "main", &dressed), None);
+        assert_eq!(
+            trigger_allowed(&kind, Some(&payload), "main", &dressed),
+            None
+        );
 
         // The branch gate still applies first, whatever the source.
         assert_eq!(
@@ -1516,7 +1524,12 @@ mod tests {
                 "base":{"ref":"main"}}}"#,
         );
         assert_eq!(
-            trigger_allowed(&TriggerKind::Merge, headless.as_ref(), "main", &develop_only),
+            trigger_allowed(
+                &TriggerKind::Merge,
+                headless.as_ref(),
+                "main",
+                &develop_only
+            ),
             Some("merge is not from one of the project's merge_sources")
         );
 
@@ -1573,7 +1586,11 @@ mod tests {
     async fn fake_github(
         status: axum::http::StatusCode,
         response_body: &'static str,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Seen>>>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Seen>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use axum::{extract::State as AxumState, routing::post, Router};
         use std::sync::{Arc, Mutex};
 
@@ -1649,13 +1666,21 @@ mod tests {
                 .unwrap_or_default()
         };
         // Without a User-Agent GitHub answers 403 for every request.
-        assert!(header("user-agent").starts_with("webhookr/"), "{:?}", header("user-agent"));
+        assert!(
+            header("user-agent").starts_with("webhookr/"),
+            "{:?}",
+            header("user-agent")
+        );
         assert_eq!(header("accept"), "application/vnd.github+json");
         assert_eq!(header("x-github-api-version"), API_VERSION);
         // Assert the shape, never the value.
         assert!(header("authorization").starts_with("Bearer "));
 
-        assert!(request.body.contains(r#""state":"success""#), "{}", request.body);
+        assert!(
+            request.body.contains(r#""state":"success""#),
+            "{}",
+            request.body
+        );
         assert!(request.body.contains("webhookr/site"), "{}", request.body);
         // An absent Details link is omitted, not sent as null.
         assert!(
@@ -1705,7 +1730,10 @@ mod tests {
             rendered.contains("cannot write commit statuses"),
             "the 404 hint is the whole point: {rendered}"
         );
-        assert!(!rendered.contains("ghp_TESTTOKEN"), "token leaked: {rendered}");
+        assert!(
+            !rendered.contains("ghp_TESTTOKEN"),
+            "token leaked: {rendered}"
+        );
 
         server.abort();
     }

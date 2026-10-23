@@ -312,7 +312,13 @@ pub(crate) async fn send_test(api_base: &str, config: &config::TelegramConfig) -
          (webhookr {})",
         env!("CARGO_PKG_VERSION")
     );
-    post_message(api_base, config.bot_token.trim(), config.chat_id.trim(), &text).await
+    post_message(
+        api_base,
+        config.bot_token.trim(),
+        config.chat_id.trim(),
+        &text,
+    )
+    .await
 }
 
 // ----- the messages --------------------------------------------------------
@@ -436,6 +442,7 @@ mod tests {
             author: None,
             triggered_by: None,
             telegram: None,
+            rollback_to: None,
         }
     }
 
@@ -477,7 +484,10 @@ mod tests {
             Some("push by alice"),
             Some("https://panel.example.com/runs/a1b2c3d4e5f6"),
         );
-        assert!(started.contains("🚀 My Site deployment started"), "{started}");
+        assert!(
+            started.contains("🚀 My Site deployment started"),
+            "{started}"
+        );
         assert!(
             started.contains("run a1b2c3d4 · commit 4f5e6d7c · author alice · push by alice"),
             "{started}"
@@ -515,10 +525,7 @@ mod tests {
             failed.contains("error: pull failed: non-fast-forward"),
             "{failed}"
         );
-        assert!(
-            failed.contains("last part of the run log"),
-            "{failed}"
-        );
+        assert!(failed.contains("last part of the run log"), "{failed}");
         assert!(failed.contains("line one\nline two"), "{failed}");
         assert!(failed.ends_with("https://panel.example.com/runs/a1b2c3d4e5f6"));
     }

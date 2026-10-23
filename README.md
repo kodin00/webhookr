@@ -9,6 +9,10 @@ built-in Docker Compose presets, and published on a real HTTPS hostname via an
 optional Cloudflare Tunnel. Manage it from a terminal UI, a CLI, or an optional
 browser dashboard.
 
+Every deploy records the commit it shipped, so a bad one can be undone:
+rollback redeploys any past successful run — restoring the database dump from
+just before it, when the project has a database.
+
 ## Install
 
 ```sh
@@ -66,6 +70,10 @@ rather than installed from a release.
 - Each run records what triggered it — `push by <user>`, `merge by <user>`,
   `workflow_dispatch by <user>`, `webhook`, `web UI`, or `cli` — shown on run
   pages, dashboard cards, and in Telegram messages.
+- Any past successful run can be rolled back: the recorded commit is checked
+  out detached and the preset re-run. Forward deploys dump the project's
+  database (when one is configured) before touching git, so a rollback
+  restores data as well as code.
 - Only one run per project at a time; a trigger arriving while that project is
   already deploying is refused rather than queued, so two pushes cannot race
   `git pull` on the same checkout.
@@ -126,6 +134,7 @@ Run `webhookr --help` for the same list.
 | `webhookr key --id <ID> [--rotate]` | Show the project's secret (and webhook URL); `--rotate` generates a new one. |
 | `webhookr logs --id <ID> [--lines <N>]` | Tail the latest run's log (default 50 lines). |
 | `webhookr run --id <ID> [--no-pull]` | Pull the latest source, then run the deployment; `--no-pull` deploys the checkout as-is. |
+| `webhookr rollback <ID> [--to <RUN-OR-SHA>] [--no-db] [--yes]` | Roll a project back to a past successful run — the most recent, or the run id / commit sha `--to` names. `--no-db` skips the database restore; prompts unless `--yes`. |
 | `webhookr cloudflare [--hostname hooks.example.com] [--admin-hostname deploy.example.com]` | Provision a Cloudflare Tunnel; at least one hostname required. Reads `CLOUDFLARE_API_TOKEN` or `--api-token`. |
 | `webhookr version [--offline]` | Show the running build and compare it with the published one. |
 | `webhookr update [--check]` | Replace this binary with the published build; `--check` only reports. |
@@ -153,6 +162,70 @@ written into the checkout's `.git/config`.
 If `--repository` is set and the project path does not exist, the first update
 clones that branch into the path. Later updates fetch, check out, and
 fast-forward the same branch.
+
+## Rollback
+
+Any past successful run can be redeployed as a rollback. webhookr fetches,
+checks out the commit that run deployed — `git checkout --detach <sha>`, never
+touching the branch — and re-runs the project's normal deploy preset. When the
+project's database has backups on, the data from just before that run is
+restored too.
+
+A rollback is operator-only: web UI, CLI, or TUI — a webhook can never start
+one. Afterwards the checkout sits detached at the old commit, and the next
+push-triggered deploy checks the branch back out and fast-forwards, so a
+rollback is transient by design. A dirty working tree is refused (git's own
+error shows in the run log); webhookr never discards uncommitted work.
+
+### From the web UI
+
+Every run page for a `success` run with a recorded commit has a **Rollback to
+this run** button. It opens a confirm page showing the commit, the preset that
+will run, and the database dump that will be restored — or a note that no dump
+was recorded and the rollback will be code-only. Confirming starts a new run.
+
+### From the CLI and TUI
+
+```sh
+webhookr rollback <id>                    # most recent successful run
+webhookr rollback <id> --to <run-or-sha>  # a specific run id or commit sha
+webhookr rollback <id> --no-db --yes      # code only, no prompt
+```
+
+In the TUI, press `r` while viewing a run to roll back to it.
+
+### Database backups
+
+Backups are the data half of a rollback, configured per project in the
+`database` section:
+
+| Setting | What it does |
+| --- | --- |
+| Mode | `auto` (default) — detect the database by asking `docker compose config` which services run Postgres, PostGIS, MySQL, or MariaDB; `manual` — you name the engine (`kind`) and compose `service`; `off` — no backups, rollbacks are code-only. |
+| Backups | On by default. Every forward deploy dumps the database **before** touching git, and a failed dump fails the deploy before any code change. |
+| Keep | How many dumps to keep per project (default 5); the oldest are pruned once a new one lands. |
+
+Dumps live under the state dir in `backups/<project>/`. Credentials resolve
+inside the container (`$POSTGRES_USER`, `$MYSQL_ROOT_PASSWORD`, …) — never
+stored or logged by webhookr.
+
+A rollback with a database first takes a `pre-rollback` safety dump of the
+current state, then restores the dump taken immediately before the run being
+undone — exactly the data state of the previously-good deploy. Postgres
+restores by dropping and recreating the public schema; MySQL and MariaDB by
+dropping and recreating the app database. If no dump was recorded for that
+run, the rollback is offered as code-only and says so. Mongo and Redis
+services can appear in a compose file but are not backed up in v1 — those
+projects roll back code-only.
+
+### Caveats
+
+- **Auto-detection covers compose-managed databases only.** Dumps and restores
+  run through the database's own compose service, so one that auto-detection
+  misses must be named with `manual`, and a fully external managed database is
+  out of scope.
+- **Shared databases are not coordinated.** Two projects deploying against one
+  database take independent dumps and can restore over each other's data.
 
 ## Web admin UI
 
@@ -243,7 +316,7 @@ the stylesheet are compiled into the binary.
 | `a` | Add a project |
 | `e` | Edit the selected project |
 | `d` | Delete the selected project |
-| `r` | Run the selected project |
+| `r` | Run the selected project; on a run, roll back to it |
 | `u` | Clone/pull and deploy the selected project |
 | `l` | View the selected project's log |
 | `c` | Configure Cloudflare Tunnel |
@@ -414,6 +487,8 @@ becomes `https://hooks.example.com/hooks/<id>`.
   `WEBHOOKR_STATE_DIR`). Per-run logs live under
   `~/.local/share/webhookr/logs/runs/<run-id>.log`, indexed by
   `~/.local/share/webhookr/runs.json`.
+- **Database backups**: `~/.local/share/webhookr/backups/<project>/` when
+  backups are on, pruned past the project's `keep` count.
 
 ## Deploying with systemd
 

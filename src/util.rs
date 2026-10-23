@@ -3,6 +3,13 @@
 use chrono::Utc;
 use uuid::Uuid;
 
+/// Serializes tests that redirect `config::state_dir()` through the
+/// process-wide `WEBHOOKR_STATE_DIR` env var: the variable is global to the
+/// process, so two such tests running in parallel (the default test harness)
+/// would write into each other's directories.
+#[cfg(test)]
+pub(crate) static STATE_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Current UTC timestamp as an RFC3339 string (second precision).
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)

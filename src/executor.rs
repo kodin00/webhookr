@@ -10,6 +10,7 @@ use std::time::Instant;
 use tokio::process::Command;
 use tokio::sync::Notify;
 
+use crate::backup;
 use crate::config::ProjectConfig;
 use crate::github;
 use crate::state::RunRecord;
@@ -45,7 +46,8 @@ fn project_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// consumes it immediately. That bounds the gap between a cancel and the
 /// child dying to "the rest of the current step", which is as good as it gets
 /// without a process group kill.
-static CANCEL: LazyLock<Mutex<HashMap<String, Arc<Notify>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static CANCEL: LazyLock<Mutex<HashMap<String, Arc<Notify>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Trip a run's cancel signal. Returns `false` when no such run is in flight
 /// (already finished, or an id that never existed) — the caller treats that as
@@ -109,6 +111,30 @@ enum SyncOutcome {
     Cancelled,
 }
 
+/// How [`run`] moves the source checkout before deploying it.
+///
+/// `Forward` and `AsIs` replace the old `sync_source: bool`; `Rollback` is the
+/// third shape. `run_id` rides along on `Rollback` (not just the sha) because
+/// the database half of a rollback needs the *target run's* id to find its
+/// pre-deploy dump, and the history wants it for `rollback_to` — threading it
+/// through the mode keeps [`run`]'s signature at one discriminator.
+#[derive(Debug)]
+enum SyncMode {
+    /// Clone or fast-forward to the branch tip, then deploy (the webhook path).
+    Forward,
+    /// Deploy the checkout exactly as it stands, without touching Git.
+    AsIs,
+    /// Detach the checkout at a previously-deployed commit and deploy that.
+    /// `sha` is guard-validated (see [`rollback_sha`]) to a full 40-hex object
+    /// name before it ever reaches git positionally; `run_id` is the run being
+    /// rolled back to; `restore_db` switches the database half on or off.
+    Rollback {
+        sha: String,
+        run_id: String,
+        restore_db: bool,
+    },
+}
+
 /// What kicked a run off.
 ///
 /// A webhook delivery carries the push payload — already HMAC-verified by
@@ -136,28 +162,63 @@ impl Trigger {
 /// Clone or fast-forward the source, then deploy it. Manual entry point
 /// (`webhookr run`, and the TUI through it).
 pub async fn run_project(p: &ProjectConfig) -> Result<RunRecord> {
-    run(p, true, Trigger::manual("cli")).await
+    run(p, SyncMode::Forward, Trigger::manual("cli")).await
 }
 
 /// [`run_project`] carrying a caller-built trigger: a webhook delivery with
 /// its verified payload, or the admin UI's buttons labelled `web UI`.
 pub async fn run_project_with(p: &ProjectConfig, trigger: Trigger) -> Result<RunRecord> {
-    run(p, true, trigger).await
+    run(p, SyncMode::Forward, trigger).await
 }
 
 /// Re-run the configured deployment without touching the Git checkout.
 /// Used only as an explicit escape hatch (`run --no-pull`, TUI "Run deployment").
 pub async fn deploy_project(p: &ProjectConfig) -> Result<RunRecord> {
-    run(p, false, Trigger::manual("cli")).await
+    run(p, SyncMode::AsIs, Trigger::manual("cli")).await
 }
 
 /// [`deploy_project`] carrying a caller-built trigger, for the admin UI's
 /// "Redeploy" button.
 pub async fn deploy_project_with(p: &ProjectConfig, trigger: Trigger) -> Result<RunRecord> {
-    run(p, false, trigger).await
+    run(p, SyncMode::AsIs, trigger).await
 }
 
-async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<RunRecord> {
+/// Roll the checkout back to the commit a past run deployed, redeploy it, and
+/// (when `restore_db`) restore the database dump taken immediately before that
+/// run. Manual entry point (`webhookr rollback`); callers default the database
+/// half on, because undoing a bad deploy usually means undoing its schema
+/// changes too.
+pub async fn rollback_project(
+    p: &ProjectConfig,
+    target: &RunRecord,
+    restore_db: bool,
+) -> Result<RunRecord> {
+    rollback_project_with(p, target, restore_db, Trigger::manual("rollback (cli)")).await
+}
+
+/// [`rollback_project`] carrying a caller-built trigger, for the admin UI's
+/// rollback button. The guard runs here, before a run id is allocated or the
+/// per-project lock taken, so an unrollable target costs nothing.
+pub async fn rollback_project_with(
+    p: &ProjectConfig,
+    target: &RunRecord,
+    restore_db: bool,
+    trigger: Trigger,
+) -> Result<RunRecord> {
+    let sha = rollback_sha(target)?;
+    run(
+        p,
+        SyncMode::Rollback {
+            sha,
+            run_id: target.id.clone(),
+            restore_db,
+        },
+        trigger,
+    )
+    .await
+}
+
+async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunRecord> {
     p.validate()?;
     crate::config::ensure_dirs()?;
 
@@ -227,7 +288,11 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         .append(true)
         .open(&log_path)
         .with_context(|| format!("failed to open log {}", log_path.display()))?;
-    let action = if sync_source { "update" } else { "deploy" };
+    let action = match &mode {
+        SyncMode::Forward => "update",
+        SyncMode::AsIs => "deploy",
+        SyncMode::Rollback { .. } => "rollback",
+    };
     writeln!(
         log,
         "# webhookr {action} {id} for {} started {started_at}",
@@ -238,6 +303,14 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
     if let Some(source) = trigger.source.as_deref() {
         writeln!(log, "# trigger: {source}")?;
     }
+
+    // The run a rollback undoes, recorded on both the `running` record and the
+    // finalized one so the history shows the chain instead of a mystery jump
+    // to an older commit.
+    let rollback_to = match &mode {
+        SyncMode::Rollback { run_id, .. } => Some(run_id.clone()),
+        _ => None,
+    };
 
     // Publish a `running` record up front so the daemon, CLI and web UI can all
     // see an in-flight deploy. `finalize` replaces it by id when the run ends.
@@ -259,23 +332,112 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         triggered_by: trigger.source.clone(),
         // Filled in once the final message has been attempted below.
         telegram: None,
+        rollback_to: rollback_to.clone(),
     }) {
         eprintln!("webhookr: could not record run start: {error:#}");
     }
+
+    // The database half, before any git step touches the checkout: a forward
+    // run dumps (so a later rollback has data to restore); a rollback with
+    // `restore_db` takes a safety dump of what is about to be overwritten and
+    // then restores the target run's pre-deploy dump. Both halves run under
+    // the per-project lock — nothing else may deploy into a database that is
+    // mid-restore — and honour the run's cancel signal, since a dump streams
+    // the same child processes a deploy does. A failure here takes the same
+    // shape as a sync failure (`error`, no deploy): a deploy whose backup did
+    // not land must not change code either, and a rollback whose safety dump
+    // failed must not overwrite the only good copy of the current data.
+    let db_error = match &mode {
+        SyncMode::Forward if p.database.backups => {
+            match backup::database_for(p).await {
+                Some(db) => {
+                    match backup::dump(p, &db, &id, "pre-deploy", &mut log, cancel.notify()).await {
+                        // Ok: the dump has already written its own step lines
+                        // into the log, and the backup the rollback will want
+                        // is now on disk.
+                        Ok(_) => None,
+                        Err(error) => {
+                            let _ = writeln!(log, "--- database backup error ---\n{error:#}");
+                            Some(format!("pre-deploy database backup failed: {error:#}"))
+                        }
+                    }
+                }
+                // Nothing detected (`off`, or no engine this version can dump):
+                // no dump, and this project's rollback story is code-only.
+                None => None,
+            }
+        }
+        SyncMode::Rollback {
+            run_id,
+            restore_db: true,
+            ..
+        } => match backup::database_for(p).await {
+            Some(db) => {
+                // The safety dump first: restoring is the one destructive step
+                // in a rollback, so it never runs without a copy of the
+                // current (bad) state already on disk.
+                match backup::dump(p, &db, &id, "pre-rollback", &mut log, cancel.notify()).await {
+                    Err(error) => {
+                        let _ = writeln!(log, "--- database backup error ---\n{error:#}");
+                        Some(format!("pre-rollback database backup failed: {error:#}"))
+                    }
+                    Ok(_) => match backup::backup_before_run(&p.id, run_id) {
+                        None => Some(format!(
+                            "no pre-deploy backup recorded for run {run_id} — rerun the rollback with the database restore disabled"
+                        )),
+                        Some(pre_deploy) => {
+                            match backup::restore(p, &db, &pre_deploy, &mut log, cancel.notify())
+                                .await
+                            {
+                                Ok(()) => None,
+                                Err(error) => {
+                                    let _ =
+                                        writeln!(log, "--- database restore error ---\n{error:#}");
+                                    Some(format!("database restore failed: {error:#}"))
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+            // `off`, a detection failure, or an engine this version cannot
+            // dump: the rollback proceeds over code alone, and the log says so
+            // plainly rather than letting a silent skip read as a restored
+            // database.
+            None => {
+                writeln!(log, "# no database detected — rolling back code only")?;
+                None
+            }
+        },
+        // As-is redeploys, forward runs with backups off, rollbacks with the
+        // database half switched off.
+        _ => None,
+    };
 
     // The sha to announce against at the start: the pushed one when we have
     // it, otherwise the checkout as it stands. A manual run carries no payload,
     // so it announces against the current HEAD, which is also what lets a
     // redeploy clear a stale red X on the commit that is actually live.
-    let start_sha = match pushed_sha.clone() {
-        Some(sha) => Some(sha),
-        None => head_sha(&p.path).await,
-    };
-    // The author to announce at the start: the pushed commit's when the
-    // payload named one, otherwise whoever the checkout is sitting on.
-    let start_author = match pushed_author.clone() {
-        Some(author) => Some(author),
-        None => head_author(&p.path).await,
+    //
+    // A rollback announces nothing here: the checkout sits on the *bad*
+    // commit at this point, and the finish status posts against the
+    // post-checkout sha — a pending on the bad commit would never resolve.
+    // The post-sync re-read of HEAD below is its first and only announcement.
+    let (start_sha, start_author) = match &mode {
+        SyncMode::Rollback { .. } => (None, None),
+        _ => (
+            match pushed_sha.clone() {
+                Some(sha) => Some(sha),
+                None => head_sha(&p.path).await,
+            },
+            // The author to announce at the start: the pushed commit's when
+            // the payload named one, otherwise whoever the checkout is
+            // sitting on.
+            match pushed_author.clone() {
+                Some(author) => Some(author),
+                None => head_author(&p.path).await,
+            },
+        ),
     };
     if let Some(reporter) = reporter.as_mut() {
         reporter.set_run_url(&id);
@@ -304,36 +466,64 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
     }
 
     // The commit this run ends up deploying, kept for the run history. A
-    // synced run re-reads HEAD after the pull, which may have moved past the
-    // sha announced above; a no-sync run deploys exactly that HEAD.
-    let mut commit = if sync_source { pushed_sha.clone() } else { start_sha };
+    // synced run re-reads HEAD after the sync, which may have moved past the
+    // sha announced above; a no-sync run deploys exactly that HEAD. A rollback
+    // starts from neither: the checkout's current HEAD is the commit being
+    // undone, and the post-checkout re-read below records the target.
+    let mut commit = match &mode {
+        SyncMode::Forward => pushed_sha.clone(),
+        SyncMode::AsIs => start_sha.clone(),
+        SyncMode::Rollback { .. } => None,
+    };
     // Its author, tracked the same way: re-read from the checkout after a
     // sync so a moved HEAD names the commit that actually deployed.
-    let mut author = if sync_source {
-        pushed_author.clone()
-    } else {
-        start_author.clone()
+    let mut author = match &mode {
+        SyncMode::Forward => pushed_author.clone(),
+        SyncMode::AsIs => start_author.clone(),
+        SyncMode::Rollback { .. } => None,
     };
 
-    let (status, state, message) = if sync_source {
-        match sync_project(p, &mut log, &log_path, cancel.notify()).await {
+    let (status, state, message) = if let Some(message) = db_error {
+        // The database half failed before any git step ran, so the deployment
+        // did not run at all — the same meaning a sync failure carries, and
+        // the same shape: `failed`/`error`, no deploy, records and reporting
+        // still finalize below.
+        ("failed", github::State::Error, message)
+    } else {
+        // Whether (and how) the checkout moves before the deploy: not at all
+        // for an as-is redeploy, to the branch tip for a forward run, to the
+        // recorded commit for a rollback. The two synced modes then share the
+        // rest of the shape — re-read HEAD, announce, deploy — so it is
+        // written once here.
+        let synced = match &mode {
+            SyncMode::AsIs => None,
+            SyncMode::Forward => Some(sync_project(p, &mut log, &log_path, cancel.notify()).await),
+            SyncMode::Rollback { sha, .. } => {
+                Some(rollback_sync(p, sha, &mut log, &log_path, cancel.notify()).await)
+            }
+        };
+        match synced {
+            None => deploy_phase(p, &mut log, &log_path, cancel.notify()).await,
             // The source could never be fetched, so the deployment did not run
             // at all. That is what GitHub's `error` means, as against a deploy
             // that ran and failed.
-            Err(message) => ("failed", github::State::Error, message),
+            Some(Err(message)) => ("failed", github::State::Error, message),
             // A cancel during sync never reached the deploy: report it as
             // cancelled, not failed, so the operator sees what they did.
-            Ok(SyncOutcome::Cancelled) => (
+            Some(Ok(SyncOutcome::Cancelled)) => (
                 "cancelled",
                 github::State::Error,
                 "cancelled by operator".to_string(),
             ),
-            Ok(SyncOutcome::Done) => {
-                // The pull may have moved HEAD past what we announced: a newer
-                // push, or a run that had already fetched. The commit actually
-                // deploying is the post-pull HEAD — record it for the history,
-                // and announce it so both shas get the final state and neither
-                // is left pending forever.
+            Some(Ok(SyncOutcome::Done)) => {
+                // The sync may have moved HEAD past what we announced — a
+                // newer push, or a run that had already fetched — or, on a
+                // rollback, moved it onto the target commit, which nothing has
+                // been announced against yet (the bad pre-checkout HEAD was
+                // deliberately skipped above). The commit actually deploying
+                // is the post-sync HEAD — record it for the history, and
+                // announce it so every sha involved gets a final state and
+                // none is left pending forever.
                 if let Some(head) = head_sha(&p.path).await {
                     commit = Some(head.clone());
                     if let Some(a) = head_author(&p.path).await {
@@ -346,8 +536,6 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
                 deploy_phase(p, &mut log, &log_path, cancel.notify()).await
             }
         }
-    } else {
-        deploy_phase(p, &mut log, &log_path, cancel.notify()).await
     };
 
     // History before GitHub: the admin UI polls `finished_at` to stop tailing
@@ -363,6 +551,7 @@ async fn run(p: &ProjectConfig, sync_source: bool, trigger: Trigger) -> Result<R
         commit,
         author,
         trigger.source.clone(),
+        rollback_to,
     )?;
     if let Some(reporter) = reporter.as_mut() {
         let text = if state == github::State::Success {
@@ -410,9 +599,11 @@ async fn deploy_phase(
         }
     };
     match outcome {
-        ExecOutcome::Cancelled => {
-            ("cancelled", github::State::Error, "cancelled by operator".to_string())
-        }
+        ExecOutcome::Cancelled => (
+            "cancelled",
+            github::State::Error,
+            "cancelled by operator".to_string(),
+        ),
         ExecOutcome::Ran(ok) => {
             let message = summary_line(log_path).unwrap_or_else(|| "no output".to_string());
             if ok {
@@ -465,19 +656,24 @@ async fn head_author(path: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The token git authenticates with for this project, resolved against the
+/// live config so a project linked to a shared github key authenticates with
+/// that key's token, and a legacy project with a per-project token still
+/// works. Local file remotes (the test fixtures) carry no token and need no
+/// auth.
+fn live_git_token(p: &ProjectConfig) -> String {
+    crate::config::load_config()
+        .map(|app| app.git_token_for(p).to_string())
+        .unwrap_or_else(|_| p.git_token.trim().to_string())
+}
+
 async fn sync_project(
     p: &ProjectConfig,
     log: &mut std::fs::File,
     log_path: &Path,
     cancel: &Notify,
 ) -> std::result::Result<SyncOutcome, String> {
-    // The clone/fetch token is resolved against the live config so a project
-    // linked to a shared github key authenticates with that key's token, and a
-    // legacy project with a per-project token still works. Local file remotes
-    // (the test fixtures) carry no token and need no auth.
-    let token = crate::config::load_config()
-        .map(|app| app.git_token_for(p).to_string())
-        .unwrap_or_else(|_| p.git_token.trim().to_string());
+    let token = live_git_token(p);
     let path = Path::new(&p.path);
     if !path.exists() {
         if p.repository.trim().is_empty() {
@@ -538,7 +734,83 @@ async fn sync_project(
     Ok(SyncOutcome::Done)
 }
 
-async fn deploy(p: &ProjectConfig, log: &mut std::fs::File, cancel: &Notify) -> Result<ExecOutcome> {
+/// A full 40-hex-digit object name — the only commit spelling the rollback
+/// path will hand to `git checkout` positionally. Short sha prefixes and
+/// anything flag-shaped (a leading `-`) are refused by the caller up front
+/// instead of being left for git to interpret.
+fn is_full_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The commit a rollback of `target` returns to, once `target` is rollable:
+/// a run that succeeded and recorded a full sha (see [`is_full_sha`]).
+///
+/// Guarded here — before a run id is allocated, the lock taken, or anything
+/// executed — so an unrollable target costs nothing, and the error names the
+/// run because the caller (CLI, admin UI) points at it by id.
+fn rollback_sha(target: &RunRecord) -> Result<String> {
+    let commit = target.commit.as_deref().unwrap_or_default();
+    if target.status == "success" && is_full_sha(commit) {
+        return Ok(commit.to_string());
+    }
+    bail!(
+        "can only roll back to a successful run with a recorded commit — \
+         run {} is {} with commit {}",
+        target.id,
+        target.status,
+        if commit.is_empty() { "none" } else { commit }
+    );
+}
+
+/// Move the checkout to a previously-deployed commit for a rollback run:
+/// fetch the branch, then detach at `sha`.
+///
+/// A sibling of [`sync_project`] rather than another branch inside it because
+/// the two share no first step: sync may clone when the checkout is missing, a
+/// rollback has nothing to clone into (no checkout means no deployed history
+/// to return to) and refuses instead. It never pulls and never touches the
+/// branch ref — the branch stays at its remote tip, so the next forward run's
+/// `checkout <branch>` + `pull --ff-only` self-heals the detached state with
+/// no operator action. `sha` arrives guard-validated to 40 hex digits, so it
+/// cannot read as a git flag.
+async fn rollback_sync(
+    p: &ProjectConfig,
+    sha: &str,
+    log: &mut std::fs::File,
+    log_path: &Path,
+    cancel: &Notify,
+) -> std::result::Result<SyncOutcome, String> {
+    if !Path::new(&p.path).join(".git").exists() {
+        return Err(format!("cannot roll back: no checkout at {}", p.path));
+    }
+    let token = live_git_token(p);
+    let git_steps: [(&str, Vec<&str>); 2] = [
+        ("fetch", vec!["fetch", "origin", p.branch.as_str()]),
+        // --detach is the point: the branch ref is left pointing at the
+        // remote tip for the next forward run to heal from.
+        ("checkout", vec!["checkout", "--detach", sha]),
+    ];
+    for (step, args) in git_steps {
+        let label = format!("git {step}");
+        let mut command = git_command(&token);
+        command.args(&args);
+        match exec(command, &p.path, &label, log, cancel).await {
+            Err(error) => return Err(format!("failed to run {label}: {error:#}")),
+            Ok(ExecOutcome::Cancelled) => return Ok(SyncOutcome::Cancelled),
+            Ok(ExecOutcome::Ran(false)) => {
+                return Err(last_error(&format!("{label} failed"), log_path));
+            }
+            Ok(ExecOutcome::Ran(true)) => {}
+        }
+    }
+    Ok(SyncOutcome::Done)
+}
+
+async fn deploy(
+    p: &ProjectConfig,
+    log: &mut std::fs::File,
+    cancel: &Notify,
+) -> Result<ExecOutcome> {
     if !Path::new(&p.path).exists() {
         bail!("project path does not exist: {}", p.path);
     }
@@ -723,6 +995,11 @@ fn read_tail(path: &Path, max_bytes: u64) -> String {
 }
 
 /// Build the [`RunRecord`], write the tail line, persist it, and return it.
+///
+/// `rollback_to` is threaded from the run's mode onto both the `running`
+/// record and this final one, so the history names the run a rollback undoes
+/// even when the rollback itself fails halfway.
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     log: &mut std::fs::File,
     id: &str,
@@ -734,6 +1011,7 @@ fn finalize(
     commit: Option<String>,
     author: Option<String>,
     triggered_by: Option<String>,
+    rollback_to: Option<String>,
 ) -> Result<RunRecord> {
     let finished_at = crate::util::now_iso();
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -750,6 +1028,7 @@ fn finalize(
         author,
         triggered_by,
         telegram: None,
+        rollback_to,
     };
 
     writeln!(
@@ -789,8 +1068,9 @@ mod tests {
     use std::io::Write;
     use std::process::Command as StdCommand;
 
-    use super::{sync_project, ExecOutcome};
+    use super::{rollback_sha, rollback_sync, sync_project, ExecOutcome};
     use crate::config::ProjectConfig;
+    use crate::state::RunRecord;
 
     #[tokio::test]
     async fn clones_missing_checkout_and_fast_forwards_existing_checkout() {
@@ -850,7 +1130,93 @@ mod tests {
             fs::read_to_string(checkout.join("version.txt")).unwrap(),
             "two"
         );
+
+        // A rollback detaches at the "one" commit. The branch must be left at
+        // "two" (the remote tip) rather than rewritten, so the next forward
+        // run heals the detached state by itself — which the final sync here
+        // proves end to end.
+        let one = git_output(&seed, &["rev-parse", "HEAD~1"]);
+        rollback_sync(&project, &one, &mut log, &log_path, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "one"
+        );
+        // Detached HEAD: `symbolic-ref -q` fails when HEAD names no branch.
+        let symbolic = StdCommand::new("git")
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(
+            !symbolic.success(),
+            "a rollback must detach HEAD, not move the branch"
+        );
+        sync_project(&project, &mut log, &log_path, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "two"
+        );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The rollback guard: only a run that succeeded and recorded a full
+    /// 40-hex sha is a rollable target. The sha later reaches `git checkout`
+    /// positionally, so a short prefix or anything flag-shaped is refused
+    /// here rather than handed to git to interpret.
+    #[test]
+    fn rollback_guard_requires_success_and_a_full_sha() {
+        let sha = "1111111111111111111111111111111111111111";
+        let mut target = run_record("success", Some(sha));
+        assert_eq!(rollback_sha(&target).unwrap(), sha);
+
+        // A failed run is never rollable, however good its commit looks.
+        target.status = "failed".into();
+        let error = rollback_sha(&target).unwrap_err().to_string();
+        assert!(error.contains("can only roll back"), "{error}");
+        assert!(
+            error.contains("run-7"),
+            "the message must name the run: {error}"
+        );
+
+        // Guard-validated sha shapes: a real-but-short prefix, nothing at all,
+        // and a flag-shaped 40-char string.
+        target.status = "success".into();
+        for bad in [
+            "1c7ad01".to_string(),
+            String::new(),
+            format!("-{}", "1".repeat(39)),
+        ] {
+            target.commit = Some(bad.clone());
+            assert!(
+                rollback_sha(&target).is_err(),
+                "{bad:?} must not be rollable"
+            );
+        }
+        target.commit = None;
+        assert!(rollback_sha(&target).is_err(), "no recorded commit");
+    }
+
+    /// A minimal run record for the rollback guard tests: only `status` and
+    /// `commit` matter to it.
+    fn run_record(status: &str, commit: Option<&str>) -> RunRecord {
+        RunRecord {
+            id: "run-7".into(),
+            project_id: "site".into(),
+            started_at: String::new(),
+            finished_at: None,
+            status: status.into(),
+            duration_ms: 0,
+            message: String::new(),
+            commit: commit.map(str::to_string),
+            author: None,
+            triggered_by: None,
+            telegram: None,
+            rollback_to: None,
+        }
     }
 
     /// Cancelling mid-run kills the child and returns `Cancelled`, so the run
@@ -915,7 +1281,17 @@ mod tests {
     /// The guard on requirement one: GitHub being unreachable must not change
     /// the outcome of a deploy.
     #[tokio::test]
+    // The std guard is held across the test's awaits on purpose: it must span
+    // the whole set_var … remove_var window, and nothing on this thread ever
+    // re-locks it, so the await points are safe.
+    #[allow(clippy::await_holding_lock)]
     async fn a_dead_github_does_not_fail_the_deploy() {
+        // Held for the whole test: WEBHOOKR_STATE_DIR is process-wide, so any
+        // other test redirecting the state dir concurrently would interleave
+        // with this one's set/remove.
+        let _state_dir = crate::util::STATE_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root =
             std::env::temp_dir().join(format!("webhookr-status-{}", crate::util::new_run_id()));
         fs::create_dir_all(&root).unwrap();
@@ -1011,7 +1387,14 @@ mod tests {
         writeln!(log, "Successfully tagged site:latest").unwrap();
 
         notifier
-            .started("Site", "a1b2c3d4e5f6", None, None, Some("push by alice"), &mut log)
+            .started(
+                "Site",
+                "a1b2c3d4e5f6",
+                None,
+                None,
+                Some("push by alice"),
+                &mut log,
+            )
             .await;
         let failed = crate::state::RunRecord {
             id: "a1b2c3d4e5f6".into(),
@@ -1025,6 +1408,7 @@ mod tests {
             author: None,
             triggered_by: Some("push by alice".into()),
             telegram: None,
+            rollback_to: None,
         };
         let delivery = notifier
             .finished("Site", &failed, "docker: no such image", &mut log)
@@ -1073,7 +1457,8 @@ mod tests {
 
     #[test]
     fn read_tail_starts_on_a_line_boundary() {
-        let path = std::env::temp_dir().join(format!("webhookr-tail-{}", crate::util::new_run_id()));
+        let path =
+            std::env::temp_dir().join(format!("webhookr-tail-{}", crate::util::new_run_id()));
         fs::write(&path, "alpha\nbravo\ncharlie\n").unwrap();
 
         // Whole file when it fits.
@@ -1092,8 +1477,11 @@ mod tests {
     fn summary_line_skips_step_headers_and_run_banner() {
         let path = std::env::temp_dir().join(format!("webhookr-sum-{}", crate::util::new_run_id()));
         // A command that produced no output leaves only the banner and header.
-        fs::write(&path, "# webhookr deploy abc for Site started now\n--- custom command ---\n")
-            .unwrap();
+        fs::write(
+            &path,
+            "# webhookr deploy abc for Site started now\n--- custom command ---\n",
+        )
+        .unwrap();
         assert_eq!(super::summary_line(&path), None);
         fs::remove_file(&path).unwrap();
     }
@@ -1105,5 +1493,16 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Run git and return its stdout, for capturing shas in fixtures.
+    fn git_output(cwd: &std::path::Path, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 }

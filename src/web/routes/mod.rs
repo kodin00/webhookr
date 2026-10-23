@@ -31,14 +31,26 @@ pub fn pages() -> Router<AppState> {
         .route("/", get(dashboard::index))
         .route("/projects", get(projects::list).post(projects::create))
         .route("/projects/new", get(projects::new_form))
-        .route("/projects/{id}", get(projects::detail).post(projects::update))
+        .route(
+            "/projects/{id}",
+            get(projects::detail).post(projects::update),
+        )
         .route("/projects/{id}/edit", get(projects::edit_form))
         .route(
             "/projects/{id}/delete",
             get(projects::delete_confirm).post(projects::delete),
         )
-        .route("/projects/{id}/secret/rotate", post(projects::rotate_secret))
+        .route(
+            "/projects/{id}/secret/rotate",
+            post(projects::rotate_secret),
+        )
         .route("/projects/{id}/deploy", post(projects::deploy))
+        // Rollback on the delete_confirm pattern: the GET confirm page changes
+        // nothing (safe to prefetch and to share), the POST replays the run.
+        .route(
+            "/projects/{id}/rollback",
+            get(projects::rollback_form).post(projects::rollback),
+        )
         .route("/projects/{id}/update-app", post(projects::update_app))
         .route("/projects/{id}/cancel", post(projects::cancel))
         .route("/runs", get(runs::index))
@@ -60,8 +72,14 @@ pub fn pages() -> Router<AppState> {
         // GitHub account credentials shared across projects: managed on the
         // Settings page so a PAT is not pasted into every project.
         .route("/settings/github-keys/add", post(settings::github_keys_add))
-        .route("/settings/github-keys/{id}/delete", post(settings::github_keys_delete))
-        .route("/settings/github-keys/{id}/test", post(settings::github_keys_test))
+        .route(
+            "/settings/github-keys/{id}/delete",
+            post(settings::github_keys_delete),
+        )
+        .route(
+            "/settings/github-keys/{id}/test",
+            post(settings::github_keys_test),
+        )
 }
 
 /// htmx fragments: bare markup, no page chrome.

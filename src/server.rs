@@ -233,9 +233,10 @@ async fn webhook(
             .unwrap_or("-"),
         payload_ref.and_then(github::payload_sha).unwrap_or("-"),
         payload_ref.and_then(github::payload_actor).unwrap_or("-"),
-        payload_ref
-            .and_then(github::payload_slug)
-            .map_or_else(|| "-".to_string(), |slug| format!("{}/{}", slug.owner, slug.repo)),
+        payload_ref.and_then(github::payload_slug).map_or_else(
+            || "-".to_string(),
+            |slug| format!("{}/{}", slug.owner, slug.repo)
+        ),
     );
 
     // A `ping` never deploys; with a non-empty filter, only the selected kinds
@@ -292,7 +293,10 @@ async fn webhook(
     std::mem::drop(tokio::spawn(async move {
         if let Err(error) = executor::run_project_with(&project, trigger).await {
             // Includes the single-flight rejection when a run is already going.
-            eprintln!("webhookr: run for {} failed to start: {error:#}", project.id);
+            eprintln!(
+                "webhookr: run for {} failed to start: {error:#}",
+                project.id
+            );
         }
     }));
 

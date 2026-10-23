@@ -100,7 +100,9 @@ pub fn jakarta_time(iso: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(iso) {
         Ok(dt) => {
             let wib = chrono::FixedOffset::east_opt(7 * 3600).expect("7h is a valid offset");
-            dt.with_timezone(&wib).format("%Y-%m-%d %H:%M:%S WIB").to_string()
+            dt.with_timezone(&wib)
+                .format("%Y-%m-%d %H:%M:%S WIB")
+                .to_string()
         }
         Err(_) => iso.to_string(),
     }

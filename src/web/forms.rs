@@ -7,7 +7,7 @@
 use anyhow::Result;
 use serde::Deserialize;
 
-use crate::config::ProjectConfig;
+use crate::config::{DatabaseConfig, ProjectConfig};
 use crate::util;
 
 fn default_branch() -> String {
@@ -16,7 +16,7 @@ fn default_branch() -> String {
 
 /// The single add/edit form. Every field the TUI's nine-step wizard collects,
 /// on one page.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProjectForm {
     pub name: String,
     #[serde(default)]
@@ -70,6 +70,32 @@ pub struct ProjectForm {
     pub status_reports: Option<String>,
     #[serde(default)]
     pub status_context: String,
+    /// Database mode: `auto` (detect from the compose file), `manual` (use
+    /// [`Self::db_kind`] + [`Self::db_service`]), or `off`. Blank reads as
+    /// `auto`; a blank *section* (see [`Self::to_project`]) means the form
+    /// predates rollbacks and the stored block rides along.
+    #[serde(default)]
+    pub db_mode: String,
+    /// Engine for manual mode: `postgres`, `mysql`, or `mariadb`. Ignored (and
+    /// blanked) in auto/off, where detection fills the engine in at backup
+    /// time — a value typed then abandoned must not lurk in the config
+    /// looking meaningful.
+    #[serde(default)]
+    pub db_kind: String,
+    /// Compose service running the database, for manual mode only. Same
+    /// blanking rule as [`Self::db_kind`].
+    #[serde(default)]
+    pub db_service: String,
+    /// Present when the "back up before deploys" checkbox is ticked. Same
+    /// presence pattern as [`Self::status_reports`]: an absent key is the only
+    /// way an unticked checkbox can announce itself.
+    #[serde(default)]
+    pub db_backups: Option<String>,
+    /// Dumps to keep per project, as a string because urlencoded forms carry
+    /// strings. Blank or unparsable falls back to 5; 0 is floored to 1 (and
+    /// [`ProjectConfig::validate`] would refuse it anyway).
+    #[serde(default)]
+    pub db_keep: String,
 }
 
 impl ProjectForm {
@@ -109,20 +135,14 @@ impl ProjectForm {
             } else {
                 let pick = self.repository_pick.trim();
                 match pick.rsplit_once('\t') {
-                    Some((url, key_id)) => {
-                        (url.trim().to_string(), key_id.trim().to_string())
-                    }
+                    Some((url, key_id)) => (url.trim().to_string(), key_id.trim().to_string()),
                     None => (pick.to_string(), self.github_key_id.trim().to_string()),
                 }
             }
         };
 
-        let git_token = existing
-            .map(|p| p.git_token.clone())
-            .unwrap_or_default();
-        let status_token = existing
-            .map(|p| p.status_token.clone())
-            .unwrap_or_default();
+        let git_token = existing.map(|p| p.git_token.clone()).unwrap_or_default();
+        let status_token = existing.map(|p| p.status_token.clone()).unwrap_or_default();
 
         let mut trigger_events = Vec::new();
         if self.trigger_push.is_some() {
@@ -150,6 +170,8 @@ impl ProjectForm {
             self.verify_mode.trim().to_string()
         };
 
+        let database = self.database(existing);
+
         let project = ProjectConfig {
             id,
             name: self.name.trim().to_string(),
@@ -169,10 +191,64 @@ impl ProjectForm {
             status_reports: self.status_reports.is_some(),
             status_token,
             status_context: self.status_context.trim().to_string(),
+            database,
         };
 
         project.validate()?;
         Ok(project)
+    }
+
+    /// The database block from the submitted fields.
+    ///
+    /// A form that carries *no* database fields at all (a client posting the
+    /// pre-rollback shape — every db_* key absent, so every field blank) is not
+    /// an operator asking for defaults; it is a client that never saw the
+    /// section. Carrying the stored block forward keeps such an edit from
+    /// resetting a `manual`/`off` setup behind the operator's back. On create
+    /// there is nothing to carry, so the same branch lands on
+    /// [`DatabaseConfig::default`], which is what the section's blanks mean
+    /// anyway.
+    fn database(&self, existing: Option<&ProjectConfig>) -> DatabaseConfig {
+        let section_submitted = !self.db_mode.trim().is_empty()
+            || !self.db_kind.trim().is_empty()
+            || !self.db_service.trim().is_empty()
+            || self.db_backups.is_some()
+            || !self.db_keep.trim().is_empty();
+        if !section_submitted {
+            return existing.map(|p| p.database.clone()).unwrap_or_default();
+        }
+
+        let mode = match self.db_mode.trim() {
+            "" => "auto".to_string(),
+            // A typo is left for validate() to reject — it is the one
+            // authority on what a valid project looks like, and silently
+            // rewriting a hand-crafted POST would hide the mistake.
+            other => other.to_string(),
+        };
+        // auto/off ignore kind + service entirely, so blank them rather than
+        // store a value that only looks like it would be used.
+        let (kind, service) = if mode == "manual" {
+            (
+                self.db_kind.trim().to_string(),
+                self.db_service.trim().to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
+        DatabaseConfig {
+            mode,
+            kind,
+            service,
+            backups: self.db_backups.is_some(),
+            keep: self
+                .db_keep
+                .trim()
+                .parse::<usize>()
+                // Includes the blank case: an empty number input posts "".
+                .map(|n| n.max(1))
+                .unwrap_or(5),
+        }
     }
 
     /// Rebuild a form from a stored project, for the edit page.
@@ -203,6 +279,11 @@ impl ProjectForm {
             merge_sources: project.merge_sources.join(", "),
             status_reports: project.status_reports.then(|| "1".to_string()),
             status_context: project.status_context.clone(),
+            db_mode: project.database.mode.clone(),
+            db_kind: project.database.kind.clone(),
+            db_service: project.database.service.clone(),
+            db_backups: project.database.backups.then(|| "1".to_string()),
+            db_keep: project.database.keep.to_string(),
         }
     }
 }
@@ -256,6 +337,13 @@ mod tests {
             merge_sources: String::new(),
             status_reports: None,
             status_context: String::new(),
+            // All blank: the shape a client predating the database section
+            // still posts, and the shape every non-database test wants.
+            db_mode: String::new(),
+            db_kind: String::new(),
+            db_service: String::new(),
+            db_backups: None,
+            db_keep: String::new(),
         }
     }
 
@@ -277,7 +365,10 @@ mod tests {
 
         let project = edited.to_project(Some(&original)).unwrap();
         assert_eq!(project.id, original.id, "id must be immutable");
-        assert_eq!(project.secret, original.secret, "secret must survive an edit");
+        assert_eq!(
+            project.secret, original.secret,
+            "secret must survive an edit"
+        );
         assert_eq!(project.name, "Renamed");
     }
 
@@ -339,10 +430,7 @@ mod tests {
                     path=/tmp/webhookr-form-test&branch=main&command=./deploy.sh&\
                     trigger_merge=1";
         let form = serde_urlencoded::from_str::<ProjectForm>(body).unwrap();
-        assert_eq!(
-            form.to_project(None).unwrap().trigger_events,
-            vec!["merge"]
-        );
+        assert_eq!(form.to_project(None).unwrap().trigger_events, vec!["merge"]);
 
         // Neither ticked: the field is simply absent from the body.
         let body = "name=My+Site&repository=https://example.com/site.git&\
@@ -395,5 +483,71 @@ mod tests {
         let mut bad = form();
         bad.branch = "--upload-pack=x".into();
         assert!(bad.to_project(None).is_err());
+    }
+
+    #[test]
+    fn database_section_parses_and_normalizes() {
+        let mut form = form();
+        form.db_mode = " manual ".into();
+        form.db_kind = " postgres ".into();
+        form.db_service = " db ".into();
+        form.db_backups = Some("1".into());
+        form.db_keep = "0".into();
+        let project = form.to_project(None).unwrap();
+        assert_eq!(project.database.mode, "manual");
+        assert_eq!(project.database.kind, "postgres");
+        assert_eq!(project.database.service, "db");
+        assert!(project.database.backups);
+        // 0 would prune every backup; validate() refuses it, and the form
+        // floors it so saving from the UI can never trip that.
+        assert_eq!(project.database.keep, 1);
+
+        // Junk keep falls back to the default rather than failing the save.
+        let mut junk = form.clone();
+        junk.db_keep = "lots".into();
+        assert_eq!(junk.to_project(None).unwrap().database.keep, 5);
+    }
+
+    #[test]
+    fn database_auto_and_off_blank_kind_and_service() {
+        // A value typed while in manual mode must not survive a switch back
+        // to auto/off, where it is dead config that only looks meaningful.
+        for mode in ["auto", "off"] {
+            let mut form = form();
+            form.db_mode = mode.into();
+            form.db_kind = "postgres".into();
+            form.db_service = "db".into();
+            let project = form.to_project(None).unwrap();
+            assert_eq!(project.database.mode, mode);
+            assert!(project.database.kind.is_empty());
+            assert!(project.database.service.is_empty());
+        }
+    }
+
+    #[test]
+    fn blank_database_section_carries_the_stored_block_forward() {
+        // The wire shape a client predating the section sends: no db_* keys
+        // at all. An edit from such a form must not reset a hand-configured
+        // block to defaults behind the operator's back.
+        let mut stored = form().to_project(None).unwrap();
+        stored.database.mode = "manual".into();
+        stored.database.kind = "mysql".into();
+        stored.database.service = "mysql-db".into();
+        stored.database.backups = false;
+        stored.database.keep = 9;
+
+        let edited = form().to_project(Some(&stored)).unwrap();
+        assert_eq!(edited.database, stored.database);
+    }
+
+    #[test]
+    fn database_mode_defaults_to_auto_when_only_other_fields_arrive() {
+        // The section is present (the checkbox is ticked) but the select came
+        // through empty — read as auto, not as a carry-forward.
+        let mut form = form();
+        form.db_backups = Some("1".into());
+        let project = form.to_project(None).unwrap();
+        assert_eq!(project.database.mode, "auto");
+        assert!(project.database.backups);
     }
 }
