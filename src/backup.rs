@@ -76,30 +76,47 @@ pub struct DbInfo {
 /// deploy time. The file probed is explicit: the operator-picked
 /// `database.compose_file`, defaulting to a compose preset's configured
 /// file. A custom-command project that picks none is opaque (its command
-/// decides what Compose sees) and detection answers none. `manual` trusts
-/// the operator's `kind`/`service` and resolves files the same way. `off`
-/// (and any detection failure) is `None`: no backups, and a rollback
+/// decides what Compose sees) and detection answers none. `manual` overrides
+/// what detection got wrong: values the operator set are trusted verbatim,
+/// blanks are filled from the same probe. `off` (and any detection failure
+/// with a blank still unfilled) is `None`: no backups, and a rollback
 /// restores code only.
 pub async fn database_for(p: &ProjectConfig) -> Option<DbInfo> {
     match p.database.mode.as_str() {
         "off" => None,
-        "manual" => Some(DbInfo {
-            // `validate` confines a manual `kind` to the three engines; a
-            // hand-edited typo still has to map somewhere, and treating it as
-            // postgres matches how the image names spell the default.
-            kind: match p.database.kind.as_str() {
-                "mysql" => DbKind::Mysql,
-                "mariadb" => DbKind::Mariadb,
-                _ => DbKind::Postgres,
-            },
-            service: p.database.service.clone(),
-            compose_files: resolve_compose_files(p),
-            profiles: if p.uses_compose() {
-                p.compose_profiles.clone()
-            } else {
-                Vec::new()
-            },
-        }),
+        "manual" => {
+            let kind = match p.database.kind.as_str() {
+                "mysql" => Some(DbKind::Mysql),
+                "mariadb" => Some(DbKind::Mariadb),
+                "postgres" => Some(DbKind::Postgres),
+                _ => None,
+            };
+            let service = {
+                let trimmed = p.database.service.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            };
+            if kind.is_some() && service.is_some() {
+                return Some(DbInfo {
+                    kind: kind.expect("checked above"),
+                    service: service.expect("checked above"),
+                    compose_files: resolve_compose_files(p),
+                    profiles: if p.uses_compose() {
+                        p.compose_profiles.clone()
+                    } else {
+                        Vec::new()
+                    },
+                });
+            }
+            // Something was left blank: fill it from the chosen file with the
+            // same probe `auto` runs, keeping whatever the operator did set.
+            let detected = detect_via_compose(p).await?;
+            Some(DbInfo {
+                kind: kind.unwrap_or(detected.kind),
+                service: service.unwrap_or(detected.service),
+                compose_files: detected.compose_files,
+                profiles: detected.profiles,
+            })
+        }
         "auto" => detect_via_compose(p).await,
         _ => None,
     }
@@ -881,6 +898,16 @@ mod tests {
         // command is resolved bare.
         assert!(db.profiles.is_empty());
 
+        // Manual with a blank is an override with nothing overridden: the
+        // blank is filled by the same probe auto runs, and here that probe
+        // has nothing to find (empty checkout, no docker), so none.
+        p.database.service.clear();
+        p.database.kind.clear();
+        assert!(
+            super::database_for(&p).await.is_none(),
+            "a blank left unfilled by detection is none, not a guess"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1074,6 +1101,25 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    /// Whether the stack's Postgres answers a trivial query right now — the
+    /// readiness probe, kept separate from [`psql`] because a failing probe
+    /// means "not yet", not a test bug.
+    async fn psql_answers(root: &std::path::Path) -> bool {
+        tokio::process::Command::new("docker")
+            .args([
+                "compose", "exec", "-T", "db", "psql", "-U", "app", "-d", "appdb", "-t", "-A",
+                "-c", "SELECT 1",
+            ])
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1")
+            .unwrap_or(false)
+    }
+
     /// One SQL statement through the stack's psql, `-t -A` so the result is
     /// bare rows — assertable without parsing table borders.
     async fn psql(root: &std::path::Path, sql: &str) -> String {
@@ -1148,30 +1194,27 @@ mod tests {
         project.deploy_preset = "compose_up".into();
         project.compose_file = "compose.yaml".into();
         project.database.mode = "manual".into();
-        project.database.kind = "postgres".into();
-        project.database.service = "db".into();
+        // Blanks on purpose: detection must fill both from the compose file.
+        project.database.kind.clear();
+        project.database.service.clear();
         project.database.backups = true;
         project.database.keep = 3;
 
         compose(&root, &["up", "-d", "--quiet-pull"]).await;
         // Postgres takes a moment to accept connections after the container
-        // reports up; pg_isready inside the service is the authoritative
-        // probe, polled so a slow first-time image pull cannot flake it.
+        // reports up — and on first boot the image runs a throwaway server
+        // for setup before shutting it down and starting the real one, which
+        // `pg_isready` alone happily mistakes for ready. So readiness is a
+        // real query, confirmed twice, polled so a slow first-time image pull
+        // cannot flake it.
         let mut ready = false;
         for _ in 0..90 {
-            let ok = tokio::process::Command::new("docker")
-                .args(["compose", "exec", "-T", "db", "pg_isready", "-U", "app"])
-                .current_dir(&root)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await
-                .map(|status| status.success())
-                .unwrap_or(false);
-            if ok {
-                ready = true;
-                break;
+            if psql_answers(&root).await {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if psql_answers(&root).await {
+                    ready = true;
+                    break;
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
@@ -1184,9 +1227,12 @@ mod tests {
         )
         .await;
 
+        // Manual with blanks: the engine and service must come from the
+        // compose file itself — the override path with nothing overridden,
+        // which is the "I already chose the file, just read it" flow.
         let db = super::database_for(&project)
             .await
-            .expect("manual mode resolves without probing");
+            .expect("manual blanks are filled from the chosen file");
         assert_eq!(db.kind, DbKind::Postgres);
         assert_eq!(db.service, "db");
 

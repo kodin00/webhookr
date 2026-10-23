@@ -584,7 +584,7 @@ fn project_form(
                         db_mode,
                         &[
                             ("auto", "Auto-detect from the compose file"),
-                            ("manual", "Manual — name the service below"),
+                            ("manual", "Manual — override what's detected"),
                             ("off", "Off — no backups, code-only rollbacks"),
                         ],
                     ))
@@ -595,13 +595,15 @@ fn project_form(
                         "db_kind",
                         &form.db_kind,
                         &[
+                            ("", "Detect from the compose file"),
                             ("postgres", "Postgres"),
                             ("mysql", "MySQL"),
                             ("mariadb", "MariaDB"),
                         ],
                     ))
                     span class="hint" {
-                        "Ignored in auto mode (detection decides at backup time) and when off."
+                        "Ignored in auto mode (detection decides at backup time) and when off. \
+                         In manual mode, the detect option reads the engine from the file."
                     }
                 }
                 label {
@@ -610,7 +612,8 @@ fn project_form(
                           placeholder="db";
                     span class="hint" {
                         "The compose service running the database, e.g. "
-                        code class="mono" { "db" } ". Ignored unless mode is manual."
+                        code class="mono" { "db" } ". In manual mode, leaving it blank reads \
+                         the service from the database compose file."
                     }
                 }
                 label {

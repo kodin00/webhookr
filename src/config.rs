@@ -422,14 +422,16 @@ impl ProjectConfig {
             other => bail!("database mode must be 'auto', 'manual', or 'off', got {other:?}"),
         }
         if self.database.mode == "manual" {
+            // Manual is an override mode, not a re-typing mode: anything left
+            // blank (kind, service) is detected from the database compose
+            // file, so only values actually set are checked here. A non-empty
+            // kind has to be a real engine — a typo would silently override
+            // detection with nonsense.
             match self.database.kind.as_str() {
-                "postgres" | "mysql" | "mariadb" => {}
+                "postgres" | "mysql" | "mariadb" | "" => {}
                 other => {
                     bail!("database kind must be 'postgres', 'mysql', or 'mariadb', got {other:?}")
                 }
-            }
-            if self.database.service.trim().is_empty() {
-                bail!("manual database mode needs the compose service name");
             }
             if self.database.service.starts_with('-') {
                 bail!("database service may not start with '-'");
