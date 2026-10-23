@@ -249,9 +249,148 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 
 .radio-group { display: flex; flex-direction: column; gap: 0.5rem; }
 .radio, .checkbox { display: flex; gap: 0.6rem; align-items: flex-start; margin-bottom: 0; }
-.radio input, .checkbox input { margin-top: 0.28rem; }
+/* The native circles/squares stay native; accent-color just retints them to
+   the theme so they stop being the browser's default blue. */
+.radio input, .checkbox input { margin-top: 0.28rem; accent-color: var(--accent); }
 .radio-text { display: flex; flex-direction: column; }
 .checkbox > span { display: flex; flex-direction: column; }
+
+/* ----- themed form components (views::dropdown / views::checkbox) -------- */
+
+/* Single-choice dropdown: a <details> menu of real radios, so the chosen
+   value POSTs with the form with no script involved. ui.js only closes the
+   menu once a radio is picked or the click lands elsewhere. */
+.select { position: relative; }
+.select-menu summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin: 0;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.95rem;
+  cursor: pointer;
+  list-style: none;
+}
+/* Chrome still draws its own disclosure triangle over summaries. */
+.select-menu summary::-webkit-details-marker { display: none; }
+.select-menu summary:hover { border-color: var(--accent); }
+.select-menu summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* Caret: a rotated corner of borders — no image, no inline style. */
+.select-caret {
+  flex: none;
+  width: 0.4rem;
+  height: 0.4rem;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: rotate(45deg);
+  transition: transform 0.15s ease;
+}
+.select-menu[open] .select-caret { transform: rotate(225deg); }
+/* The menu must float over whatever follows the field, not push it down. */
+.select-options {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  margin: 0;
+  padding: 0.25rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 16rem;
+  overflow-y: auto;
+}
+.select-options label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0.35rem 0.5rem;
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+.select-options label:hover { background: var(--bg); }
+/* The real radio stays in the tab order but out of sight; its state and
+   focus are mirrored onto the visible span beside it. */
+.select-options input {
+  position: absolute;
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  opacity: 0;
+}
+.select-options input:checked + span { color: var(--accent); font-weight: 600; }
+.select-options input:focus-visible + span {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+/* Themed checkbox: the real input is visually hidden — not display: none,
+   which would drop it from the tab order — and the box beside it carries
+   the visuals via sibling selectors. */
+label.checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  margin: 0;
+  cursor: pointer;
+}
+/* Matches the spacing .form label gives every other control. */
+.form label.checkbox { margin-bottom: 0.9rem; }
+.checkbox .checkbox-input {
+  position: absolute;
+  width: 1.1rem;
+  height: 1.1rem;
+  margin: 0;
+  opacity: 0;
+}
+.checkbox .checkbox-box {
+  flex: none;
+  position: relative;
+  display: block;
+  width: 1.1rem;
+  height: 1.1rem;
+  margin-top: 0.2rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+label.checkbox:hover .checkbox-box { border-color: var(--accent); }
+/* The check is a rotated corner of borders; white on the accent fill matches
+   .button.primary, the app's existing white-on-accent pairing. */
+.checkbox .checkbox-box::after {
+  content: "";
+  position: absolute;
+  left: 0.3rem;
+  top: 0.14rem;
+  width: 0.3rem;
+  height: 0.55rem;
+  border-right: 2px solid #fff;
+  border-bottom: 2px solid #fff;
+  transform: rotate(45deg);
+  opacity: 0;
+}
+.checkbox .checkbox-input:checked + .checkbox-box {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.checkbox .checkbox-input:checked + .checkbox-box::after { opacity: 1; }
+.checkbox .checkbox-input:focus-visible + .checkbox-box {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 
 /* ----- alerts ----------------------------------------------------------- */
 
@@ -353,6 +492,15 @@ td a:hover { text-decoration: underline; }
   overflow-y: auto;
 }
 .browser-list li { padding: 0.1rem 0; }
+/* A file row in the compose picker: name on the left, action on the right. */
+.browser-file {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.15rem 0;
+  flex-wrap: wrap;
+}
 
 details summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; margin: 0.5rem 0; }
 

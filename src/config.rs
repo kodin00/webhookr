@@ -158,10 +158,12 @@ pub fn deploy_command_preview(project: &ProjectConfig) -> String {
 /// How a project's database is treated by pre-deploy backups and rollback
 /// restores.
 ///
-/// Detection is best-effort: compose presets are probed through
-/// `docker compose config`, and anything else (or a detection the operator
-/// disagrees with) is spelled out by hand with `manual`. `off` disables both
-/// halves — no dumps are taken and a rollback restores code only.
+/// Detection is best-effort: the database's compose file — the one the
+/// operator picked, defaulting to a compose preset's configured file — is
+/// probed through `docker compose config`, and anything else (or a detection
+/// the operator disagrees with) is spelled out by hand with `manual`. `off`
+/// disables both halves — no dumps are taken and a rollback restores code
+/// only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DatabaseConfig {
     /// `auto` (detect from the compose file), `manual` (use `kind` +
@@ -175,6 +177,13 @@ pub struct DatabaseConfig {
     /// Name of the compose service running the database, for `manual` mode.
     #[serde(default)]
     pub service: String,
+    /// Compose file (relative to the project path) that defines the database
+    /// service — for projects whose deploy command is a custom command
+    /// wrapping Compose with files of its own. Empty: a compose preset probes
+    /// its configured `compose_file`; a custom-command project has nothing to
+    /// probe and detection answers none.
+    #[serde(default)]
+    pub compose_file: String,
     /// Whether forward deploys dump the database before touching git. This is
     /// what makes a rollback able to restore data, so a failed dump fails the
     /// deploy *before* any code change.
@@ -192,6 +201,7 @@ impl Default for DatabaseConfig {
             mode: default_db_mode(),
             kind: String::new(),
             service: String::new(),
+            compose_file: String::new(),
             backups: default_db_backups(),
             keep: default_db_keep(),
         }
@@ -423,6 +433,16 @@ impl ProjectConfig {
             }
             if self.database.service.starts_with('-') {
                 bail!("database service may not start with '-'");
+            }
+        }
+        // The database's own compose file, when one is named: the same
+        // containment the preset's compose file gets (relative, inside the
+        // project), plus the leading-'-' refusal — it reaches the docker
+        // command line positionally after `-f`.
+        if !self.database.compose_file.is_empty() {
+            validate_relative_file(&self.database.compose_file)?;
+            if self.database.compose_file.starts_with('-') {
+                bail!("database compose file may not start with '-'");
             }
         }
         if self.database.keep == 0 {

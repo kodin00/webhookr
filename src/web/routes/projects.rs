@@ -104,10 +104,22 @@ pub async fn detail(
     // this card honest about what a rollback here would actually restore.
     let database = backup::database_for(&project).await;
     let backups = backup::load_index(&project.id);
-    let database_label = match &database {
-        Some(db) => format!("{} — service “{}”", db.kind.as_str(), db.service),
-        None if project.database.mode == "off" => "off — rollbacks restore code only".to_string(),
-        None => "none detected — rollbacks restore code only".to_string(),
+    let database_label = {
+        let label = match &database {
+            Some(db) => format!("{} — service “{}”", db.kind.as_str(), db.service),
+            None if project.database.mode == "off" => {
+                "off — rollbacks restore code only".to_string()
+            }
+            None => "none detected — rollbacks restore code only".to_string(),
+        };
+        // Name the compose file detection is pinned to, when one is set: it
+        // is the difference between "nothing there" and "wrong file", and
+        // this card is what an operator reads before trusting a rollback.
+        if project.database.compose_file.is_empty() {
+            label
+        } else {
+            format!("{label} · {}", project.database.compose_file)
+        }
     };
     let backups_label = if project.database.backups {
         format!("on, keeping the newest {}", project.database.keep)
@@ -347,6 +359,7 @@ pub async fn new_form() -> Result<Markup, WebError> {
         db_mode: String::new(),
         db_kind: String::new(),
         db_service: String::new(),
+        db_compose_file: String::new(),
         db_backups: None,
         db_keep: String::new(),
     };
@@ -566,31 +579,27 @@ fn project_form(
                 }
                 label {
                     span { "Mode" }
-                    select name="db_mode" {
-                        option value="auto" selected[db_mode == "auto"] {
-                            "Auto-detect from the compose file"
-                        }
-                        option value="manual" selected[db_mode == "manual"] {
-                            "Manual — name the service below"
-                        }
-                        option value="off" selected[db_mode == "off"] {
-                            "Off — no backups, code-only rollbacks"
-                        }
-                    }
+                    (views::dropdown(
+                        "db_mode",
+                        db_mode,
+                        &[
+                            ("auto", "Auto-detect from the compose file"),
+                            ("manual", "Manual — name the service below"),
+                            ("off", "Off — no backups, code-only rollbacks"),
+                        ],
+                    ))
                 }
                 label {
                     span { "Engine" span class="optional" { "manual mode only" } }
-                    select name="db_kind" {
-                        option value="postgres" selected[form.db_kind == "postgres"] {
-                            "Postgres"
-                        }
-                        option value="mysql" selected[form.db_kind == "mysql"] {
-                            "MySQL"
-                        }
-                        option value="mariadb" selected[form.db_kind == "mariadb"] {
-                            "MariaDB"
-                        }
-                    }
+                    (views::dropdown(
+                        "db_kind",
+                        &form.db_kind,
+                        &[
+                            ("postgres", "Postgres"),
+                            ("mysql", "MySQL"),
+                            ("mariadb", "MariaDB"),
+                        ],
+                    ))
                     span class="hint" {
                         "Ignored in auto mode (detection decides at backup time) and when off."
                     }
@@ -604,15 +613,40 @@ fn project_form(
                         code class="mono" { "db" } ". Ignored unless mode is manual."
                     }
                 }
-                label class="checkbox" {
-                    input type="checkbox" name="db_backups" value="1"
-                          checked[form.db_backups.is_some()];
-                    span { "Back up the database before every deploy" }
+                label {
+                    span { "Database compose file" span class="optional" { "optional" } }
+                    span class="input-row" {
+                        input type="text" id="db_compose_file" name="db_compose_file"
+                              class="mono" value=(form.db_compose_file)
+                              placeholder="docker-compose.yml";
+                        // The picker browses inside the checkout, so without
+                        // a path there is nothing to list — the button waits
+                        // and the hint names what to fill in first.
+                        button type="button" class="button small"
+                               disabled[form.path.trim().is_empty()]
+                               hx-get="/f/browse-files"
+                               hx-vals=(browse_files_vals(form.path.trim()))
+                               hx-target="#db-file-browser" hx-swap="innerHTML" { "Browse…" }
+                    }
                     span class="hint" {
-                        "This is what makes a rollback able to restore data as well as "
-                        "code. A failed dump fails the deploy before any code changes."
+                        "The compose file auto-detect reads, relative to the checkout. "
+                        "Leave empty to use the preset's compose file; a custom-command "
+                        "project must name the file that defines the database service."
+                        @if form.path.trim().is_empty() {
+                            " Fill in the path on this server above to enable Browse."
+                        }
                     }
                 }
+                div id="db-file-browser" {}
+                (views::checkbox(
+                    "db_backups",
+                    form.db_backups.is_some(),
+                    "Back up the database before every deploy",
+                    Some(
+                        "This is what makes a rollback able to restore data as well as \
+                         code. A failed dump fails the deploy before any code changes.",
+                    ),
+                ))
                 label {
                     span { "Backups to keep" }
                     input type="number" name="db_keep" value=(db_keep) min="1" step="1";
@@ -654,24 +688,25 @@ fn project_form(
                     "Which GitHub deliveries start a deploy. Leave both unticked to deploy on "
                     "every delivery (the default)."
                 }
-                label class="checkbox" {
-                    input type="checkbox" name="trigger_push" value="1"
-                          checked[form.trigger_push.is_some()];
-                    span { "Push" }
-                    span class="hint" {
-                        "A push to the configured branch — including the merge commit pushed "
-                        "after a PR merge."
-                    }
-                }
-                label class="checkbox" {
-                    input type="checkbox" name="trigger_merge" value="1"
-                          checked[form.trigger_merge.is_some()];
-                    span { "Merge" }
-                    span class="hint" {
-                        "A pull request closed and merged. Needs the pull_request event enabled "
-                        "in your GitHub webhook settings; a ping never triggers a deploy."
-                    }
-                }
+                (views::checkbox(
+                    "trigger_push",
+                    form.trigger_push.is_some(),
+                    "Push",
+                    Some(
+                        "A push to the configured branch — including the merge commit \
+                         pushed after a PR merge.",
+                    ),
+                ))
+                (views::checkbox(
+                    "trigger_merge",
+                    form.trigger_merge.is_some(),
+                    "Merge",
+                    Some(
+                        "A pull request closed and merged. Needs the pull_request event \
+                         enabled in your GitHub webhook settings; a ping never triggers \
+                         a deploy.",
+                    ),
+                ))
 
                 label {
                     span { "Merge from branches" span class="optional" { "optional" } }
@@ -687,16 +722,16 @@ fn project_form(
             fieldset {
                 legend { "GitHub commit status" }
 
-                label class="checkbox" {
-                    input type="checkbox" name="status_reports" value="1"
-                          checked[form.status_reports.is_some()];
-                    span { "Report deploy results on the commit" }
-                }
-                span class="hint" {
-                    "GitHub shows the pending dot, green check or red X beside the "
-                    "deployed commit on the repository page. Statuses are posted with "
-                    "the linked GitHub key (set in Settings)."
-                }
+                (views::checkbox(
+                    "status_reports",
+                    form.status_reports.is_some(),
+                    "Report deploy results on the commit",
+                    Some(
+                        "GitHub shows the pending dot, green check or red X beside the \
+                         deployed commit on the repository page. Statuses are posted \
+                         with the linked GitHub key (set in Settings).",
+                    ),
+                ))
 
                 label {
                     span { "Context" span class="optional" { "optional" } }
@@ -716,6 +751,12 @@ fn project_form(
             }
         }
     }
+}
+
+/// JSON object for htmx's `hx-vals`, so the checkout path survives quoting
+/// intact — same trick as the directory picker's select fragment.
+fn browse_files_vals(root: &str) -> String {
+    serde_json::json!({ "root": root }).to_string()
 }
 
 /// Fragment swapped in when the preset radio changes.
@@ -749,6 +790,7 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
         db_mode: String::new(),
         db_kind: String::new(),
         db_service: String::new(),
+        db_compose_file: String::new(),
         db_backups: None,
         db_keep: String::new(),
     };
@@ -863,17 +905,24 @@ pub struct SlugQuery {
 ///
 /// Loaded into `#repo-picker` on the project form via `hx-get` on page load.
 /// `hx-include="closest form"` sends the current form values so the manual URL
-/// and key `<select>` can be pre-filled on edit or after a validation re-render.
+/// and key dropdown can be pre-filled on edit or after a validation re-render.
 ///
 /// Each repo renders as a radio whose value encodes both the clone URL and the
 /// owning key id as `"clone_url\tkey_id"`; [`ProjectForm::to_project`] splits
 /// that pair. A separate manual URL field (`name="repository"`) takes
-/// precedence when filled, paired with a `<select>` of all github keys for the
+/// precedence when filled, paired with a dropdown of all github keys for the
 /// manual-URL case. No inline JavaScript is needed — the CSP forbids it.
 pub async fn github_repos(Query(query): Query<RepoPickerQuery>) -> Result<maud::Markup, WebError> {
     let cfg = config::load_config()?;
     let current_repo = query.repository.as_deref().unwrap_or("");
     let current_key = query.github_key_id.as_deref().unwrap_or("");
+
+    // The key dropdown's options: "no key" first, then one entry per
+    // configured key — the same pairs the native select offered.
+    let mut key_options: Vec<(&str, &str)> = vec![("", "no key / public repo")];
+    for key in &cfg.github_keys {
+        key_options.push((key.id.as_str(), key.label.as_str()));
+    }
 
     // Fetch repos from every configured github key, best-effort: a key whose
     // token is bad or rate-limited should not blank out the others.
@@ -936,16 +985,7 @@ pub async fn github_repos(Query(query): Query<RepoPickerQuery>) -> Result<maud::
         @if !cfg.github_keys.is_empty() {
             label {
                 span { "GitHub key" span class="optional" { "for a typed URL" } }
-                select name="github_key_id" {
-                    option value="" selected[current_key.is_empty()] {
-                        "public repo / none"
-                    }
-                    @for key in &cfg.github_keys {
-                        option value=(key.id) selected[current_key == key.id] {
-                            (key.label)
-                        }
-                    }
-                }
+                (views::dropdown("github_key_id", current_key, &key_options))
                 span class="hint" {
                     "Used for clone, pull and commit statuses when you type a URL above."
                 }
@@ -1204,17 +1244,15 @@ pub async fn rollback_form(
                                 ))
                                 (views::code_field("Backup file", &dump.file))
                                 (views::field("Backup size", &human_size(dump.size)))
-                                label class="checkbox" {
-                                    input type="checkbox" name="restore_db" value="1"
-                                          checked;
-                                    span {
-                                        "Restore the database backup taken before that deploy"
-                                    }
-                                    span class="hint" {
-                                        "Untick to move only the code back; the database "
-                                        "keeps everything the deploys since then wrote."
-                                    }
-                                }
+                                (views::checkbox(
+                                    "restore_db",
+                                    true,
+                                    "Restore the database backup taken before that deploy",
+                                    Some(
+                                        "Untick to move only the code back; the database \
+                                         keeps everything the deploys since then wrote.",
+                                    ),
+                                ))
                             }
                             None => {
                                 // The run predates backups (or its dump was

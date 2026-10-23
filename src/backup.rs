@@ -64,7 +64,7 @@ pub struct DbInfo {
     /// than the one detection probed.
     pub compose_files: Vec<String>,
     /// Compose profiles that were part of the resolution (compose presets
-    /// only; a scanned stack is probed exactly as it stands).
+    /// only — an operator-named file on a custom command is probed bare).
     pub profiles: Vec<String>,
 }
 
@@ -73,9 +73,10 @@ pub struct DbInfo {
 /// `auto` asks Compose itself (`docker compose -f … config --format json`)
 /// which services run a known database image — delegating the parsing means
 /// `env_file`, variables and `extends` all resolve the same way they do at
-/// deploy time. A compose preset names the file to probe; a custom-command
-/// deploy is opaque (its command decides what Compose sees), so the checkout
-/// is scanned for the canonical compose file names instead. `manual` trusts
+/// deploy time. The file probed is explicit: the operator-picked
+/// `database.compose_file`, defaulting to a compose preset's configured
+/// file. A custom-command project that picks none is opaque (its command
+/// decides what Compose sees) and detection answers none. `manual` trusts
 /// the operator's `kind`/`service` and resolves files the same way. `off`
 /// (and any detection failure) is `None`: no backups, and a rollback
 /// restores code only.
@@ -106,75 +107,20 @@ pub async fn database_for(p: &ProjectConfig) -> Option<DbInfo> {
 
 /// The compose files a project's database lives in.
 ///
-/// A compose preset names its file, so that is authoritative. A custom
-/// command is opaque — its command may wrap Compose in files of its own —
-/// so the checkout is scanned for the canonical names Compose itself would
-/// discover, shallowest first. Empty (nothing found) is legal: `docker
-/// compose` then falls back to its own default lookup at the project root.
+/// The file is explicit, never discovered: the operator-picked
+/// `database.compose_file` when one is named, else a compose preset's
+/// configured file. A custom-command project that names none has nothing to
+/// probe — detection answers none. Empty is legal in exactly that case:
+/// dump/restore then run with no `-f`, and Compose's own root lookup applies
+/// at dump time.
 fn resolve_compose_files(p: &ProjectConfig) -> Vec<String> {
-    if p.uses_compose() {
+    if !p.database.compose_file.is_empty() {
+        vec![p.database.compose_file.clone()]
+    } else if p.uses_compose() {
         vec![p.compose_file.clone()]
     } else {
-        scan_compose_files(&p.path)
+        Vec::new()
     }
-}
-
-/// The canonical Compose file names, in the order Compose itself prefers
-/// them within one directory.
-const COMPOSE_FILE_NAMES: [&str; 4] = [
-    "compose.yaml",
-    "compose.yml",
-    "docker-compose.yaml",
-    "docker-compose.yml",
-];
-
-/// Scan a checkout for compose files, shallowest first (path as tiebreak).
-///
-/// Deliberately conservative, because this runs on every project-page render:
-/// only the canonical names, hidden directories and dependency trees skipped,
-/// depth and result count capped so a huge checkout cannot turn the page into
-/// a filesystem walk.
-fn scan_compose_files(root: &str) -> Vec<String> {
-    /// How deep to descend from the checkout root.
-    const MAX_DEPTH: usize = 4;
-    /// How many candidates to hand back; more than a couple of stacks in one
-    /// repo is a monorepo, and probing eight files is plenty.
-    const MAX_FILES: usize = 8;
-    /// Directories that never hold the real stack but can be enormous.
-    const SKIP_DIRS: [&str; 3] = ["node_modules", "target", "vendor"];
-
-    let mut found: Vec<(usize, String)> = Vec::new();
-    let mut queue: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from(root), 0)];
-    while let Some((dir, depth)) = queue.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if file_type.is_dir() {
-                if depth < MAX_DEPTH
-                    && !name.starts_with('.')
-                    && !SKIP_DIRS.contains(&name.as_ref())
-                {
-                    queue.push((entry.path(), depth + 1));
-                }
-            } else if COMPOSE_FILE_NAMES.contains(&name.as_ref()) {
-                if let Ok(relative) = entry.path().strip_prefix(root) {
-                    found.push((depth, relative.to_string_lossy().into_owned()));
-                }
-            }
-        }
-    }
-    found.sort();
-    found
-        .into_iter()
-        .take(MAX_FILES)
-        .map(|(_, file)| file)
-        .collect()
 }
 
 /// Ask Compose which services the project really runs, and look for a known
@@ -634,8 +580,8 @@ async fn exec_step(
 /// from the files detection resolved (`-f` per file plus profiles, so
 /// `env_file`, variables and `extends` resolve at backup time precisely as
 /// they did at detection time), then `exec -T <service> sh -c <inner>`.
-/// With no resolved files Compose's own default lookup in the project root
-/// applies — the same rule the scan itself follows.
+/// With no resolved files (a custom-command project that named none)
+/// Compose's own default lookup in the project root applies.
 ///
 /// `-T` matters twice over: it keeps compose from allocating a TTY, which
 /// would mangle a piped dump with CRs and echo, and it is what lets stdin
@@ -887,9 +833,9 @@ mod tests {
 
     #[tokio::test]
     async fn manual_and_off_modes_resolve_without_docker() {
-        // An empty directory, not /tmp: `auto` on a custom-command project
-        // now scans the checkout, and a scan of the shared temp dir could
-        // find another test's compose file (or take arbitrarily long).
+        // A custom-command project that names no database compose file: auto
+        // has zero candidates to probe, so its answer is none without a
+        // single docker invocation — docker or no docker.
         let root =
             std::env::temp_dir().join(format!("webhookr-empty-{}", crate::util::new_run_id()));
         fs::create_dir_all(&root).unwrap();
@@ -902,8 +848,6 @@ mod tests {
             "secret".into(),
             "github".into(),
         );
-        // Custom preset with an empty checkout: the scan finds no candidates,
-        // so `auto` answers none — docker or no docker.
         p.database.mode = "auto".into();
         assert!(super::database_for(&p).await.is_none());
 
@@ -918,44 +862,24 @@ mod tests {
             .expect("manual is trusted verbatim");
         assert_eq!(db.kind, DbKind::Mariadb);
         assert_eq!(db.service, "mydb");
-        // Manual resolves files like auto does: nothing scanned in an empty
-        // checkout, so Compose's own root lookup will apply at dump time.
+        // Manual resolves files like auto does: none named on a
+        // custom-command project, so Compose's own root lookup will apply at
+        // dump time.
         assert!(db.compose_files.is_empty());
         assert!(db.profiles.is_empty());
 
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// The scan a custom-command project's `auto` mode rides on: canonical
-    /// names only, shallowest first, hidden and dependency trees skipped.
-    #[test]
-    fn scan_finds_canonical_compose_files_shallowest_first() {
-        let root =
-            std::env::temp_dir().join(format!("webhookr-scan-{}", crate::util::new_run_id()));
-        for dir in ["docker", "deep/a/b", "node_modules", ".hidden"] {
-            fs::create_dir_all(root.join(dir)).unwrap();
-        }
-        // The names that must not count, next to ones that must.
-        fs::write(root.join("compose.yaml"), "services: {}").unwrap();
-        fs::write(root.join("docker/docker-compose.yml"), "services: {}").unwrap();
-        fs::write(root.join("deep/a/b/docker-compose.yaml"), "services: {}").unwrap();
-        fs::write(root.join("node_modules/docker-compose.yml"), "x").unwrap();
-        fs::write(root.join(".hidden/compose.yaml"), "x").unwrap();
-        // A compose file with a non-canonical name: real stacks use these as
-        // extra `-f` files, but a scan that matched them would second-guess
-        // the deploy command's own file choices.
-        fs::create_dir_all(root.join("deploy")).unwrap();
-        fs::write(root.join("deploy/observability-compose.yml"), "x").unwrap();
-
-        assert_eq!(
-            super::scan_compose_files(&root.to_string_lossy()),
-            vec![
-                "compose.yaml".to_string(),
-                "docker/docker-compose.yml".to_string(),
-                "deep/a/b/docker-compose.yaml".to_string(),
-            ],
-            "canonical names only, shallowest first, skips honored"
-        );
+        // Name the database's compose file and resolution answers with it —
+        // the operator's pick, verbatim, even though the deploy command is a
+        // custom command with no preset file of its own. No probe happens in
+        // manual mode, so the file does not have to exist here.
+        p.database.compose_file = "db/compose.yaml".into();
+        let db = super::database_for(&p)
+            .await
+            .expect("manual still needs no docker");
+        assert_eq!(db.compose_files, vec!["db/compose.yaml".to_string()]);
+        // Profiles belong to compose presets; a named file on a custom
+        // command is resolved bare.
+        assert!(db.profiles.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

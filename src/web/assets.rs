@@ -16,6 +16,7 @@ use axum::{
 const HTMX: &str = include_str!("assets/htmx.min.js");
 const CSS: &str = include_str!("assets/app.css");
 const LOG_JS: &str = include_str!("assets/log.js");
+const UI_JS: &str = include_str!("assets/ui.js");
 
 /// Serve one of the embedded assets.
 ///
@@ -25,6 +26,7 @@ pub async fn asset(Path(file): Path<String>) -> Response {
         "htmx.min.js" => (HTMX, "application/javascript; charset=utf-8"),
         "app.css" => (CSS, "text/css; charset=utf-8"),
         "log.js" => (LOG_JS, "application/javascript; charset=utf-8"),
+        "ui.js" => (UI_JS, "application/javascript; charset=utf-8"),
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
 

@@ -86,6 +86,14 @@ pub struct ProjectForm {
     /// blanking rule as [`Self::db_kind`].
     #[serde(default)]
     pub db_service: String,
+    /// Compose file the `auto` detector reads, relative to the project path —
+    /// a monorepo can keep the database in `ops/db.yml` while the preset
+    /// deploys `docker-compose.yml`. Empty is valid: it means the preset's
+    /// compose file (or no detection, for a custom-command project). Rides
+    /// along on the stored block when a blank section carries it forward
+    /// (see [`Self::to_project`]).
+    #[serde(default)]
+    pub db_compose_file: String,
     /// Present when the "back up before deploys" checkbox is ticked. Same
     /// presence pattern as [`Self::status_reports`]: an absent key is the only
     /// way an unticked checkbox can announce itself.
@@ -240,6 +248,10 @@ impl ProjectForm {
             mode,
             kind,
             service,
+            // Trimmed as-is: empty is a real answer ("the preset's file /
+            // none"), not a blank to be second-guessed — only the fully
+            // blank section above carries the stored value forward.
+            compose_file: self.db_compose_file.trim().to_string(),
             backups: self.db_backups.is_some(),
             keep: self
                 .db_keep
@@ -282,6 +294,7 @@ impl ProjectForm {
             db_mode: project.database.mode.clone(),
             db_kind: project.database.kind.clone(),
             db_service: project.database.service.clone(),
+            db_compose_file: project.database.compose_file.clone(),
             db_backups: project.database.backups.then(|| "1".to_string()),
             db_keep: project.database.keep.to_string(),
         }
@@ -342,6 +355,7 @@ mod tests {
             db_mode: String::new(),
             db_kind: String::new(),
             db_service: String::new(),
+            db_compose_file: String::new(),
             db_backups: None,
             db_keep: String::new(),
         }
@@ -491,12 +505,14 @@ mod tests {
         form.db_mode = " manual ".into();
         form.db_kind = " postgres ".into();
         form.db_service = " db ".into();
+        form.db_compose_file = " ops/db.yml ".into();
         form.db_backups = Some("1".into());
         form.db_keep = "0".into();
         let project = form.to_project(None).unwrap();
         assert_eq!(project.database.mode, "manual");
         assert_eq!(project.database.kind, "postgres");
         assert_eq!(project.database.service, "db");
+        assert_eq!(project.database.compose_file, "ops/db.yml");
         assert!(project.database.backups);
         // 0 would prune every backup; validate() refuses it, and the form
         // floors it so saving from the UI can never trip that.
@@ -506,6 +522,13 @@ mod tests {
         let mut junk = form.clone();
         junk.db_keep = "lots".into();
         assert_eq!(junk.to_project(None).unwrap().database.keep, 5);
+
+        // A submitted section with the compose file cleared stores empty —
+        // that is the "use the preset's file" answer, not a blank to fill
+        // from somewhere.
+        let mut cleared = form.clone();
+        cleared.db_compose_file = "   ".into();
+        assert_eq!(cleared.to_project(None).unwrap().database.compose_file, "");
     }
 
     #[test]
@@ -533,11 +556,15 @@ mod tests {
         stored.database.mode = "manual".into();
         stored.database.kind = "mysql".into();
         stored.database.service = "mysql-db".into();
+        stored.database.compose_file = "ops/db.yml".into();
         stored.database.backups = false;
         stored.database.keep = 9;
 
         let edited = form().to_project(Some(&stored)).unwrap();
         assert_eq!(edited.database, stored.database);
+        // Called out because it is the newest field: the blank section must
+        // carry the pinned compose file along with the rest of the block.
+        assert_eq!(edited.database.compose_file, "ops/db.yml");
     }
 
     #[test]

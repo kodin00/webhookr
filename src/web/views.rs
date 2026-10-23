@@ -27,6 +27,10 @@ pub fn page(title: &str, body: Markup) -> Markup {
                 meta name="htmx-config" content=r#"{"includeIndicatorStyles":false}"#;
                 link rel="stylesheet" href={ "/static/app.css?v=" (version) };
                 script src={ "/static/htmx.min.js?v=" (version) } defer {}
+                // Behaviour shared by every page's form components (currently
+                // just closing dropdown menus). Page-specific scripts like
+                // log.js stay on the pages that need them.
+                script src={ "/static/ui.js?v=" (version) } defer {}
             }
             body {
                 header class="topbar" {
@@ -143,9 +147,86 @@ pub fn code_field(label: &str, value: &str) -> Markup {
     }
 }
 
+/// A themed single-choice dropdown: a `<details>` menu of radios, so the value
+/// POSTs natively with the form — no JavaScript needed to submit.
+///
+/// `options` is `(value, display-text)`; `current` is the stored value
+/// (anything not in options renders as its own display text). Checking a
+/// radio is all the form needs; `ui.js` only closes the menu afterwards.
+pub fn dropdown(name: &str, current: &str, options: &[(&str, &str)]) -> Markup {
+    let display = options
+        .iter()
+        .find(|(value, _)| *value == current)
+        .map(|(_, text)| *text)
+        .unwrap_or(current);
+    html! {
+        div class="select" data-select {
+            details class="select-menu" {
+                summary {
+                    span class="select-value" { (display) }
+                    span class="select-caret" aria-hidden="true" {}
+                }
+                div class="select-options" {
+                    @for (value, text) in options {
+                        label {
+                            input type="radio" id=(option_id(name, value))
+                                  name=(name) value=(value)
+                                  checked[*value == current];
+                            span { (text) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A themed checkbox: a real input (presence semantics preserved — unchecked
+/// posts nothing) made invisible, with a styled box + checkmark beside it.
+///
+/// Invisible rather than `display: none`: a hidden input keeps its focus, so
+/// the control stays keyboard-operable; the visuals live on `.checkbox-box`
+/// and react to the input through sibling selectors.
+pub fn checkbox(name: &str, checked: bool, label: &str, hint: Option<&str>) -> Markup {
+    html! {
+        label class="checkbox" {
+            input type="checkbox" class="checkbox-input" name=(name) value="1"
+                  checked[checked];
+            span class="checkbox-box" aria-hidden="true" {}
+            span class="checkbox-label" {
+                (label)
+                @if let Some(hint) = hint {
+                    span class="hint" { (hint) }
+                }
+            }
+        }
+    }
+}
+
+/// Stable id for a dropdown option's radio, derived from the field name and
+/// value: only `[a-z0-9_-]` survives, so a page rendering two dropdowns — or
+/// the same one twice — never gets duplicate element ids.
+fn option_id(name: &str, value: &str) -> String {
+    let sanitise = |ch: char| match ch {
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch.to_ascii_lowercase(),
+        _ => '-',
+    };
+    let mut id = String::with_capacity(name.len() + value.len() + 1);
+    id.extend(name.chars().map(sanitise));
+    id.push('-');
+    id.extend(value.chars().map(sanitise));
+    id
+}
+
 #[cfg(test)]
 mod tests {
-    use super::jakarta_time;
+    use super::{jakarta_time, option_id};
+
+    #[test]
+    fn option_ids_survive_values_that_are_not_id_safe() {
+        assert_eq!(option_id("db_mode", "auto"), "db_mode-auto");
+        assert_eq!(option_id("Deploy Kind", "a/b c"), "deploy-kind-a-b-c");
+    }
 
     #[test]
     fn utc_timestamps_render_as_wib() {

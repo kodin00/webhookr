@@ -96,6 +96,12 @@ pub fn fragments() -> Router<AppState> {
         .route("/f/path-check", get(browse::check))
         .route("/f/browse", get(browse::list))
         .route("/f/browse/select", get(browse::select))
+        // Compose-file picker for the database section: the directory
+        // picker's pattern rooted at the project path, so it can only walk
+        // inside the checkout, and the file it picks is what
+        // #db_compose_file stores (relative to that root).
+        .route("/f/browse-files", get(browse::files))
+        .route("/f/browse-file-select", get(browse::file_select))
         .route("/f/github-repos", get(projects::github_repos))
 }
 
