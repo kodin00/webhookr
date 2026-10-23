@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "webhookr"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -2928,6 +2928,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "form_urlencoded",
  "hex",
  "hmac",
  "maud",

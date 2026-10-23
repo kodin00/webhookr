@@ -1,6 +1,6 @@
 [package]
 name = "webhookr"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Self-hosted webhook runner: trigger git pull + deploy commands from GitHub webhooks"
 license = "MIT"
@@ -17,6 +17,7 @@ chrono = { version = "0.4", features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
 dirs = "5"
+form_urlencoded = "1"
 hex = "0.4"
 hmac = "0.12"
 maud = { version = "0.27", features = ["axum"] }

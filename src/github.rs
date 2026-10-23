@@ -339,10 +339,25 @@ pub struct Sender {
     pub login: Option<String>,
 }
 
-/// Read a webhook body as a push payload. Anything unparseable yields `None`,
-/// which simply means this run reports against the checkout instead.
+/// Read a webhook body as a push payload. The body is raw JSON for an
+/// `application/json` hook, or the `payload=<urlencoded JSON>` form field for
+/// the `application/x-www-form-urlencoded` content type GitHub creates hooks
+/// with by default. Anything unparseable yields `None`, which simply means
+/// this run reports against the checkout instead.
 pub fn parse_push(body: &[u8]) -> Option<PushPayload> {
-    serde_json::from_slice(body).ok()
+    body_json(body).and_then(|json| serde_json::from_value(json).ok())
+}
+
+/// The JSON of a webhook body, whether the sender posted it raw or wrapped in
+/// the `payload` field of a form-encoded delivery.
+fn body_json(body: &[u8]) -> Option<serde_json::Value> {
+    if let Ok(json) = serde_json::from_slice(body) {
+        return Some(json);
+    }
+    let (_, payload) = form_urlencoded::parse(body)
+        .find(|(key, _)| key == "payload")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))?;
+    serde_json::from_str(&payload).ok()
 }
 
 /// The parts of a GitHub `pull_request` payload a deploy decision needs.
@@ -385,10 +400,10 @@ pub struct PrBranch {
     pub r#ref: Option<String>,
 }
 
-/// Read a webhook body as a `pull_request` payload. Anything unparseable yields
-/// `None`, same contract as [`parse_push`].
+/// Read a webhook body as a `pull_request` payload, raw or form-encoded —
+/// same contract as [`parse_push`].
 fn parse_pull_request(body: &[u8]) -> Option<PullRequestPayload> {
-    serde_json::from_slice(body).ok()
+    body_json(body).and_then(|json| serde_json::from_value(json).ok())
 }
 
 /// The commit this push landed, or `None` when there is nothing to report on.
@@ -422,10 +437,11 @@ fn is_sha(value: &str) -> bool {
 /// starts a `main` deploy. The executor still checks it for the paths that
 /// bypass the handler's gate (token-mode senders, an empty project branch):
 /// without the check we would post a status against a commit that is not on
-/// the branch we checked out. An empty branch never matches: it is permitted
-/// in config, but only for projects that never pull.
+/// the branch we checked out. The configured branch is spelled the same way
+/// config allows it — bare, or dressed in `refs/heads/`. An empty branch never
+/// matches: it is permitted in config, but only for projects that never pull.
 pub fn ref_matches(payload: &PushPayload, branch: &str) -> bool {
-    let branch = branch.trim();
+    let branch = branch_name(branch);
     !branch.is_empty()
         && payload
             .r#ref
@@ -453,10 +469,11 @@ pub fn branch_name(value: &str) -> &str {
 /// * **Branch.** With a branch configured, a push must be to it and a merge
 ///   must land on it — the normalized merge payload's `ref` *is* the base
 ///   branch, so [`ref_matches`] covers both. This is what stops a push to
-///   `dev` from redeploying `main`. A payload-less trigger (a manual run, a
-///   token-mode sender) has nothing to check and passes; an empty project
-///   branch (a never-pull project) can never match a ref, so it skips the
-///   gate rather than refuse everything.
+///   `dev` from redeploying `main`. A payload-less token-mode sender (no
+///   GitHub event header) chose to send and passes; a GitHub delivery whose
+///   body could not be read cannot be checked and is refused rather than
+///   deployed unverified. An empty project branch (a never-pull project) can
+///   never match a ref, so it skips the gate rather than refuse everything.
 /// * **Merge source.** With `merge_sources` listed, a [`TriggerKind::Merge`]
 ///   must additionally come from one of those PR head branches — the "deploy
 ///   only what merges in from `develop`" rule. A merge that carries no source
@@ -469,8 +486,14 @@ pub fn trigger_allowed(
 ) -> Option<&'static str> {
     let payload = match payload {
         Some(payload) => payload,
-        // Nothing to check: a manual run or a token-mode sender chose to send.
-        None => return None,
+        // A token-mode sender carries no GitHub event header and chose to
+        // send, so there is nothing to check.
+        None if matches!(kind, TriggerKind::Webhook) => return None,
+        // A GitHub delivery whose body could not be read — most often a hook
+        // posting something other than JSON or form-encoded JSON. The
+        // signature proves the sender, not the branch the push landed on, so
+        // it does not deploy rather than skip the gate.
+        None => return Some("delivery body could not be read"),
     };
 
     if !ref_matches(payload, branch) && !branch.trim().is_empty() {
@@ -1159,6 +1182,9 @@ mod tests {
         let on_main = parse_push(br#"{"ref":"refs/heads/main"}"#).unwrap();
         assert!(ref_matches(&on_main, "main"));
         assert!(!ref_matches(&on_main, "dev"));
+        // The configured branch may be spelled either way.
+        assert!(ref_matches(&on_main, "refs/heads/main"));
+        assert!(ref_matches(&on_main, "  main  "));
         // An empty branch is valid config for a project that never pulls, but it
         // can never match a ref.
         assert!(!ref_matches(&on_main, ""));
@@ -1388,9 +1414,60 @@ mod tests {
         // so the gate is skipped rather than refusing everything.
         assert_eq!(trigger_allowed(&TriggerKind::Push, Some(&on_main), "", &no_sources), None);
 
-        // A payload-less trigger (a manual run, a token-mode sender) passes.
-        assert_eq!(trigger_allowed(&TriggerKind::Push, None, "main", &no_sources), None);
+        // A payload-less token-mode sender chose to send and passes.
         assert_eq!(trigger_allowed(&TriggerKind::Webhook, None, "main", &no_sources), None);
+
+        // A GitHub delivery whose body could not be read — here a `push` that
+        // is not JSON at all — cannot be checked against the branch, so it
+        // does not deploy.
+        assert_eq!(
+            trigger_allowed(&TriggerKind::Push, None, "main", &no_sources),
+            Some("delivery body could not be read")
+        );
+    }
+
+    #[test]
+    fn form_encoded_deliveries_gate_like_json_ones() {
+        // GitHub creates hooks with the `application/x-www-form-urlencoded`
+        // content type by default: the JSON rides in the `payload` field. The
+        // gate must see through the wrapping to the ref it names.
+        let form = form_urlencoded::Serializer::new(String::new())
+            .append_pair("payload", r#"{"ref":"refs/heads/main"}"#)
+            .finish();
+        let (kind, payload) = classify(Some("push"), form.as_bytes());
+        assert_eq!(kind, TriggerKind::Push);
+        let payload = payload.unwrap();
+        assert!(ref_matches(&payload, "main"));
+
+        // And an off-branch form delivery is refused, not waved through as a
+        // payload-less trigger.
+        let no_sources: Vec<String> = Vec::new();
+        assert_eq!(
+            trigger_allowed(&kind, Some(&payload), "release", &no_sources),
+            Some("delivery is not on the project's branch")
+        );
+
+        // A merge reads the same way when its body is form-encoded.
+        let merged = form_urlencoded::Serializer::new(String::new())
+            .append_pair(
+                "payload",
+                r#"{"action":"closed","pull_request":{"merged":true,
+                    "merge_commit_sha":"2222222222222222222222222222222222222222",
+                    "base":{"ref":"main"},"head":{"ref":"develop"}}}"#,
+            )
+            .finish();
+        let (kind, payload) = classify(Some("pull_request"), merged.as_bytes());
+        assert_eq!(kind, TriggerKind::Merge);
+        assert_eq!(
+            trigger_allowed(&kind, payload.as_ref(), "main", &no_sources),
+            None
+        );
+
+        // A `payload` field that is not JSON is simply not a push.
+        let junk = form_urlencoded::Serializer::new(String::new())
+            .append_pair("payload", "not json")
+            .finish();
+        assert!(parse_push(junk.as_bytes()).is_none());
     }
 
     #[test]

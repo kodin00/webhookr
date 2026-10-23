@@ -260,9 +260,10 @@ async fn webhook(
     // The branch gates. With a branch configured, only deliveries on that
     // branch start a run — a push must be to it, a merge must land on it —
     // and with `merge_sources` listed, a merge must additionally come from one
-    // of them. Payload-less triggers (a manual run, a token-mode sender) have
-    // nothing to check and pass through. Skipped deliveries still get a 2xx:
-    // the delivery was fine, it just was not a trigger.
+    // of them. A payload-less token-mode sender passes through; a GitHub
+    // delivery whose body could not be read is refused rather than deployed
+    // unverified. Skipped deliveries still get a 2xx: the delivery was fine,
+    // it just was not a trigger.
     if let Some(reason) = github::trigger_allowed(
         &kind,
         payload.as_ref(),
