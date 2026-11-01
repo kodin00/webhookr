@@ -102,7 +102,6 @@ pub fn fragments() -> Router<AppState> {
         // #db_compose_file stores (relative to that root).
         .route("/f/browse-files", get(browse::files))
         .route("/f/browse-file-select", get(browse::file_select))
-        .route("/f/github-repos", get(projects::github_repos))
 }
 
 /// HTML 404 for anything unrouted.

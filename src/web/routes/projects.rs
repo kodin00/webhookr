@@ -342,7 +342,6 @@ pub async fn new_form() -> Result<Markup, WebError> {
         name: String::new(),
         id: String::new(),
         repository: String::new(),
-        repository_pick: String::new(),
         github_key_id: String::new(),
         path: String::new(),
         branch: "main".to_string(),
@@ -411,6 +410,7 @@ pub async fn create(Form(form): Form<ProjectForm>) -> Result<Response, WebError>
         if cfg.get(&id).is_some() {
             anyhow::bail!("a project with id '{id}' already exists");
         }
+        ensure_path_free(cfg, &id, &project.path)?;
         cfg.upsert(project);
         Ok(())
     });
@@ -461,10 +461,36 @@ pub async fn update(
     };
 
     config::update_config(|cfg| {
+        ensure_path_free(cfg, &id, &project.path)?;
         cfg.upsert(project);
         Ok(())
     })?;
     Ok(Redirect::to(&format!("/projects/{id}")).into_response())
+}
+
+/// Refuse a project whose checkout path another project already uses.
+///
+/// Two projects sharing a path fight over one worktree: each run checks out
+/// its own branch, so a redeploy of either ships the other's branch tip.
+/// The branch guard on the redeploy path catches that at run time; this
+/// catches it at save time, when the fix is obvious.
+fn ensure_path_free(cfg: &config::AppConfig, id: &str, path: &str) -> anyhow::Result<()> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Ok(());
+    }
+    if let Some(other) = cfg
+        .projects
+        .iter()
+        .find(|other| other.id != id && other.path.trim() == path)
+    {
+        anyhow::bail!(
+            "project path '{path}' is already used by '{}' — \
+             each project needs its own checkout directory",
+            other.name
+        );
+    }
+    Ok(())
 }
 
 /// The add/edit form: every field the TUI's nine-step wizard collects, at once.
@@ -495,6 +521,22 @@ fn project_form(
     } else {
         form.db_keep.trim()
     };
+    // Shared github keys, for the optional key dropdown next to the
+    // repository URL. A config that cannot be read just hides the dropdown.
+    let github_cfg = config::load_config().ok();
+    let (has_github_keys, key_options) = match &github_cfg {
+        Some(cfg) => {
+            let options: Vec<(&str, &str)> = std::iter::once(("", "no key / public repo"))
+                .chain(
+                    cfg.github_keys
+                        .iter()
+                        .map(|key| (key.id.as_str(), key.label.as_str())),
+                )
+                .collect();
+            (!cfg.github_keys.is_empty(), options)
+        }
+        None => (false, vec![("", "no key / public repo")]),
+    };
     html! {
         section class="page-head" { h1 { (title) } }
         @if let Some(error) = error { (views::alert("error", error)) }
@@ -522,14 +564,24 @@ fn project_form(
                     }
                 }
 
-                // The repository picker: a list of the user's GitHub repos
-                // (fetched from the shared github keys) loads here on page
-                // load, with a manual-URL fallback. `hx-include` sends the
-                // current form values so the fragment can pre-fill the URL
-                // and key on edit or after a validation re-render.
-                div id="repo-picker"
-                     hx-get="/f/github-repos" hx-trigger="load"
-                     hx-include="closest form" hx-swap="innerHTML" {}
+                // The repository is typed by hand; no repo listing is fetched.
+                // The key dropdown appears only when shared github keys exist.
+                label {
+                    span { "Repository URL" span class="optional" { "optional if the path exists" } }
+                    input type="url" name="repository" value=(form.repository)
+                          placeholder="https://github.com/owner/repo.git";
+                    span class="hint" {
+                        "If set and the path below does not exist yet, webhookr clones it on the first run."
+                    }
+                }
+                @if has_github_keys {
+                    label {
+                        span { "GitHub key" span class="optional" { "for a private repo" } }
+                        (views::dropdown("github_key_id", &form.github_key_id, &key_options))                        span class="hint" {
+                            "Used for clone, pull and commit statuses."
+                        }
+                    }
+                }
 
                 label {
                     span { "Path on this server" }
@@ -771,7 +823,6 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
         name: String::new(),
         id: String::new(),
         repository: String::new(),
-        repository_pick: String::new(),
         github_key_id: String::new(),
         path: String::new(),
         branch: String::new(),
@@ -900,110 +951,6 @@ pub async fn slug_preview(Query(query): Query<SlugQuery>) -> Markup {
 #[derive(Deserialize)]
 pub struct SlugQuery {
     pub name: Option<String>,
-}
-
-// ----- repo picker fragment ----------------------------------------------
-
-/// Fragment: the repository picker.
-///
-/// Loaded into `#repo-picker` on the project form via `hx-get` on page load.
-/// `hx-include="closest form"` sends the current form values so the manual URL
-/// and key dropdown can be pre-filled on edit or after a validation re-render.
-///
-/// Each repo renders as a radio whose value encodes both the clone URL and the
-/// owning key id as `"clone_url\tkey_id"`; [`ProjectForm::to_project`] splits
-/// that pair. A separate manual URL field (`name="repository"`) takes
-/// precedence when filled, paired with a dropdown of all github keys for the
-/// manual-URL case. No inline JavaScript is needed — the CSP forbids it.
-pub async fn github_repos(Query(query): Query<RepoPickerQuery>) -> Result<maud::Markup, WebError> {
-    let cfg = config::load_config()?;
-    let current_repo = query.repository.as_deref().unwrap_or("");
-    let current_key = query.github_key_id.as_deref().unwrap_or("");
-
-    // The key dropdown's options: "no key" first, then one entry per
-    // configured key — the same pairs the native select offered.
-    let mut key_options: Vec<(&str, &str)> = vec![("", "no key / public repo")];
-    for key in &cfg.github_keys {
-        key_options.push((key.id.as_str(), key.label.as_str()));
-    }
-
-    // Fetch repos from every configured github key, best-effort: a key whose
-    // token is bad or rate-limited should not blank out the others.
-    let mut repos = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    for key in &cfg.github_keys {
-        match crate::github::list_repos(&key.token, &key.host, &key.id, &key.label).await {
-            Ok(mut list) => repos.append(&mut list),
-            Err(err) => errors.push(format!("{}: {err}", key.label)),
-        }
-    }
-
-    Ok(html! {
-        @if cfg.github_keys.is_empty() {
-            p class="hint" {
-                "No GitHub keys configured — add one in Settings, or type a repository URL below."
-            }
-        } @else {
-            @if !repos.is_empty() {
-                label {
-                    span { "Your repositories" }
-                    div class="radio-group" {
-                        @for repo in &repos {
-                            @let encoded = format!("{}\t{}", repo.clone_url, repo.key_id);
-                            label class="radio" {
-                                input type="radio" name="repository_pick"
-                                      value=(encoded)
-                                      checked[!current_repo.is_empty()
-                                              && current_repo == repo.clone_url];
-                                span class="radio-text" {
-                                    (repo.full_name)
-                                    @if repo.private {
-                                        span class="muted small" { " (private)" }
-                                    }
-                                    span class="muted small" { " — " (repo.key_label) }
-                                }
-                            }
-                        }
-                    }
-                    span class="hint" {
-                        "Pick a repository to link its GitHub key for clone, pull and commit statuses."
-                    }
-                }
-                p class="hint" { "— or type a URL —" }
-            }
-            @for err in &errors {
-                p class="hint warn" { (err) }
-            }
-        }
-
-        label {
-            span { "Repository URL" span class="optional" { "optional" } }
-            input type="url" name="repository" value=(current_repo)
-                  placeholder="https://github.com/owner/repo.git";
-            span class="hint" {
-                "If set and the path below does not exist yet, webhookr clones it on the first run."
-            }
-        }
-
-        @if !cfg.github_keys.is_empty() {
-            label {
-                span { "GitHub key" span class="optional" { "for a typed URL" } }
-                (views::dropdown("github_key_id", current_key, &key_options))
-                span class="hint" {
-                    "Used for clone, pull and commit statuses when you type a URL above."
-                }
-            }
-        }
-    })
-}
-
-/// The subset of the form the repo picker needs to pre-fill its fields. Sent by
-/// `hx-include="closest form"`, so every other field arrives too and is simply
-/// ignored.
-#[derive(Deserialize)]
-pub struct RepoPickerQuery {
-    pub repository: Option<String>,
-    pub github_key_id: Option<String>,
 }
 
 // ----- destructive actions ----------------------------------------------

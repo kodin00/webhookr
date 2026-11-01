@@ -534,7 +534,28 @@ async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunR
         // rest of the shape — re-read HEAD, announce, deploy — so it is
         // written once here.
         let synced = match &mode {
-            SyncMode::AsIs => None,
+            SyncMode::AsIs => {
+                // An as-is redeploy deploys the checkout exactly as it stands,
+                // so it must not silently ship a commit from another branch:
+                // a second project sharing this path (or any other run) may
+                // have left HEAD elsewhere. Detached HEAD is exempt — that is
+                // the deliberate state a rollback leaves behind.
+                let branch_mismatch = if p.branch.trim().is_empty() {
+                    None
+                } else {
+                    current_branch(&p.path)
+                        .await
+                        .filter(|branch| !branch.is_empty() && *branch != p.branch)
+                        .map(|branch| {
+                            format!(
+                                "checkout is on branch '{branch}', not '{}' — \
+                                 run Pull & deploy first to switch branches",
+                                p.branch
+                            )
+                        })
+                };
+                branch_mismatch.map(Err)
+            }
             SyncMode::Forward => Some(sync_project(p, &mut log, &log_path, cancel.notify()).await),
             SyncMode::Rollback { sha, .. } => {
                 Some(rollback_sync(p, sha, &mut log, &log_path, cancel.notify()).await)
@@ -692,6 +713,25 @@ async fn head_author(path: &str) -> Option<String> {
     }
     let name = String::from_utf8(output.stdout).ok()?.trim().to_string();
     (!name.is_empty()).then_some(name)
+}
+
+/// The branch currently checked out, read with `git branch --show-current`.
+/// `Some("")` on a detached HEAD — which is a deliberate state (a rollback
+/// leaves one behind) and never a branch mismatch. `None` when the path is not
+/// a checkout or `git` is unusable.
+async fn current_branch(path: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
 }
 
 /// The token git authenticates with for this project, resolved against the

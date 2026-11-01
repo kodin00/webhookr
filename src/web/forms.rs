@@ -21,17 +21,11 @@ pub struct ProjectForm {
     pub name: String,
     #[serde(default)]
     pub id: String,
-    /// Manual repository URL. Empty when the user picks from the radio list
-    /// rendered by the `/f/github-repos` fragment; non-empty takes precedence
-    /// over [`Self::repository_pick`].
+    /// Manual repository URL. Empty when the project uses an existing path.
     #[serde(default)]
     pub repository: String,
-    /// Encoded `"clone_url\tkey_id"` from the repo picker radio list. Empty
-    /// when the user types a URL manually instead.
-    #[serde(default)]
-    pub repository_pick: String,
-    /// Id of the shared GitHub key to link to, for the manual-URL case. The
-    /// radio list carries its own key id inside [`Self::repository_pick`].
+    /// Id of the shared GitHub key to link to, used for clone, pull and
+    /// commit statuses on the repository URL.
     #[serde(default)]
     pub github_key_id: String,
     #[serde(default)]
@@ -130,24 +124,12 @@ impl ProjectForm {
             None => util::generate_secret(),
         };
 
-        // The repo picker offers a radio list (encoded as "url\tkey_id") and a
-        // manual URL field with a separate keys `<select>`. A typed URL wins
-        // over a radio pick; a radio pick carries its own key id. The form no
-        // longer edits tokens — they are carried forward from the existing
-        // project so a legacy per-project token survives until the project is
-        // migrated to a shared github key.
-        let (repository, github_key_id) = {
-            let manual = self.repository.trim();
-            if !manual.is_empty() {
-                (manual.to_string(), self.github_key_id.trim().to_string())
-            } else {
-                let pick = self.repository_pick.trim();
-                match pick.rsplit_once('\t') {
-                    Some((url, key_id)) => (url.trim().to_string(), key_id.trim().to_string()),
-                    None => (pick.to_string(), self.github_key_id.trim().to_string()),
-                }
-            }
-        };
+        // The repository is a typed URL paired with the selected shared github
+        // key. The form no longer edits tokens — they are carried forward from
+        // the existing project so a legacy per-project token survives until
+        // the project is migrated to a shared github key.
+        let repository = self.repository.trim().to_string();
+        let github_key_id = self.github_key_id.trim().to_string();
 
         let git_token = existing.map(|p| p.git_token.clone()).unwrap_or_default();
         let status_token = existing.map(|p| p.status_token.clone()).unwrap_or_default();
@@ -269,7 +251,6 @@ impl ProjectForm {
             name: project.name.clone(),
             id: project.id.clone(),
             repository: project.repository.clone(),
-            repository_pick: String::new(),
             github_key_id: project.github_key_id.clone(),
             path: project.path.clone(),
             branch: project.branch.clone(),
@@ -336,7 +317,6 @@ mod tests {
             name: "My Site".into(),
             id: String::new(),
             repository: "https://example.com/site.git".into(),
-            repository_pick: String::new(),
             github_key_id: String::new(),
             path: "/tmp/webhookr-form-test".into(),
             branch: "main".into(),
