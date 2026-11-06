@@ -194,8 +194,12 @@ webhookr run --id myapp --branch sandbox   # manual run of one branch
   default name unless you set one.
 - **Token-mode senders** pick a branch with `POST /hooks/<id>?branch=<name>`.
   Without it they deploy the primary branch.
-- **Redeploy without pulling** only works for the branch the worktree is on.
-  Use **Pull & deploy** to switch.
+- **Redeploy without pulling** works for any branch. If the worktree is on
+  another branch, webhookr checks out that branch's local ref, without
+  fetching, so you get the code it last pulled. A branch that has never been
+  pulled into the checkout needs one **Pull & deploy** first. After a
+  rollback, redeploying the same branch keeps the rolled-back commit. The
+  project page shows which branch the worktree is on.
 - **Bind mounts.** A stack that bind-mounts the source sees whichever branch is
   checked out last.
 

@@ -87,6 +87,9 @@ pub async fn detail(
         .find(|r| r.status == "running")
         .map(|r| r.id.clone());
     let hook_url = config::webhook_url(&cfg, &project.id);
+    // Which branch the shared worktree sits on right now — `Some("")` is a
+    // detached HEAD (a rollback), `None` no checkout yet.
+    let checked_out = crate::executor::current_branch(&project.path).await;
     // Tokens now come from the linked github key (set in Settings). Show the
     // key's label when one is linked; fall back to "stored (legacy)" for a
     // pre-existing per-project token, or "none" for a public repo.
@@ -146,6 +149,17 @@ pub async fn detail(
 
         section class="card" {
             h2 { "Deploy" @if !project.branches.is_empty() { " " span class="mono small muted" { (project.branch) } } }
+            @if !project.branches.is_empty() {
+                p class="hint" {
+                    "Worktree is on "
+                    @match checked_out.as_deref() {
+                        Some("") => { "a detached commit (rollback)" }
+                        Some(branch) => { span class="mono" { (branch) } }
+                        None => { "nothing yet (not cloned)" }
+                    }
+                    ". Redeploy switches to the branch's last-pulled code without fetching."
+                }
+            }
             div class="actions" {
                 form method="post" action={ "/projects/" (project.id) "/update-app" } {
                     button type="submit" class="button primary" { "Pull & deploy" }
@@ -176,7 +190,7 @@ pub async fn detail(
                     table {
                         thead { tr {
                             th { "Branch" } th { "Deployment" } th { "Compose file / command" }
-                            th { "Env file" } th { "Compose project" } th { "Runs" } th {}
+                            th { "Env file" } th { "Compose project" } th { "Command" } th {}
                         } }
                         tbody {
                             @for target in &targets {
@@ -185,6 +199,9 @@ pub async fn detail(
                                     td class="mono" {
                                         (target.branch)
                                         @if primary { " " span class="badge badge-none" { "primary" } }
+                                        @if checked_out.as_deref() == Some(target.branch.as_str()) {
+                                            " " span class="badge badge-ok" title="The shared worktree is on this branch" { "checked out" }
+                                        }
                                     }
                                     td { (target.preset_label()) }
                                     td class="mono small" {
@@ -205,7 +222,8 @@ pub async fn detail(
                                             }
                                             form method="post"
                                                  action={ "/projects/" (project.id) "/deploy" (branch_qs(&project, &target.branch)) } {
-                                                button type="submit" class="button small" { "Redeploy" }
+                                                button type="submit" class="button small"
+                                                       title="Deploy this branch's last-pulled code without fetching; switches the worktree to it if needed" { "Redeploy" }
                                             }
                                         }
                                     }

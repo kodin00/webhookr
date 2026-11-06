@@ -493,8 +493,21 @@ async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunR
     // commit at this point, and the finish status posts against the
     // post-checkout sha — a pending on the bad commit would never resolve.
     // The post-sync re-read of HEAD below is its first and only announcement.
+    // An as-is redeploy of a branch the worktree is not on first switches to
+    // that branch's *local* ref — no fetch, no pull, so it redeploys exactly
+    // what that branch last deployed. Done before the start sha is read so the
+    // announcement, the run history and the deploy all name the right commit.
+    let mut as_is_switch = match &mode {
+        SyncMode::AsIs => switch_for_redeploy(p, &id, &mut log, &log_path, cancel.notify()).await,
+        _ => None,
+    };
+    let switch_failed = matches!(as_is_switch, Some(Err(_)) | Some(Ok(SyncOutcome::Cancelled)));
     let (start_sha, start_author) = match &mode {
         SyncMode::Rollback { .. } => (None, None),
+        // The checkout never reached this branch: announcing against whatever
+        // HEAD it sits on would post this branch's status on another branch's
+        // commit.
+        SyncMode::AsIs if switch_failed => (None, None),
         _ => (
             match pushed_sha.clone() {
                 Some(sha) => Some(sha),
@@ -567,28 +580,11 @@ async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunR
         // rest of the shape — re-read HEAD, announce, deploy — so it is
         // written once here.
         let synced = match &mode {
-            SyncMode::AsIs => {
-                // An as-is redeploy deploys the checkout exactly as it stands,
-                // so it must not silently ship a commit from another branch:
-                // a second project sharing this path (or any other run) may
-                // have left HEAD elsewhere. Detached HEAD is exempt — that is
-                // the deliberate state a rollback leaves behind.
-                let branch_mismatch = if p.branch.trim().is_empty() {
-                    None
-                } else {
-                    current_branch(&p.path)
-                        .await
-                        .filter(|branch| !branch.is_empty() && *branch != p.branch)
-                        .map(|branch| {
-                            format!(
-                                "checkout is on branch '{branch}', not '{}' — \
-                                 run Pull & deploy first to switch branches",
-                                p.branch
-                            )
-                        })
-                };
-                branch_mismatch.map(Err)
-            }
+            // Switched (or already on the branch) above: deploy as it stands.
+            SyncMode::AsIs => match as_is_switch.take() {
+                None | Some(Ok(SyncOutcome::Done)) => None,
+                failed => failed,
+            },
             SyncMode::Forward => Some(sync_project(p, &mut log, &log_path, cancel.notify()).await),
             SyncMode::Rollback { sha, .. } => {
                 Some(rollback_sync(p, sha, &mut log, &log_path, cancel.notify()).await)
@@ -755,7 +751,7 @@ async fn head_author(path: &str) -> Option<String> {
 /// `Some("")` on a detached HEAD — which is a deliberate state (a rollback
 /// leaves one behind) and never a branch mismatch. `None` when the path is not
 /// a checkout or `git` is unusable.
-async fn current_branch(path: &str) -> Option<String> {
+pub(crate) async fn current_branch(path: &str) -> Option<String> {
     let output = Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(path)
@@ -768,6 +764,99 @@ async fn current_branch(path: &str) -> Option<String> {
         return None;
     }
     Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
+}
+
+/// Put the worktree on `p.branch` for an as-is redeploy, without touching the
+/// network: `None` when nothing needs to move, otherwise the outcome of a local
+/// `git checkout`.
+///
+/// * Already on the branch, or no branch configured: nothing to do.
+/// * Detached HEAD: a rollback leaves one behind on purpose. When the
+///   project's previous run was on this branch, the detached commit *is* this
+///   branch's live deploy and stays put; otherwise it belongs to another
+///   branch and the worktree switches.
+/// * Another branch: check out the local branch ref, or create it from an
+///   already-fetched `origin/<branch>`. A branch never fetched into this
+///   checkout cannot be redeployed — there is nothing local to deploy.
+async fn switch_for_redeploy(
+    p: &ProjectConfig,
+    run_id: &str,
+    log: &mut std::fs::File,
+    log_path: &Path,
+    cancel: &Notify,
+) -> Option<std::result::Result<SyncOutcome, String>> {
+    let branch = p.branch.trim();
+    if branch.is_empty() {
+        return None;
+    }
+    let current = current_branch(&p.path).await?;
+    if current == branch {
+        return None;
+    }
+    if current.is_empty() {
+        let previous = crate::state::load_runs()
+            .into_iter()
+            .find(|run| run.project_id == p.id && run.id != run_id);
+        let previous_branch = previous
+            .as_ref()
+            .and_then(|run| run.branch.clone())
+            .or_else(|| {
+                // Runs recorded before branch targets existed: the primary.
+                crate::config::load_config()
+                    .ok()
+                    .and_then(|app| app.get(&p.id).map(|stored| stored.branch.clone()))
+            });
+        if previous_branch.as_deref().map(str::trim) == Some(branch) {
+            return None;
+        }
+    }
+
+    let checkout: Vec<String> = if local_branch_exists(&p.path, branch).await {
+        vec!["checkout".into(), branch.into()]
+    } else if remote_branch_exists(&p.path, branch).await {
+        vec![
+            "checkout".into(),
+            "-b".into(),
+            branch.into(),
+            "--no-track".into(),
+            format!("origin/{branch}"),
+        ]
+    } else {
+        return Some(Err(format!(
+            "branch '{branch}' has never been fetched into this checkout — \
+             run Pull & deploy once first"
+        )));
+    };
+    let _ = writeln!(
+        log,
+        "# switching worktree from {} to '{branch}' (local ref, no pull)",
+        if current.is_empty() {
+            "a detached HEAD".to_string()
+        } else {
+            format!("'{current}'")
+        }
+    );
+    let mut command = Command::new("git");
+    command.args(&checkout);
+    Some(match exec(command, &p.path, "git checkout", log, cancel).await {
+        Err(error) => Err(format!("failed to run git checkout: {error:#}")),
+        Ok(ExecOutcome::Cancelled) => Ok(SyncOutcome::Cancelled),
+        Ok(ExecOutcome::Ran(true)) => Ok(SyncOutcome::Done),
+        Ok(ExecOutcome::Ran(false)) => Err(last_error("git checkout failed", log_path)),
+    })
+}
+
+/// Whether the checkout has an already-fetched `origin/<branch>`.
+async fn remote_branch_exists(path: &str, branch: &str) -> bool {
+    Command::new("git")
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/remotes/origin/{branch}"))
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// The token git authenticates with for this project, resolved against the
@@ -1280,7 +1369,8 @@ mod tests {
     use std::process::Command as StdCommand;
 
     use super::{
-        parse_dotenv, rollback_sha, rollback_sync, sync_project, target_for_run, ExecOutcome,
+        parse_dotenv, rollback_sha, rollback_sync, switch_for_redeploy, sync_project,
+        target_for_run, ExecOutcome, SyncOutcome,
     };
     use crate::config::ProjectConfig;
     use crate::state::RunRecord;
@@ -1467,8 +1557,46 @@ mod tests {
             "sandbox-two"
         );
 
+        // A redeploy (no pull) of develop while the worktree sits on sandbox
+        // switches to the local develop ref instead of refusing.
+        let switched = switch_for_redeploy(&develop, "run-x", &mut log, &log_path, &cancel).await;
+        assert!(matches!(switched, Some(Ok(SyncOutcome::Done))), "{switched:?}");
+        assert_eq!(
+            git_output(&checkout, &["branch", "--show-current"]).trim(),
+            "develop"
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "dev-one"
+        );
+        // Already there: nothing to do.
+        assert!(switch_for_redeploy(&develop, "run-x", &mut log, &log_path, &cancel)
+            .await
+            .is_none());
+        // Back to sandbox without a pull: its local ref, not the remote tip.
+        fs::write(seed.join("version.txt"), "sandbox-unpulled").unwrap();
+        git(&seed, &["commit", "-am", "sandbox 3"]);
+        git(&seed, &["push"]);
+        let switched = switch_for_redeploy(&sandbox, "run-x", &mut log, &log_path, &cancel).await;
+        assert!(matches!(switched, Some(Ok(SyncOutcome::Done))), "{switched:?}");
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "sandbox-two"
+        );
+        // A branch never fetched here has nothing local to redeploy.
+        let mut with_ghost = project.clone();
+        with_ghost
+            .branches
+            .push(crate::config::BranchTarget::new("ghost".into()));
+        let ghost = with_ghost.target("ghost").unwrap();
+        let switched = switch_for_redeploy(&ghost, "run-x", &mut log, &log_path, &cancel).await;
+        assert!(
+            matches!(&switched, Some(Err(message)) if message.contains("never been fetched")),
+            "{switched:?}"
+        );
+
         // A rollback on the sandbox target fetches with the same refspec.
-        let one = git_output(&seed, &["rev-parse", "HEAD~1"]);
+        let one = git_output(&seed, &["rev-parse", "HEAD~2"]);
         rollback_sync(&sandbox, &one, &mut log, &log_path, &cancel)
             .await
             .unwrap();
