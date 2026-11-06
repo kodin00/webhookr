@@ -209,9 +209,11 @@ impl Notifier {
     }
 
     /// The run has begun: post the `🚀` message.
+    #[allow(clippy::too_many_arguments)]
     pub async fn started(
         &self,
         project_name: &str,
+        branch: &str,
         run_id: &str,
         commit: Option<&str>,
         author: Option<&str>,
@@ -220,6 +222,7 @@ impl Notifier {
     ) {
         let text = message_started(
             project_name,
+            branch,
             run_id,
             commit,
             author,
@@ -234,12 +237,14 @@ impl Notifier {
     pub async fn finished(
         &self,
         project_name: &str,
+        branch: &str,
         record: &RunRecord,
         log_tail: &str,
         log: &mut File,
     ) -> TelegramDelivery {
         let text = message_finished(
             project_name,
+            branch,
             record,
             log_tail,
             self.run_url(&record.id).as_deref(),
@@ -328,8 +333,29 @@ fn short(value: &str) -> &str {
     value.get(..8).unwrap_or(value)
 }
 
+/// The branch a run deployed: the record's own, else `primary` (a record with
+/// no branch ran the primary branch).
+fn run_branch<'a>(record_branch: Option<&'a str>, primary: &'a str) -> &'a str {
+    record_branch
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or(primary)
+}
+
+/// `Name (branch)`, or just the name when no branch is known.
+fn project_label(project_name: &str, branch: &str) -> String {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        project_name.to_string()
+    } else {
+        format!("{project_name} ({branch})")
+    }
+}
+
+/// `branch` is the branch being deployed (the effective config's branch).
 pub fn message_started(
     project_name: &str,
+    branch: &str,
     run_id: &str,
     commit: Option<&str>,
     author: Option<&str>,
@@ -338,6 +364,7 @@ pub fn message_started(
 ) -> String {
     let commit = commit.map(short).unwrap_or("unknown");
     let author = author.unwrap_or("unknown");
+    let project_name = project_label(project_name, branch);
     let mut text = format!(
         "🚀 {project_name} deployment started\nrun {} · commit {commit} · author {author}",
         short(run_id)
@@ -353,12 +380,18 @@ pub fn message_started(
     truncate_chars(&text, MAX_MESSAGE)
 }
 
+/// `primary_branch` names the branch for a record that carries none.
 pub fn message_finished(
     project_name: &str,
+    primary_branch: &str,
     record: &RunRecord,
     log_tail: &str,
     run_url: Option<&str>,
 ) -> String {
+    let project_name = project_label(
+        project_name,
+        run_branch(record.branch.as_deref(), primary_branch),
+    );
     let duration = crate::executor::human_duration(record.duration_ms);
     let commit = record.commit.as_deref().map(short).unwrap_or("unknown");
     let author = record.author.as_deref().unwrap_or("unknown");
@@ -443,6 +476,7 @@ mod tests {
             triggered_by: None,
             telegram: None,
             rollback_to: None,
+            branch: None,
         }
     }
 
@@ -478,6 +512,7 @@ mod tests {
     fn messages_name_the_run_project_and_commit() {
         let started = message_started(
             "My Site",
+            "develop",
             "a1b2c3d4e5f6",
             Some("4f5e6d7c8b9a"),
             Some("alice"),
@@ -485,7 +520,7 @@ mod tests {
             Some("https://panel.example.com/runs/a1b2c3d4e5f6"),
         );
         assert!(
-            started.contains("🚀 My Site deployment started"),
+            started.contains("🚀 My Site (develop) deployment started"),
             "{started}"
         );
         assert!(
@@ -496,7 +531,7 @@ mod tests {
 
         // No commit to name yet (a manual run before HEAD is read), and no
         // trigger (a run recorded before the field existed).
-        let blind = message_started("My Site", "a1b2c3d4e5f6", None, None, None, None);
+        let blind = message_started("My Site", "develop", "a1b2c3d4e5f6", None, None, None, None);
         assert!(blind.contains("commit unknown"), "{blind}");
         assert!(blind.contains("author unknown"), "{blind}");
         assert!(!blind.contains(" · push"), "no trigger, no label: {blind}");
@@ -504,8 +539,11 @@ mod tests {
         let mut triggered = record("success", "Successfully tagged site:latest");
         triggered.triggered_by = Some("merge by alice".into());
         triggered.author = Some("dave".into());
-        let ok = message_finished("My Site", &triggered, "leftover", None);
-        assert!(ok.contains("✅ My Site deployment succeeded"), "{ok}");
+        let ok = message_finished("My Site", "develop", &triggered, "leftover", None);
+        assert!(
+            ok.contains("✅ My Site (develop) deployment succeeded"),
+            "{ok}"
+        );
         assert!(
             ok.contains("commit 4f5e6d7c · author dave · merge by alice · deployed in 42s"),
             "{ok}"
@@ -515,11 +553,15 @@ mod tests {
 
         let failed = message_finished(
             "My Site",
+            "develop",
             &record("failed", "error: pull failed: non-fast-forward"),
             "line one\nline two",
             Some("https://panel.example.com/runs/a1b2c3d4e5f6"),
         );
-        assert!(failed.contains("❌ My Site deployment failed"), "{failed}");
+        assert!(
+            failed.contains("❌ My Site (develop) deployment failed"),
+            "{failed}"
+        );
         assert!(failed.contains("failed after 42s"), "{failed}");
         assert!(
             failed.contains("error: pull failed: non-fast-forward"),
@@ -531,11 +573,21 @@ mod tests {
     }
 
     #[test]
+    fn a_runs_own_branch_beats_the_primary() {
+        let mut sandbox = record("success", "done");
+        sandbox.branch = Some("sandbox".into());
+        let text = message_finished("My Site", "develop", &sandbox, "", None);
+        assert!(text.contains("My Site (sandbox) deployment"), "{text}");
+        assert!(!text.contains("develop"), "{text}");
+    }
+
+    #[test]
     fn messages_fit_telegrams_limit_and_never_split_characters() {
         // A huge log tail is capped at MAX_TAIL_CHARS, long before the
         // whole-message clamp would matter.
         let huge_tail = message_finished(
             "My Site",
+            "develop",
             &record("failed", "boom"),
             &"x".repeat(10_000),
             None,
@@ -547,6 +599,7 @@ mod tests {
         // message is clamped, with the ellipsis as the last character.
         let huge_message = message_finished(
             "My Site",
+            "develop",
             &record("failed", &"y".repeat(5_000)),
             "tail",
             None,
@@ -557,6 +610,7 @@ mod tests {
         // Multi-byte text must truncate on a character boundary.
         let wide = message_finished(
             "My Site",
+            "develop",
             &record("failed", "boom"),
             &"é".repeat(4_000),
             None,
@@ -746,7 +800,7 @@ mod tests {
             std::env::temp_dir().join(format!("webhookr-sent-{}", crate::util::new_run_id()));
         let mut log = std::fs::File::create(&path).unwrap();
         let delivery = notifier
-            .finished("Site", &record("success", "done"), "", &mut log)
+            .finished("Site", "main", &record("success", "done"), "", &mut log)
             .await;
         let written = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();

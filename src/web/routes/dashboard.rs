@@ -90,10 +90,12 @@ fn project_grid(cfg: &config::AppConfig) -> Markup {
                         h3 { a href={ "/projects/" (project.id) } { (project.name) } }
                         (views::status_badge(run))
                     }
-                    p class="muted mono small" { (project.branch) " · " (project.preset_label()) }
+                    p class="muted mono small" { (project.branch_names().join(", ")) " · " (project.preset_label()) }
                     @if let Some(run) = run {
                         p class="summary" { (run.message) }
                         p class="muted small" {
+                            span class="mono" { (views::run_branch(run, project)) }
+                            " · "
                             (views::jakarta_time(&run.started_at))
                             @if let Some(author) = run.author.as_deref() {
                                 " · " (author)

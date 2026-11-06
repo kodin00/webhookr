@@ -143,7 +143,14 @@ pub fn deploy_command_preview(project: &ProjectConfig) -> String {
         return project.command.clone();
     }
 
-    let mut base = format!("docker compose -f {}", project.compose_file);
+    let mut base = "docker compose".to_string();
+    if !project.compose_project.trim().is_empty() {
+        base.push_str(&format!(" -p {}", project.compose_project.trim()));
+    }
+    base.push_str(&format!(" -f {}", project.compose_file));
+    if !project.env_file.trim().is_empty() {
+        base.push_str(&format!(" --env-file {}", project.env_file.trim()));
+    }
     for profile in &project.compose_profiles {
         base.push_str(&format!(" --profile {profile}"));
     }
@@ -298,6 +305,95 @@ pub struct ProjectConfig {
     /// keeps every config written before rollbacks existed working unchanged.
     #[serde(default)]
     pub database: DatabaseConfig,
+    /// Env file (relative to the project path) for the primary branch. Compose
+    /// presets pass it as `--env-file`; custom commands get its `KEY=VALUE`
+    /// pairs exported into their environment. Empty: none.
+    #[serde(default)]
+    pub env_file: String,
+    /// Compose project name (`docker compose -p`) for the primary branch.
+    /// Empty leaves Compose's own default (the top-level `name:` or the
+    /// directory name), which is what every config written before branch
+    /// targets existed was deployed under.
+    #[serde(default)]
+    pub compose_project: String,
+    /// Extra branches deployed from the same checkout. A delivery for one of
+    /// these branches checks it out, pulls it, and deploys with the target's
+    /// own preset/command, compose file, env file and database — see
+    /// [`Self::target`]. Empty: only [`Self::branch`] deploys.
+    #[serde(default)]
+    pub branches: Vec<BranchTarget>,
+}
+
+/// An extra branch a project deploys from the same checkout, with its own
+/// deploy settings. The project-wide settings (path, repository, secret,
+/// credentials, trigger events, status reporting) are shared.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BranchTarget {
+    /// Branch name, e.g. `sandbox`.
+    pub branch: String,
+    /// Deployment preset: `custom`, `compose_build`, `compose_pull`, or `compose_up`.
+    #[serde(default = "default_deploy_preset")]
+    pub deploy_preset: String,
+    /// Shell command for the `custom` preset.
+    #[serde(default)]
+    pub command: String,
+    /// Compose file relative to the project checkout.
+    #[serde(default = "default_compose_file")]
+    pub compose_file: String,
+    #[serde(default)]
+    pub compose_profiles: Vec<String>,
+    /// Env file relative to the project checkout. Empty: none.
+    #[serde(default)]
+    pub env_file: String,
+    /// Compose project name (`-p`). Empty derives `{project id}-{branch}` so
+    /// this branch's stack never shares a Compose project — and therefore
+    /// never gets `--remove-orphans`'d — with the primary branch's stack.
+    #[serde(default)]
+    pub compose_project: String,
+    /// PR source branches whose merges into this branch may deploy it. Empty:
+    /// any.
+    #[serde(default)]
+    pub merge_sources: Vec<String>,
+    /// Database handling for this branch's stack (a sandbox usually has its
+    /// own database, distinct from the primary branch's).
+    #[serde(default)]
+    pub database: DatabaseConfig,
+}
+
+impl BranchTarget {
+    pub fn new(branch: String) -> Self {
+        Self {
+            branch,
+            deploy_preset: default_deploy_preset(),
+            command: String::new(),
+            compose_file: default_compose_file(),
+            compose_profiles: Vec::new(),
+            env_file: String::new(),
+            compose_project: String::new(),
+            merge_sources: Vec::new(),
+            database: DatabaseConfig::default(),
+        }
+    }
+}
+
+/// A Compose-project-name-safe slug: lowercase alphanumerics, `-` and `_`,
+/// starting with an alphanumeric.
+fn compose_slug(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.starts_with(['-', '_']) {
+        out.remove(0);
+    }
+    out
 }
 
 impl ProjectConfig {
@@ -331,7 +427,72 @@ impl ProjectConfig {
             trigger_events: Vec::new(),
             merge_sources: Vec::new(),
             database: DatabaseConfig::default(),
+            env_file: String::new(),
+            compose_project: String::new(),
+            branches: Vec::new(),
         }
+    }
+
+    /// Whether `branch` is this project's primary branch (the top-level
+    /// [`Self::branch`]). `refs/heads/` is tolerated.
+    pub fn is_primary_branch(&self, branch: &str) -> bool {
+        crate::github::branch_name(branch) == self.branch.trim()
+    }
+
+    /// The effective config for deploying `branch`: the project itself for the
+    /// primary branch, or the project with the matching [`BranchTarget`]'s
+    /// settings laid over it. `None` when the project does not deploy
+    /// `branch`. `refs/heads/` is tolerated.
+    ///
+    /// The result is a *run-time view*, never to be saved back to the config:
+    /// its `branches` list is emptied so it cannot be mistaken for the stored
+    /// project. Its `id` is unchanged — runs, the per-project lock, and the
+    /// webhook URL stay keyed by the project.
+    pub fn target(&self, branch: &str) -> Option<ProjectConfig> {
+        let name = crate::github::branch_name(branch);
+        if self.is_primary_branch(name) {
+            let mut primary = self.clone();
+            primary.branches.clear();
+            return Some(primary);
+        }
+        let extra = self.branches.iter().find(|t| t.branch.trim() == name)?;
+        let mut view = self.clone();
+        view.branches.clear();
+        view.branch = extra.branch.trim().to_string();
+        view.deploy_preset = extra.deploy_preset.clone();
+        view.command = extra.command.clone();
+        view.compose_file = extra.compose_file.clone();
+        view.compose_profiles = extra.compose_profiles.clone();
+        view.env_file = extra.env_file.clone();
+        view.compose_project = if extra.compose_project.trim().is_empty() {
+            compose_slug(&format!("{}-{}", self.id, view.branch))
+        } else {
+            extra.compose_project.trim().to_string()
+        };
+        view.merge_sources = extra.merge_sources.clone();
+        view.database = extra.database.clone();
+        view.status_context = if self.status_context.trim().is_empty() {
+            format!("webhookr/{}/{}", self.id, view.branch)
+        } else {
+            format!("{}/{}", self.status_context.trim(), view.branch)
+        };
+        Some(view)
+    }
+
+    /// The primary target followed by every extra branch target, as
+    /// effective configs (see [`Self::target`]).
+    pub fn targets(&self) -> Vec<ProjectConfig> {
+        std::iter::once(self.branch.as_str())
+            .chain(self.branches.iter().map(|t| t.branch.as_str()))
+            .filter_map(|b| self.target(b))
+            .collect()
+    }
+
+    /// Every branch this project deploys, primary first.
+    pub fn branch_names(&self) -> Vec<String> {
+        std::iter::once(self.branch.trim().to_string())
+            .chain(self.branches.iter().map(|t| t.branch.trim().to_string()))
+            .collect()
     }
 
     /// Basic sanity checks before a project can be used.
@@ -465,6 +626,43 @@ impl ProjectConfig {
                 bail!("status context must be at most 100 characters");
             }
         }
+        if !self.env_file.trim().is_empty() {
+            validate_env_file(&self.env_file)?;
+        }
+        if !self.compose_project.trim().is_empty() {
+            validate_compose_project(&self.compose_project)?;
+        }
+        // Extra branch targets: unique, distinct from the primary branch, and
+        // each one valid as an effective config in its own right.
+        if !self.branches.is_empty() && self.branch.trim().is_empty() {
+            bail!("set the primary branch before adding extra branches");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for extra in &self.branches {
+            let name = extra.branch.trim();
+            if name.is_empty() {
+                bail!("extra branches need a branch name");
+            }
+            if name.starts_with('-') {
+                bail!("branch may not start with '-'");
+            }
+            if name == self.branch.trim() {
+                bail!("branch '{name}' is already the project's primary branch");
+            }
+            if !seen.insert(name.to_string()) {
+                bail!("branch '{name}' is listed more than once");
+            }
+            let view = self
+                .target(name)
+                .expect("an extra branch always resolves to a target");
+            view.validate()
+                .map_err(|error| anyhow::anyhow!("branch '{name}': {error:#}"))?;
+            if !view.compose_project.is_empty()
+                && view.compose_project == self.compose_project.trim()
+            {
+                bail!("branch '{name}' must use a different compose project name than the primary branch");
+            }
+        }
         Ok(())
     }
 
@@ -579,6 +777,36 @@ fn validate_relative_file(value: &str) -> Result<()> {
         .any(|part| matches!(part, std::path::Component::ParentDir))
     {
         bail!("compose file may not leave the project directory");
+    }
+    Ok(())
+}
+
+/// An env file path: relative, inside the project, not flag-shaped.
+fn validate_env_file(value: &str) -> Result<()> {
+    let path = Path::new(value.trim());
+    if path.is_absolute()
+        || value.trim().starts_with('-')
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("env file must be a relative path inside the project");
+    }
+    Ok(())
+}
+
+/// A Compose project name: what `docker compose -p` accepts.
+fn validate_compose_project(value: &str) -> Result<()> {
+    let value = value.trim();
+    let ok = value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if !ok {
+        bail!("compose project name must be lowercase letters, digits, '-' or '_', starting with a letter or digit");
     }
     Ok(())
 }
@@ -1009,7 +1237,7 @@ pub fn ensure_dirs() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, DatabaseConfig, ProjectConfig};
+    use super::{deploy_command_preview, AppConfig, BranchTarget, DatabaseConfig, ProjectConfig};
 
     #[test]
     fn old_config_deserializes_with_deployment_defaults() {
@@ -1160,6 +1388,93 @@ mod tests {
         assert!(project.validate().is_err());
     }
 
+    fn with_sandbox() -> ProjectConfig {
+        let mut p = ProjectConfig::new(
+            "app".into(),
+            "App".into(),
+            "/tmp".into(),
+            "develop".into(),
+            "make deploy".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        let mut sandbox = BranchTarget::new("sandbox".into());
+        sandbox.deploy_preset = "compose_build".into();
+        sandbox.compose_file = "docker-compose.sandbox.yml".into();
+        sandbox.env_file = ".env.sandbox".into();
+        p.branches.push(sandbox);
+        p
+    }
+
+    #[test]
+    fn branch_targets_resolve_to_effective_configs() {
+        let p = with_sandbox();
+        p.validate().unwrap();
+
+        let primary = p.target("refs/heads/develop").unwrap();
+        assert_eq!(primary.command, "make deploy");
+        assert!(primary.compose_project.is_empty());
+        assert!(primary.branches.is_empty());
+
+        let sandbox = p.target("sandbox").unwrap();
+        assert_eq!(sandbox.id, "app");
+        assert_eq!(sandbox.branch, "sandbox");
+        assert_eq!(sandbox.deploy_preset, "compose_build");
+        assert_eq!(sandbox.env_file, ".env.sandbox");
+        assert_eq!(sandbox.compose_project, "app-sandbox");
+        assert_eq!(sandbox.effective_status_context(), "webhookr/app/sandbox");
+        assert!(deploy_command_preview(&sandbox).contains(
+            "docker compose -p app-sandbox -f docker-compose.sandbox.yml --env-file .env.sandbox"
+        ));
+
+        assert!(p.target("main").is_none());
+        assert_eq!(p.branch_names(), vec!["develop", "sandbox"]);
+        assert_eq!(p.targets().len(), 2);
+    }
+
+    #[test]
+    fn branch_targets_are_validated() {
+        let mut p = with_sandbox();
+        p.branches.push(BranchTarget::new("sandbox".into()));
+        assert!(p.validate().is_err(), "duplicate branch");
+
+        let mut p = with_sandbox();
+        p.branches.push(BranchTarget::new("develop".into()));
+        assert!(p.validate().is_err(), "primary branch repeated");
+
+        let mut p = with_sandbox();
+        p.branches[0].branch = "--upload-pack=x".into();
+        assert!(p.validate().is_err(), "flag-shaped branch");
+
+        let mut p = with_sandbox();
+        p.branches[0].env_file = "../secrets.env".into();
+        assert!(p.validate().is_err(), "env file escapes the project");
+
+        let mut p = with_sandbox();
+        p.branches[0].deploy_preset = "custom".into();
+        assert!(p.validate().is_err(), "custom target without a command");
+
+        let mut p = with_sandbox();
+        p.compose_project = "app-sandbox".into();
+        assert!(p.validate().is_err(), "both stacks under one compose project");
+
+        let mut p = with_sandbox();
+        p.branches[0].compose_project = "Bad Name".into();
+        assert!(p.validate().is_err(), "invalid compose project name");
+    }
+
+    #[test]
+    fn configs_without_branch_targets_still_load() {
+        let p: ProjectConfig = serde_json::from_str(
+            r#"{"id":"site","name":"Site","path":"/tmp","branch":"main",
+                "command":"true","secret":"s","verify_mode":"github"}"#,
+        )
+        .unwrap();
+        assert!(p.branches.is_empty());
+        assert!(p.env_file.is_empty());
+        assert_eq!(p.targets().len(), 1);
+    }
+
     #[test]
     fn clone_target_may_not_exist_yet() {
         let project = ProjectConfig {
@@ -1182,6 +1497,9 @@ mod tests {
             trigger_events: Vec::new(),
             merge_sources: Vec::new(),
             database: DatabaseConfig::default(),
+            env_file: String::new(),
+            compose_project: String::new(),
+            branches: Vec::new(),
         };
         project.validate().unwrap();
     }

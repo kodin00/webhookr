@@ -1064,6 +1064,16 @@ impl App {
                         .as_ref()
                         .map(|existing| existing.database.clone())
                         .unwrap_or_default();
+                    let (env_file, compose_project, branches) = stored
+                        .as_ref()
+                        .map(|existing| {
+                            (
+                                existing.env_file.clone(),
+                                existing.compose_project.clone(),
+                                existing.branches.clone(),
+                            )
+                        })
+                        .unwrap_or_default();
                     let project = ProjectConfig {
                         id,
                         name,
@@ -1093,6 +1103,12 @@ impl App {
                         compose_file: w.compose_file.value().trim().to_string(),
                         compose_profiles: parse_profiles(w.compose_profiles.value()),
                         database,
+                        // Not wizard fields: carry the stored values forward so
+                        // editing here never drops them (manage with `webhookr
+                        // edit` / `webhookr branch`, or the web UI).
+                        env_file,
+                        compose_project,
+                        branches,
                     };
                     match project.validate() {
                         Ok(()) => {
@@ -1525,9 +1541,37 @@ impl App {
             field_line("verify", &p.verify_mode),
             field_line("webhook", &webhook_url(&self.config, &p.id)),
         ];
+        if !p.env_file.trim().is_empty() {
+            lines.push(field_line("env file", &p.env_file));
+        }
+        if !p.compose_project.trim().is_empty() {
+            lines.push(field_line("compose -p", &p.compose_project));
+        }
+        for t in p.targets().iter().skip(1) {
+            let mut s = t.preset_label().to_string();
+            if t.uses_compose() {
+                s.push_str(&format!(" · {}", t.compose_file));
+            }
+            if !t.env_file.trim().is_empty() {
+                s.push_str(&format!(" · env {}", t.env_file));
+            }
+            if !t.compose_project.trim().is_empty() {
+                s.push_str(&format!(" · -p {}", t.compose_project));
+            }
+            lines.push(field_line(&format!("+ {}", t.branch), &s));
+        }
+        if !p.branches.is_empty() {
+            lines.push(field_line(
+                "branches",
+                "manage with `webhookr branch ...` or the web UI",
+            ));
+        }
         let last_line = match self.last_runs.get(&p.id) {
             Some(r) => {
                 let mut s = format!("{} ({}ms) {}", r.status, r.duration_ms, r.message);
+                if let Some(branch) = r.branch.as_deref().filter(|b| !b.trim().is_empty()) {
+                    s.push_str(&format!(" · {branch}"));
+                }
                 if let Some(trigger) = r.triggered_by.as_deref() {
                     s.push_str(&format!(" · {trigger}"));
                 }

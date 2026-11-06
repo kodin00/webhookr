@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::Path,
+    extract::{Path, Query},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -75,7 +75,9 @@ pub async fn serve(port: Option<u16>, web_override: WebOverride) -> Result<()> {
     for project in &cfg.projects {
         println!(
             "  POST /hooks/{}  ->  {}  (branch {})",
-            project.id, project.name, project.branch
+            project.id,
+            project.name,
+            project.branch_names().join(", ")
         );
     }
     if let Some(tunnel) = &cfg.cloudflare {
@@ -169,6 +171,7 @@ async fn healthz() -> Json<serde_json::Value> {
 /// Webhook entrypoint: verify the payload, then spawn a project run and reply.
 async fn webhook(
     Path(id): Path<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -258,6 +261,32 @@ async fn webhook(
         );
     }
 
+    // Resolve which of the project's branch targets this delivery is for: the
+    // push ref (the base branch for a merge), or `?branch=` for a token-mode
+    // sender. Everything below gates against the *resolved target*.
+    let target = match resolve_target(&project, payload.as_ref(), query.get("branch")) {
+        Ok(target) => target,
+        Err(TargetError::UnknownQueryBranch) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "unknown branch", "project": id })),
+            );
+        }
+        Err(TargetError::NotOnBranch) => {
+            let reason = "delivery is not on one of the project's branches";
+            eprintln!("webhookr: {reason} for {}; skipping", project.name);
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "project": id,
+                    "started": false,
+                    "reason": reason,
+                })),
+            );
+        }
+    };
+
     // The branch gates. With a branch configured, only deliveries on that
     // branch start a run — a push must be to it, a merge must land on it —
     // and with `merge_sources` listed, a merge must additionally come from one
@@ -268,8 +297,8 @@ async fn webhook(
     if let Some(reason) = github::trigger_allowed(
         &kind,
         payload.as_ref(),
-        &project.branch,
-        &project.merge_sources,
+        &target.branch,
+        &target.merge_sources,
     ) {
         eprintln!("webhookr: {reason} for {}; skipping", project.name);
         return (
@@ -278,6 +307,7 @@ async fn webhook(
                 "ok": true,
                 "project": id,
                 "started": false,
+                "branch": target.branch,
                 "reason": reason,
             })),
         );
@@ -289,21 +319,76 @@ async fn webhook(
         payload,
     };
 
-    eprintln!("webhookr: dispatching run for {}", project.name);
+    eprintln!(
+        "webhookr: dispatching run for {} (branch {})",
+        project.name,
+        if target.branch.is_empty() {
+            "-"
+        } else {
+            &target.branch
+        }
+    );
+    let branch_label = target.branch.clone();
     std::mem::drop(tokio::spawn(async move {
-        if let Err(error) = executor::run_project_with(&project, trigger).await {
+        if let Err(error) = executor::run_project_with(&target, trigger).await {
             // Includes the single-flight rejection when a run is already going.
-            eprintln!(
-                "webhookr: run for {} failed to start: {error:#}",
-                project.id
-            );
+            eprintln!("webhookr: run for {} failed to start: {error:#}", target.id);
         }
     }));
 
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "ok": true, "project": id, "started": true })),
+        Json(json!({ "ok": true, "project": id, "started": true, "branch": branch_label })),
     )
+}
+
+/// Why a delivery could not be matched to one of the project's branch targets.
+#[derive(Debug, PartialEq, Eq)]
+enum TargetError {
+    /// The delivery's branch is not one the project deploys (2xx skip).
+    NotOnBranch,
+    /// A token-mode sender named a `?branch=` the project does not deploy (400).
+    UnknownQueryBranch,
+}
+
+/// Pick the branch target a delivery is for.
+///
+/// * A GitHub payload with a `ref` (a push ref, or the base branch of a
+///   merged PR — `classify` already normalizes it) resolves to the target for
+///   that branch; no such target is [`TargetError::NotOnBranch`].
+/// * A payload without a `ref` (ping, odd bodies) resolves to the primary
+///   target, so `trigger_allowed` keeps producing its existing skip reasons.
+/// * A payload-less token-mode sender may pass `?branch=`; an unknown name is
+///   [`TargetError::UnknownQueryBranch`], none means the primary target.
+/// * A project with no branch and no extra branches keeps its old behavior:
+///   nothing gates, the project itself is the target.
+fn resolve_target(
+    project: &ProjectConfig,
+    payload: Option<&github::PushPayload>,
+    query_branch: Option<&String>,
+) -> Result<ProjectConfig, TargetError> {
+    let primary = || {
+        project
+            .target(&project.branch)
+            .unwrap_or_else(|| project.clone())
+    };
+    if project.branch.trim().is_empty() && project.branches.is_empty() {
+        return Ok(primary());
+    }
+    match payload {
+        Some(payload) => match payload.r#ref.as_deref() {
+            Some(reference) => project
+                .target(github::branch_name(reference))
+                .ok_or(TargetError::NotOnBranch),
+            None => Ok(primary()),
+        },
+        None => match query_branch.map(|b| b.trim()).filter(|b| !b.is_empty()) {
+            Some(branch) => project
+                .target(branch)
+                .ok_or(TargetError::UnknownQueryBranch),
+            None => Ok(primary()),
+        },
+    }
 }
 
 /// Authenticate a webhook payload against the project's `verify_mode`.
@@ -337,5 +422,87 @@ fn verify_secret(p: &ProjectConfig, body: &[u8], headers: &HeaderMap) -> bool {
             None => false,
         },
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(reference: Option<&str>) -> github::PushPayload {
+        github::PushPayload {
+            r#ref: reference.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn bare_project() -> ProjectConfig {
+        ProjectConfig::new(
+            "app".into(),
+            "App".into(),
+            "/srv/app".into(),
+            String::new(),
+            "true".into(),
+            "secret".into(),
+            "token".into(),
+        )
+    }
+
+    fn project() -> ProjectConfig {
+        let mut p = bare_project();
+        p.branch = "develop".into();
+        let mut extra = config::BranchTarget::new("sandbox".into());
+        extra.compose_file = "docker-compose.sandbox.yml".into();
+        extra.merge_sources = vec!["feature".into()];
+        p.branches.push(extra);
+        p
+    }
+
+    #[test]
+    fn pushes_resolve_to_their_branch_target() {
+        let p = project();
+        let t = resolve_target(&p, Some(&payload(Some("refs/heads/sandbox"))), None).unwrap();
+        assert_eq!(t.branch, "sandbox");
+        assert_eq!(t.compose_file, "docker-compose.sandbox.yml");
+        assert_eq!(t.compose_project, "app-sandbox");
+        let t = resolve_target(&p, Some(&payload(Some("refs/heads/develop"))), None).unwrap();
+        assert_eq!(t.branch, "develop");
+        assert_eq!(
+            resolve_target(&p, Some(&payload(Some("refs/heads/other"))), None).unwrap_err(),
+            TargetError::NotOnBranch
+        );
+        // Gating then applies the resolved target's merge_sources.
+        let t = resolve_target(&p, Some(&payload(Some("refs/heads/sandbox"))), None).unwrap();
+        assert_eq!(t.merge_sources, vec!["feature".to_string()]);
+    }
+
+    #[test]
+    fn token_senders_use_the_query_branch_or_the_primary() {
+        let p = project();
+        assert_eq!(resolve_target(&p, None, None).unwrap().branch, "develop");
+        let q = "sandbox".to_string();
+        assert_eq!(
+            resolve_target(&p, None, Some(&q)).unwrap().branch,
+            "sandbox"
+        );
+        let bad = "nope".to_string();
+        assert_eq!(
+            resolve_target(&p, None, Some(&bad)).unwrap_err(),
+            TargetError::UnknownQueryBranch
+        );
+    }
+
+    #[test]
+    fn a_project_without_branches_keeps_the_old_behavior() {
+        let p = bare_project();
+        let t = resolve_target(&p, Some(&payload(Some("refs/heads/anything"))), None).unwrap();
+        assert!(t.branch.is_empty());
+    }
+
+    #[test]
+    fn a_refless_payload_falls_back_to_the_primary() {
+        let p = project();
+        let t = resolve_target(&p, Some(&payload(None)), None).unwrap();
+        assert_eq!(t.branch, "develop");
     }
 }

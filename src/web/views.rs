@@ -8,7 +8,17 @@
 
 use maud::{html, Markup, DOCTYPE};
 
+use crate::config::ProjectConfig;
 use crate::state::RunRecord;
+
+/// The branch a run deployed: its recorded branch, or the project's primary
+/// branch for a run recorded before branch targets existed.
+pub fn run_branch<'a>(run: &'a RunRecord, project: &'a ProjectConfig) -> &'a str {
+    match run.branch.as_deref().map(str::trim) {
+        Some(branch) if !branch.is_empty() => branch,
+        _ => project.branch.trim(),
+    }
+}
 
 /// Wrap page content in the site shell.
 pub fn page(title: &str, body: Markup) -> Markup {

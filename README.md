@@ -164,6 +164,45 @@ If `--repository` is set and the project path does not exist, the first update
 clones that branch into the path. Later updates fetch, check out, and
 fast-forward the same branch.
 
+### Deploying several branches from one repository
+
+A project can deploy more than one branch from the same checkout. The project's
+own branch is the **primary**; each **extra branch** carries its own preset or
+command, compose file, profiles, env file, compose project name, merge sources
+and database settings. Path, repository, secret, credentials and triggers are
+shared, and so is the webhook URL.
+
+A delivery for a branch checks that branch out in the shared worktree, pulls
+it, and deploys with that branch's settings. Runs on one project never overlap,
+so the branches take turns on the worktree.
+
+```sh
+# develop is the primary branch (custom command); add sandbox alongside it
+webhookr branch add myapp sandbox \
+  --preset compose_build \
+  --compose-file docker-compose.sandbox.yml \
+  --env-file .env.sandbox
+webhookr run --id myapp --branch sandbox   # manual run of one branch
+```
+
+- **Env file.** Compose presets pass it as `--env-file`. Custom commands get its
+  `KEY=VALUE` pairs in their environment, along with `WEBHOOKR_BRANCH`,
+  `WEBHOOKR_PROJECT_ID`, `WEBHOOKR_ENV_FILE` and `WEBHOOKR_COMPOSE_PROJECT`.
+- **Compose project name.** An extra branch deploys under `-p <id>-<branch>`
+  unless you set one. Without a separate name, `--remove-orphans` on one branch
+  would tear down the other branch's containers. The primary keeps Compose's
+  default name unless you set one.
+- **Token-mode senders** pick a branch with `POST /hooks/<id>?branch=<name>`.
+  Without it they deploy the primary branch.
+- **Redeploy without pulling** only works for the branch the worktree is on.
+  Use **Pull & deploy** to switch.
+- **Bind mounts.** A stack that bind-mounts the source sees whichever branch is
+  checked out last.
+
+Extra branches are managed in the web UI (**Extra branches** on the project
+form), or with `webhookr branch list|add|remove|set`. The TUI shows them but
+doesn't edit them.
+
 ## Rollback
 
 Any past successful run can be redeployed as a rollback. webhookr fetches,

@@ -243,6 +243,16 @@ pub async fn rollback_project_with(
     restore_db: bool,
     trigger: Trigger,
 ) -> Result<RunRecord> {
+    if let Some(branch) = target.branch.as_deref() {
+        if !branch.trim().is_empty() && branch.trim() != p.branch.trim() {
+            bail!(
+                "run {} deployed branch '{}', not '{}' — roll back with that branch's target",
+                target.id,
+                branch,
+                p.branch
+            );
+        }
+    }
     let sha = rollback_sha(target)?;
     run(
         p,
@@ -254,6 +264,24 @@ pub async fn rollback_project_with(
         trigger,
     )
     .await
+}
+
+/// The effective config to roll `run` back with: the target for the branch it
+/// deployed (a record with no branch predates branch targets and ran the
+/// primary branch). Errors when that branch is no longer configured.
+pub fn target_for_run(project: &ProjectConfig, run: &RunRecord) -> Result<ProjectConfig> {
+    let branch = run
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| project.branch.trim());
+    project.target(branch).with_context(|| {
+        format!(
+            "run {} deployed branch '{branch}', which is no longer one of {}'s branches",
+            run.id, project.id
+        )
+    })
 }
 
 async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunRecord> {
@@ -338,6 +366,9 @@ async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunR
     )?;
     // Recorded in the log too, so the raw log answers "why did this run"
     // on its own. The '#' keeps it out of the summary line.
+    if !p.branch.trim().is_empty() {
+        writeln!(log, "# branch: {}", p.branch.trim())?;
+    }
     if let Some(source) = trigger.source.as_deref() {
         writeln!(log, "# trigger: {source}")?;
     }
@@ -371,6 +402,7 @@ async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunR
         // Filled in once the final message has been attempted below.
         telegram: None,
         rollback_to: rollback_to.clone(),
+        branch: Some(p.branch.clone()),
     }) {
         eprintln!("webhookr: could not record run start: {error:#}");
     }
@@ -494,6 +526,7 @@ async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunR
         telegram
             .started(
                 &p.name,
+                &p.branch,
                 &id,
                 start_sha.as_deref(),
                 start_author.as_deref(),
@@ -611,6 +644,7 @@ async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunR
         author,
         trigger.source.clone(),
         rollback_to,
+        Some(p.branch.clone()),
     )?;
     if let Some(reporter) = reporter.as_mut() {
         let text = if state == github::State::Success {
@@ -626,7 +660,9 @@ async fn run(p: &ProjectConfig, mode: SyncMode, trigger: Trigger) -> Result<RunR
         // message adds its own. Strip ANSI before the tail is cut so colour
         // codes cannot eat the character budget.
         let tail = crate::util::strip_ansi(&read_tail(&log_path, 16 * 1024));
-        let delivery = telegram.finished(&p.name, &record, &tail, &mut log).await;
+        let delivery = telegram
+            .finished(&p.name, &p.branch, &record, &tail, &mut log)
+            .await;
         // The outcome goes onto the persisted record, not just the log: the
         // run page stops polling the log as soon as the run leaves `running`,
         // which is before the `# telegram:` note is written. `append_run`
@@ -788,9 +824,27 @@ async fn sync_project(
         return Err(format!("project path is not a Git checkout: {}", p.path));
     }
 
+    // Explicit refspec: a `--single-branch` clone only tracks its first
+    // branch, so a plain `fetch origin <b>` would not create
+    // `refs/remotes/origin/<b>` for an extra branch target.
+    let refspec = fetch_refspec(&p.branch);
+    let checkout = if local_branch_exists(&p.path, &p.branch).await {
+        vec!["checkout".to_string(), p.branch.clone()]
+    } else {
+        vec![
+            "checkout".to_string(),
+            "-b".to_string(),
+            p.branch.clone(),
+            // `--no-track`: a single-branch clone's fetch config does not map
+            // this branch, so git cannot set up tracking; the pull below names
+            // the remote branch explicitly anyway.
+            "--no-track".to_string(),
+            format!("origin/{}", p.branch),
+        ]
+    };
     let git_steps: [(&str, Vec<&str>); 3] = [
-        ("fetch", vec!["fetch", "origin", p.branch.as_str()]),
-        ("checkout", vec!["checkout", p.branch.as_str()]),
+        ("fetch", vec!["fetch", "origin", refspec.as_str()]),
+        ("checkout", checkout.iter().map(String::as_str).collect()),
         (
             "pull",
             vec!["pull", "--ff-only", "origin", p.branch.as_str()],
@@ -810,6 +864,25 @@ async fn sync_project(
         }
     }
     Ok(SyncOutcome::Done)
+}
+
+/// Fetch refspec that creates the remote-tracking ref even in a
+/// `--single-branch` clone.
+fn fetch_refspec(branch: &str) -> String {
+    format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
+}
+
+/// Whether the checkout already has a local branch called `branch`.
+async fn local_branch_exists(path: &str, branch: &str) -> bool {
+    Command::new("git")
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// A full 40-hex-digit object name — the only commit spelling the rollback
@@ -862,8 +935,9 @@ async fn rollback_sync(
         return Err(format!("cannot roll back: no checkout at {}", p.path));
     }
     let token = live_git_token(p);
+    let refspec = fetch_refspec(&p.branch);
     let git_steps: [(&str, Vec<&str>); 2] = [
-        ("fetch", vec!["fetch", "origin", p.branch.as_str()]),
+        ("fetch", vec!["fetch", "origin", refspec.as_str()]),
         // --detach is the point: the branch ref is left pointing at the
         // remote tip for the next forward run to heal from.
         ("checkout", vec!["checkout", "--detach", sha]),
@@ -897,7 +971,21 @@ async fn deploy(
         if !compose_path.is_file() {
             bail!("compose file does not exist: {}", compose_path.display());
         }
-        let mut base = vec!["compose", "-f", p.compose_file.as_str()];
+        let env_file = p.env_file.trim();
+        if !env_file.is_empty() && !Path::new(&p.path).join(env_file).is_file() {
+            bail!(
+                "env file does not exist: {}",
+                Path::new(&p.path).join(env_file).display()
+            );
+        }
+        let mut base = vec!["compose"];
+        if !p.compose_project.trim().is_empty() {
+            base.extend(["-p", p.compose_project.trim()]);
+        }
+        base.extend(["-f", p.compose_file.as_str()]);
+        if !env_file.is_empty() {
+            base.extend(["--env-file", env_file]);
+        }
         for profile in &p.compose_profiles {
             base.extend(["--profile", profile.as_str()]);
         }
@@ -918,16 +1006,59 @@ async fn deploy(
         up.push("--remove-orphans");
         run_command("docker", &up, &p.path, "docker compose up", log, cancel).await
     } else {
-        run_command(
-            "sh",
-            &["-c", p.command.as_str()],
-            &p.path,
-            "custom command",
-            log,
-            cancel,
-        )
-        .await
+        let mut command = Command::new("sh");
+        command.args(["-c", p.command.as_str()]);
+        command.env("WEBHOOKR_BRANCH", p.branch.trim());
+        command.env("WEBHOOKR_PROJECT_ID", &p.id);
+        if !p.compose_project.trim().is_empty() {
+            command.env("WEBHOOKR_COMPOSE_PROJECT", p.compose_project.trim());
+        }
+        let env_file = p.env_file.trim();
+        if !env_file.is_empty() {
+            let file = Path::new(&p.path).join(env_file);
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("could not read env file {}", file.display()))?;
+            // Values are exported but never logged.
+            for (key, value) in parse_dotenv(&text) {
+                command.env(key, value);
+            }
+            command.env("WEBHOOKR_ENV_FILE", env_file);
+        }
+        exec(command, &p.path, "custom command", log, cancel).await
     }
+}
+
+/// Parse a simple dotenv file: blank lines and `#` comments are skipped, an
+/// optional `export ` prefix is dropped, and `KEY=VALUE` values lose one pair
+/// of matching surrounding single or double quotes. Lines without a valid key
+/// are ignored. No interpolation or escapes.
+pub(crate) fn parse_dotenv(text: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let valid = key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            continue;
+        }
+        let raw = value.trim();
+        let unquoted = ['"', '\'']
+            .iter()
+            .find_map(|q| raw.strip_prefix(*q).and_then(|rest| rest.strip_suffix(*q)));
+        pairs.push((key.to_string(), unquoted.unwrap_or(raw).to_string()));
+    }
+    pairs
 }
 
 /// A `git` command carrying the project's credentials, if it has any.
@@ -1090,6 +1221,7 @@ fn finalize(
     author: Option<String>,
     triggered_by: Option<String>,
     rollback_to: Option<String>,
+    branch: Option<String>,
 ) -> Result<RunRecord> {
     let finished_at = crate::util::now_iso();
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -1107,6 +1239,7 @@ fn finalize(
         triggered_by,
         telegram: None,
         rollback_to,
+        branch,
     };
 
     writeln!(
@@ -1146,7 +1279,9 @@ mod tests {
     use std::io::Write;
     use std::process::Command as StdCommand;
 
-    use super::{rollback_sha, rollback_sync, sync_project, ExecOutcome};
+    use super::{
+        parse_dotenv, rollback_sha, rollback_sync, sync_project, target_for_run, ExecOutcome,
+    };
     use crate::config::ProjectConfig;
     use crate::state::RunRecord;
 
@@ -1245,6 +1380,149 @@ mod tests {
     /// 40-hex sha is a rollable target. The sha later reaches `git checkout`
     /// positionally, so a short prefix or anything flag-shaped is refused
     /// here rather than handed to git to interpret.
+    #[tokio::test]
+    async fn deploys_a_second_branch_from_a_single_branch_clone() {
+        let root =
+            std::env::temp_dir().join(format!("webhookr-executor-{}", crate::util::new_run_id()));
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let checkout = root.join("checkout");
+        fs::create_dir_all(&seed).unwrap();
+        git(&root, &["init", "--bare", remote.to_str().unwrap()]);
+        git(&seed, &["init", "-b", "develop"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        git(&seed, &["config", "user.name", "Webhookr Test"]);
+        fs::write(seed.join("version.txt"), "dev-one").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-m", "initial"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "develop"]);
+
+        let mut project = ProjectConfig::new(
+            "site".into(),
+            "Site".into(),
+            checkout.to_string_lossy().into_owned(),
+            "develop".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        project.repository = remote.to_string_lossy().into_owned();
+        project
+            .branches
+            .push(crate::config::BranchTarget::new("sandbox".into()));
+        let develop = project.target("develop").unwrap();
+        let sandbox = project.target("sandbox").unwrap();
+
+        let log_path = root.join("test.log");
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        let cancel = tokio::sync::Notify::new();
+        // The clone is `--single-branch` on develop.
+        sync_project(&develop, &mut log, &log_path, &cancel)
+            .await
+            .unwrap();
+
+        // The sandbox branch appears on the remote only afterwards.
+        git(&seed, &["checkout", "-b", "sandbox"]);
+        fs::write(seed.join("version.txt"), "sandbox-one").unwrap();
+        git(&seed, &["commit", "-am", "sandbox"]);
+        git(&seed, &["push", "-u", "origin", "sandbox"]);
+
+        sync_project(&sandbox, &mut log, &log_path, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "sandbox-one"
+        );
+        assert_eq!(
+            git_output(&checkout, &["branch", "--show-current"]).trim(),
+            "sandbox"
+        );
+
+        // Back to develop (local branch exists), then a new sandbox commit
+        // fast-forwards the existing local sandbox branch.
+        sync_project(&develop, &mut log, &log_path, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "dev-one"
+        );
+        fs::write(seed.join("version.txt"), "sandbox-two").unwrap();
+        git(&seed, &["commit", "-am", "sandbox 2"]);
+        git(&seed, &["push"]);
+        sync_project(&sandbox, &mut log, &log_path, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "sandbox-two"
+        );
+
+        // A rollback on the sandbox target fetches with the same refspec.
+        let one = git_output(&seed, &["rev-parse", "HEAD~1"]);
+        rollback_sync(&sandbox, &one, &mut log, &log_path, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("version.txt")).unwrap(),
+            "sandbox-one"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dotenv_parsing_handles_comments_exports_and_quotes() {
+        let text = "# comment\n\nA=1\nexport B=two words\nC=\"quoted # kept\"\nD='single'\n  E = spaced \nF=\nbad line\n1X=no\nG=\"mismatch'\nH=a=b\n";
+        let pairs = parse_dotenv(text);
+        let get = |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("A"), Some("1"));
+        assert_eq!(get("B"), Some("two words"));
+        assert_eq!(get("C"), Some("quoted # kept"));
+        assert_eq!(get("D"), Some("single"));
+        assert_eq!(get("E"), Some("spaced"));
+        assert_eq!(get("F"), Some(""));
+        assert_eq!(get("G"), Some("\"mismatch'"));
+        assert_eq!(get("H"), Some("a=b"));
+        assert_eq!(pairs.len(), 8, "invalid lines are skipped");
+    }
+
+    #[test]
+    fn runs_resolve_to_their_branch_target() {
+        let mut project = ProjectConfig::new(
+            "site".into(),
+            "Site".into(),
+            "/srv/site".into(),
+            "develop".into(),
+            "true".into(),
+            "secret".into(),
+            "github".into(),
+        );
+        project
+            .branches
+            .push(crate::config::BranchTarget::new("sandbox".into()));
+        let mut run = run_record("success", None);
+        run.branch = None;
+        assert_eq!(target_for_run(&project, &run).unwrap().branch, "develop");
+        run.branch = Some("sandbox".into());
+        assert_eq!(target_for_run(&project, &run).unwrap().branch, "sandbox");
+        run.branch = Some("gone".into());
+        assert!(target_for_run(&project, &run).is_err());
+    }
+
     #[test]
     fn rollback_guard_requires_success_and_a_full_sha() {
         let sha = "1111111111111111111111111111111111111111";
@@ -1294,6 +1572,7 @@ mod tests {
             triggered_by: None,
             telegram: None,
             rollback_to: None,
+            branch: None,
         }
     }
 
@@ -1467,6 +1746,7 @@ mod tests {
         notifier
             .started(
                 "Site",
+                "main",
                 "a1b2c3d4e5f6",
                 None,
                 None,
@@ -1487,9 +1767,10 @@ mod tests {
             triggered_by: Some("push by alice".into()),
             telegram: None,
             rollback_to: None,
+            branch: None,
         };
         let delivery = notifier
-            .finished("Site", &failed, "docker: no such image", &mut log)
+            .finished("Site", "main", &failed, "docker: no such image", &mut log)
             .await;
 
         let written = fs::read_to_string(&log_path).unwrap();

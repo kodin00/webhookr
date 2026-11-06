@@ -4,10 +4,12 @@
 //! function the CLI and TUI use, so there is exactly one authority on what a
 //! valid project looks like.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use serde::Deserialize;
 
-use crate::config::{DatabaseConfig, ProjectConfig};
+use crate::config::{BranchTarget, DatabaseConfig, ProjectConfig};
 use crate::util;
 
 fn default_branch() -> String {
@@ -98,6 +100,190 @@ pub struct ProjectForm {
     /// [`ProjectConfig::validate`] would refuse it anyway).
     #[serde(default)]
     pub db_keep: String,
+    /// Env file for the primary branch's compose commands, relative to the
+    /// checkout. Empty: none.
+    #[serde(default)]
+    pub env_file: String,
+    /// Compose project name (`-p`) for the primary branch. Empty: Compose's
+    /// own default.
+    #[serde(default)]
+    pub compose_project: String,
+    /// Extra branch targets as indexed flat keys, `bt<N>_<field>` (see
+    /// [`BranchRow`]). A urlencoded body cannot carry a list of structs, so
+    /// the rows ride in as stray keys and are regrouped by [`Self::branch_rows`].
+    #[serde(flatten)]
+    pub bt: BTreeMap<String, String>,
+}
+
+/// One extra-branch row of the form: the fields the page shows for a
+/// [`BranchTarget`]. Everything is a string because that is what a form
+/// carries; [`ProjectForm::to_project`] turns rows into targets.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BranchRow {
+    pub branch: String,
+    pub preset: String,
+    pub command: String,
+    pub compose_file: String,
+    /// Comma- or newline-separated.
+    pub profiles: String,
+    pub env_file: String,
+    pub compose_project: String,
+    /// Comma- or newline-separated.
+    pub merge_sources: String,
+    pub db_mode: String,
+    pub db_compose_file: String,
+}
+
+/// Field suffixes of a branch row, in render order.
+const ROW_FIELDS: [&str; 10] = [
+    "branch",
+    "preset",
+    "command",
+    "compose_file",
+    "profiles",
+    "env_file",
+    "compose_project",
+    "merge_sources",
+    "db_mode",
+    "db_compose_file",
+];
+
+impl BranchRow {
+    fn from_target(target: &BranchTarget) -> Self {
+        Self {
+            branch: target.branch.clone(),
+            preset: target.deploy_preset.clone(),
+            command: target.command.clone(),
+            compose_file: target.compose_file.clone(),
+            profiles: target.compose_profiles.join(", "),
+            env_file: target.env_file.clone(),
+            compose_project: target.compose_project.clone(),
+            merge_sources: target.merge_sources.join(", "),
+            db_mode: target.database.mode.clone(),
+            db_compose_file: target.database.compose_file.clone(),
+        }
+    }
+
+    fn field_mut(&mut self, name: &str) -> Option<&mut String> {
+        Some(match name {
+            "branch" => &mut self.branch,
+            "preset" => &mut self.preset,
+            "command" => &mut self.command,
+            "compose_file" => &mut self.compose_file,
+            "profiles" => &mut self.profiles,
+            "env_file" => &mut self.env_file,
+            "compose_project" => &mut self.compose_project,
+            "merge_sources" => &mut self.merge_sources,
+            "db_mode" => &mut self.db_mode,
+            "db_compose_file" => &mut self.db_compose_file,
+            _ => return None,
+        })
+    }
+
+    fn field(&self, name: &str) -> &str {
+        match name {
+            "branch" => &self.branch,
+            "preset" => &self.preset,
+            "command" => &self.command,
+            "compose_file" => &self.compose_file,
+            "profiles" => &self.profiles,
+            "env_file" => &self.env_file,
+            "compose_project" => &self.compose_project,
+            "merge_sources" => &self.merge_sources,
+            "db_mode" => &self.db_mode,
+            "db_compose_file" => &self.db_compose_file,
+            _ => "",
+        }
+    }
+
+    /// Turn the row into a target, laid over `base` — the stored target of the
+    /// same branch name when editing — so the fields the form does not show
+    /// (database engine, service, backups, keep) survive a round trip.
+    fn to_target(&self, base: Option<&BranchTarget>) -> BranchTarget {
+        let name = self.branch.trim().to_string();
+        let mut target = base
+            .cloned()
+            .unwrap_or_else(|| BranchTarget::new(name.clone()));
+        target.branch = name;
+        if !self.preset.trim().is_empty() {
+            target.deploy_preset = self.preset.trim().to_string();
+        }
+        target.command = self.command.trim().to_string();
+        if !self.compose_file.trim().is_empty() {
+            target.compose_file = self.compose_file.trim().to_string();
+        }
+        target.compose_profiles = split_profiles(&self.profiles);
+        target.env_file = self.env_file.trim().to_string();
+        target.compose_project = self.compose_project.trim().to_string();
+        target.merge_sources = split_profiles(&self.merge_sources);
+
+        if !self.db_mode.trim().is_empty() {
+            target.database.mode = self.db_mode.trim().to_string();
+        }
+        // Same rule as the primary block: kind/service only mean something in
+        // manual mode, so a switch away drops them.
+        if target.database.mode != "manual" {
+            target.database.kind.clear();
+            target.database.service.clear();
+        }
+        target.database.compose_file = self.db_compose_file.trim().to_string();
+        target
+    }
+}
+
+/// Form key for field `name` of row `index`.
+pub fn row_key(index: impl std::fmt::Display, name: &str) -> String {
+    format!("bt{index}_{name}")
+}
+
+impl ProjectForm {
+    /// The submitted extra-branch rows, in index order. Keys that do not look
+    /// like `bt<N>_<field>` are ignored.
+    pub fn branch_rows(&self) -> Vec<BranchRow> {
+        let mut rows: BTreeMap<usize, BranchRow> = BTreeMap::new();
+        for (key, value) in &self.bt {
+            let Some(rest) = key.strip_prefix("bt") else {
+                continue;
+            };
+            let Some((index, name)) = rest.split_once('_') else {
+                continue;
+            };
+            let Ok(index) = index.parse::<usize>() else {
+                continue;
+            };
+            if let Some(slot) = rows.entry(index).or_default().field_mut(name) {
+                *slot = value.clone();
+            }
+        }
+        rows.into_values().collect()
+    }
+
+    fn set_rows(&mut self, rows: &[BranchRow]) {
+        self.bt.clear();
+        for (index, row) in rows.iter().enumerate() {
+            for name in ROW_FIELDS {
+                self.bt
+                    .insert(row_key(index, name), row.field(name).to_string());
+            }
+        }
+    }
+
+    /// The extra branches from the submitted rows. Rows without a branch name
+    /// are dropped (the blank row a person added and never filled in).
+    fn branch_targets(&self, existing: Option<&ProjectConfig>) -> Vec<BranchTarget> {
+        self.branch_rows()
+            .iter()
+            .filter(|row| !row.branch.trim().is_empty())
+            .map(|row| {
+                let base = existing.and_then(|p| {
+                    p.branches
+                        .iter()
+                        .find(|t| t.branch.trim() == row.branch.trim())
+                });
+                row.to_target(base)
+            })
+            .collect()
+    }
 }
 
 impl ProjectForm {
@@ -182,6 +368,9 @@ impl ProjectForm {
             status_token,
             status_context: self.status_context.trim().to_string(),
             database,
+            env_file: self.env_file.trim().to_string(),
+            compose_project: self.compose_project.trim().to_string(),
+            branches: self.branch_targets(existing),
         };
 
         project.validate()?;
@@ -247,7 +436,7 @@ impl ProjectForm {
 
     /// Rebuild a form from a stored project, for the edit page.
     pub fn from_project(project: &ProjectConfig) -> Self {
-        Self {
+        let mut form = Self {
             name: project.name.clone(),
             id: project.id.clone(),
             repository: project.repository.clone(),
@@ -278,7 +467,13 @@ impl ProjectForm {
             db_compose_file: project.database.compose_file.clone(),
             db_backups: project.database.backups.then(|| "1".to_string()),
             db_keep: project.database.keep.to_string(),
-        }
+            env_file: project.env_file.clone(),
+            compose_project: project.compose_project.clone(),
+            bt: BTreeMap::new(),
+        };
+        let rows: Vec<BranchRow> = project.branches.iter().map(BranchRow::from_target).collect();
+        form.set_rows(&rows);
+        form
     }
 }
 
@@ -338,6 +533,9 @@ mod tests {
             db_compose_file: String::new(),
             db_backups: None,
             db_keep: String::new(),
+            env_file: String::new(),
+            compose_project: String::new(),
+            bt: BTreeMap::new(),
         }
     }
 
@@ -556,5 +754,118 @@ mod tests {
         let project = form.to_project(None).unwrap();
         assert_eq!(project.database.mode, "auto");
         assert!(project.database.backups);
+    }
+
+    fn with_rows(rows: &[BranchRow]) -> ProjectForm {
+        let mut form = form();
+        form.set_rows(rows);
+        form
+    }
+
+    fn sandbox_row() -> BranchRow {
+        BranchRow {
+            branch: " sandbox ".into(),
+            preset: "compose_up".into(),
+            compose_file: "docker-compose.sandbox.yml".into(),
+            profiles: "web, worker".into(),
+            env_file: ".env.sandbox".into(),
+            ..BranchRow::default()
+        }
+    }
+
+    #[test]
+    fn primary_env_file_and_compose_project_are_stored() {
+        let mut form = form();
+        form.env_file = " .env.prod ".into();
+        form.compose_project = " site ".into();
+        let project = form.to_project(None).unwrap();
+        assert_eq!(project.env_file, ".env.prod");
+        assert_eq!(project.compose_project, "site");
+        let rebuilt = ProjectForm::from_project(&project);
+        assert_eq!(rebuilt.env_file, ".env.prod");
+        assert_eq!(rebuilt.compose_project, "site");
+    }
+
+    #[test]
+    fn extra_branches_round_trip_through_from_project() {
+        let rows = [
+            sandbox_row(),
+            BranchRow {
+                branch: "staging".into(),
+                preset: "custom".into(),
+                command: "./deploy-staging.sh".into(),
+                compose_project: "site-stg".into(),
+                merge_sources: "feature, hotfix".into(),
+                db_mode: "off".into(),
+                ..BranchRow::default()
+            },
+        ];
+        let original = with_rows(&rows).to_project(None).unwrap();
+        assert_eq!(original.branches.len(), 2);
+        let sandbox = &original.branches[0];
+        assert_eq!(sandbox.branch, "sandbox");
+        assert_eq!(sandbox.deploy_preset, "compose_up");
+        assert_eq!(sandbox.compose_file, "docker-compose.sandbox.yml");
+        assert_eq!(sandbox.compose_profiles, vec!["web", "worker"]);
+        assert_eq!(sandbox.env_file, ".env.sandbox");
+        let staging = &original.branches[1];
+        assert_eq!(staging.command, "./deploy-staging.sh");
+        assert_eq!(staging.merge_sources, vec!["feature", "hotfix"]);
+        assert_eq!(staging.database.mode, "off");
+
+        let rebuilt = ProjectForm::from_project(&original)
+            .to_project(Some(&original))
+            .unwrap();
+        assert_eq!(original, rebuilt);
+    }
+
+    #[test]
+    fn edit_keeps_hidden_database_fields_of_an_extra_branch() {
+        let mut stored = with_rows(&[sandbox_row()]).to_project(None).unwrap();
+        stored.branches[0].database.mode = "manual".into();
+        stored.branches[0].database.kind = "postgres".into();
+        stored.branches[0].database.service = "db".into();
+        stored.branches[0].database.keep = 9;
+        stored.branches[0].database.backups = false;
+
+        let edited = ProjectForm::from_project(&stored)
+            .to_project(Some(&stored))
+            .unwrap();
+        assert_eq!(edited.branches, stored.branches);
+    }
+
+    #[test]
+    fn blank_branch_rows_are_dropped() {
+        let project = with_rows(&[BranchRow::default(), sandbox_row()])
+            .to_project(None)
+            .unwrap();
+        assert_eq!(project.branches.len(), 1);
+        assert_eq!(project.branches[0].branch, "sandbox");
+    }
+
+    #[test]
+    fn duplicate_or_primary_extra_branches_are_rejected() {
+        let duplicate = with_rows(&[sandbox_row(), sandbox_row()]);
+        assert!(duplicate.to_project(None).is_err());
+
+        let mut same_as_primary = sandbox_row();
+        same_as_primary.branch = "main".into();
+        assert!(with_rows(&[same_as_primary]).to_project(None).is_err());
+    }
+
+    #[test]
+    fn branch_rows_deserialize_from_a_form_body() {
+        let body = "name=My+Site&repository=https://example.com/site.git&\
+                    path=/tmp/webhookr-form-test&branch=main&command=./deploy.sh&\
+                    trigger_push=1&env_file=.env&\
+                    bt0_branch=sandbox&bt0_preset=compose_up&bt0_compose_file=sb.yml&\
+                    bt2_branch=staging&bt2_preset=custom&bt2_command=.%2Fstg.sh";
+        let form = serde_urlencoded::from_str::<ProjectForm>(body).unwrap();
+        let project = form.to_project(None).unwrap();
+        assert_eq!(project.env_file, ".env");
+        assert_eq!(project.trigger_events, vec!["push"]);
+        assert_eq!(project.branches.len(), 2);
+        assert_eq!(project.branches[0].compose_file, "sb.yml");
+        assert_eq!(project.branches[1].command, "./stg.sh");
     }
 }

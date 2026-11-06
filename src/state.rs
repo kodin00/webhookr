@@ -60,6 +60,11 @@ pub struct RunRecord {
     /// runs and on runs recorded before rollbacks existed.
     #[serde(default)]
     pub rollback_to: Option<String>,
+    /// The branch this run deployed — which of the project's branch targets
+    /// it ran. Absent on runs recorded before branch targets existed; read
+    /// those as the project's primary branch.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// Outcome of a run's final Telegram notification.
@@ -230,6 +235,7 @@ mod tests {
             triggered_by: None,
             telegram: None,
             rollback_to: None,
+            branch: None,
         }
     }
 

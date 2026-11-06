@@ -38,6 +38,7 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
         })
         .collect();
 
+    let cfg = crate::config::load_config()?;
     let body = html! {
         section class="page-head" { h1 { "Runs" } }
         section class="card" {
@@ -47,7 +48,7 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
                 div class="table-scroll" {
                     table {
                         thead { tr {
-                            th { "Status" } th { "Project" } th { "Commit" } th { "Author" }
+                            th { "Status" } th { "Project" } th { "Branch" } th { "Commit" } th { "Author" }
                             th { "Trigger" } th { "Started" } th { "Duration" } th { "Summary" }
                         } }
                         tbody {
@@ -58,6 +59,14 @@ pub async fn index(Query(filter): Query<RunFilter>) -> Result<Markup, WebError> 
                                         (rollback_badge(run))
                                     }
                                     td { a href={ "/projects/" (run.project_id) } { (run.project_id) } }
+                                    td class="mono small" {
+                                        // Runs from before branch targets show the
+                                        // project's primary branch.
+                                        @match cfg.get(&run.project_id) {
+                                            Some(project) => (views::run_branch(run, project)),
+                                            None => (run.branch.as_deref().unwrap_or("—")),
+                                        }
+                                    }
                                     td class="mono small" title=[run.commit.as_deref()] {
                                         (short_sha(run))
                                     }
@@ -175,6 +184,10 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
                 span class="field-value" { (run.status) (rollback_badge(&run)) }
             }
             (views::field("Project", &run.project_id))
+            @match crate::config::load_config().ok().and_then(|cfg| cfg.get(&run.project_id).cloned()) {
+                Some(project) => (views::code_field("Branch", views::run_branch(&run, &project))),
+                None => @if let Some(branch) = run.branch.as_deref() { (views::code_field("Branch", branch)) },
+            }
             @if let Some(trigger) = run.triggered_by.as_deref() {
                 (views::field("Triggered by", trigger))
             }

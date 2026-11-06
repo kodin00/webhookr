@@ -66,6 +66,13 @@ pub struct DbInfo {
     /// Compose profiles that were part of the resolution (compose presets
     /// only — an operator-named file on a custom command is probed bare).
     pub profiles: Vec<String>,
+    /// Compose project name (`-p`) of the stack the deploy ran under, so dump
+    /// and restore address the same branch's containers. Empty: Compose's
+    /// default.
+    pub compose_project: String,
+    /// Env file (relative to the project path) the deploy passed as
+    /// `--env-file`. Empty: none.
+    pub env_file: String,
 }
 
 /// The database a project has, if any.
@@ -105,6 +112,8 @@ pub async fn database_for(p: &ProjectConfig) -> Option<DbInfo> {
                     } else {
                         Vec::new()
                     },
+                    compose_project: p.compose_project.trim().to_string(),
+                    env_file: p.env_file.trim().to_string(),
                 });
             }
             // Something was left blank: fill it from the chosen file with the
@@ -115,6 +124,8 @@ pub async fn database_for(p: &ProjectConfig) -> Option<DbInfo> {
                 service: service.unwrap_or(detected.service),
                 compose_files: detected.compose_files,
                 profiles: detected.profiles,
+                compose_project: detected.compose_project,
+                env_file: detected.env_file,
             })
         }
         "auto" => detect_via_compose(p).await,
@@ -155,7 +166,14 @@ async fn detect_via_compose(p: &ProjectConfig) -> Option<DbInfo> {
         Vec::new()
     };
     for file in &compose_files {
-        let mut args = vec!["compose".to_string(), "-f".to_string(), file.clone()];
+        let mut args = vec!["compose".to_string()];
+        if !p.compose_project.trim().is_empty() {
+            args.extend(["-p".to_string(), p.compose_project.trim().to_string()]);
+        }
+        args.extend(["-f".to_string(), file.clone()]);
+        if !p.env_file.trim().is_empty() {
+            args.extend(["--env-file".to_string(), p.env_file.trim().to_string()]);
+        }
         for profile in &profiles {
             args.extend(["--profile".to_string(), profile.clone()]);
         }
@@ -186,6 +204,8 @@ async fn detect_via_compose(p: &ProjectConfig) -> Option<DbInfo> {
                 // exactly what was probed here.
                 compose_files: vec![file.clone()],
                 profiles,
+                compose_project: p.compose_project.trim().to_string(),
+                env_file: p.env_file.trim().to_string(),
             });
         }
     }
@@ -264,6 +284,10 @@ pub struct Backup {
     pub label: String,
     /// Dump size in bytes, for the confirm page.
     pub size: u64,
+    /// Branch target whose database this dump came from. Absent on dumps
+    /// written before branch targets existed: read as the primary branch.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// Directory holding a project's dumps and manifest.
@@ -392,12 +416,13 @@ pub async fn dump(
         kind: db.kind.as_str().to_string(),
         label: label.to_string(),
         size,
+        branch: Some(p.branch.clone()),
     };
     // A manifest failure fails the dump — a deploy must not proceed on a dump
     // no rollback will ever find — but the dump file itself is kept: it holds
     // good data, and deleting it would not fix the manifest.
     append_backup(&p.id, entry.clone())?;
-    prune(&p.id, p.database.keep);
+    prune(&p.id, &p.branch, p.database.keep);
     Ok(entry)
 }
 
@@ -493,25 +518,55 @@ pub async fn restore(
     }
 }
 
-/// Drop the oldest dumps past `keep`, both files and manifest rows.
-pub fn prune(project_id: &str, keep: usize) {
+/// Drop the oldest dumps past `keep` *per branch*, both files and manifest
+/// rows, so a busy branch cannot prune another branch's dumps. Rows with no
+/// branch count as `primary_branch`'s.
+pub fn prune(project_id: &str, primary_branch: &str, keep: usize) {
     let _guard = INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = backups_dir(project_id);
-    let mut index = load_index(project_id);
-    if index.len() <= keep {
+    let index = load_index(project_id);
+    let (mut kept, doomed) = split_prunable(index, primary_branch, keep);
+    if doomed.is_empty() {
         return;
     }
-    // The manifest is newest-first, so everything past the first `keep` rows
-    // is by definition the oldest. Individual unlink failures are ignored: a
-    // file already gone must not abort the sweep, and the manifest written
-    // below stays the source of truth for what exists.
-    let doomed = index.split_off(keep);
+    // Individual unlink failures are ignored: a file already gone must not
+    // abort the sweep, and the manifest written below stays the source of
+    // truth for what exists.
     for backup in &doomed {
         let _ = std::fs::remove_file(dir.join(&backup.file));
     }
-    if let Err(error) = save_index(project_id, &mut index) {
+    if let Err(error) = save_index(project_id, &mut kept) {
         eprintln!("webhookr: could not prune the backup manifest for {project_id}: {error:#}");
     }
+}
+
+/// Split a newest-first manifest into (kept, doomed): the newest `keep` rows
+/// of each branch survive. Order is preserved.
+fn split_prunable(
+    index: Vec<Backup>,
+    primary_branch: &str,
+    keep: usize,
+) -> (Vec<Backup>, Vec<Backup>) {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut kept = Vec::new();
+    let mut doomed = Vec::new();
+    for backup in index {
+        let branch = backup
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| primary_branch.trim())
+            .to_string();
+        let count = seen.entry(branch).or_insert(0);
+        *count += 1;
+        if *count <= keep {
+            kept.push(backup);
+        } else {
+            doomed.push(backup);
+        }
+    }
+    (kept, doomed)
 }
 
 /// What happened to one dump/restore step.
@@ -605,8 +660,14 @@ async fn exec_step(
 /// flow from a redirected file during restore.
 fn compose_exec_args(db: &DbInfo, inner: &str) -> Vec<String> {
     let mut args = vec!["compose".to_string()];
+    if !db.compose_project.is_empty() {
+        args.extend(["-p".to_string(), db.compose_project.clone()]);
+    }
     for file in &db.compose_files {
         args.extend(["-f".to_string(), file.clone()]);
+    }
+    if !db.env_file.is_empty() {
+        args.extend(["--env-file".to_string(), db.env_file.clone()]);
     }
     for profile in &db.profiles {
         args.extend(["--profile".to_string(), profile.clone()]);
@@ -741,6 +802,7 @@ mod tests {
             kind: "postgres".into(),
             label: "pre-deploy".into(),
             size: 1024,
+            branch: None,
         }
     }
 
@@ -921,6 +983,8 @@ mod tests {
             service: "db".into(),
             compose_files: vec!["docker/docker-compose.yml".into()],
             profiles: Vec::new(),
+            compose_project: String::new(),
+            env_file: String::new(),
         };
         assert_eq!(
             super::compose_exec_args(&db, "pg_dump"),
@@ -942,6 +1006,8 @@ mod tests {
             service: "db".into(),
             compose_files: vec!["compose.yaml".into()],
             profiles: vec!["observability".into()],
+            compose_project: String::new(),
+            env_file: String::new(),
         };
         assert_eq!(
             super::compose_exec_args(&preset, "psql")[..7],
@@ -956,11 +1022,34 @@ mod tests {
             ]
         );
 
+        let branch_stack = super::DbInfo {
+            kind: DbKind::Postgres,
+            service: "db".into(),
+            compose_files: vec!["docker-compose.sandbox.yml".into()],
+            profiles: Vec::new(),
+            compose_project: "app-sandbox".into(),
+            env_file: ".env.sandbox".into(),
+        };
+        assert_eq!(
+            super::compose_exec_args(&branch_stack, "psql")[..7],
+            [
+                "compose",
+                "-p",
+                "app-sandbox",
+                "-f",
+                "docker-compose.sandbox.yml",
+                "--env-file",
+                ".env.sandbox"
+            ]
+        );
+
         let unresolved = super::DbInfo {
             kind: DbKind::Postgres,
             service: "db".into(),
             compose_files: Vec::new(),
             profiles: Vec::new(),
+            compose_project: String::new(),
+            env_file: String::new(),
         };
         assert_eq!(
             super::compose_exec_args(&unresolved, "psql")[..4],
@@ -1048,7 +1137,7 @@ mod tests {
         for entry in [&old, &mid, &outside] {
             fs::write(dir.join(&entry.file), "-- dump").unwrap();
         }
-        super::prune("site", 2);
+        super::prune("site", "main", 2);
         let index = load_index("site");
         assert_eq!(index.len(), 2, "keep = 2 of 3");
         assert!(!index.iter().any(|b| b.file == old.file));
@@ -1065,6 +1154,28 @@ mod tests {
         assert!(dir.join(super::INDEX_FILE).exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_per_branch() {
+        let row = |file: &str, at: &str, branch: Option<&str>| Backup {
+            branch: branch.map(str::to_string),
+            ..backup(file, at, "")
+        };
+        // Newest first, as the manifest is. `sandbox` is busy; `develop` (the
+        // primary) has one old row recorded with no branch.
+        let index = vec![
+            row("s4", "2026-01-05", Some("sandbox")),
+            row("s3", "2026-01-04", Some("sandbox")),
+            row("s2", "2026-01-03", Some("sandbox")),
+            row("d2", "2026-01-02", Some("develop")),
+            row("s1", "2026-01-02", Some("sandbox")),
+            row("d1", "2026-01-01", None),
+        ];
+        let (kept, doomed) = super::split_prunable(index, "develop", 2);
+        let names = |rows: &[Backup]| rows.iter().map(|b| b.file.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&kept), ["s4", "s3", "d2", "d1"]);
+        assert_eq!(names(&doomed), ["s2", "s1"]);
     }
 
     /// Whether a container runtime answers, so docker-dependent tests can skip

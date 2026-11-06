@@ -39,3 +39,32 @@
     if (text && value) value.textContent = text.textContent;
   });
 })();
+
+// Extra-branch rows on the project form. The server renders one row per
+// stored branch plus a <template> with an `__i__` placeholder in every field
+// name; adding a row clones the template under a fresh number, removing one
+// just drops its fieldset (a row that is never posted is a row that is gone).
+(() => {
+  document.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) return;
+
+    const remove = event.target.closest("[data-remove-branch]");
+    if (remove) {
+      const row = remove.closest("[data-branch-row]");
+      if (row) row.remove();
+      return;
+    }
+
+    if (event.target.closest("[data-add-branch]")) {
+      const rows = document.getElementById("branch-rows");
+      const template = document.getElementById("branch-template");
+      if (!rows || !template) return;
+      const next = Number(rows.dataset.next || "0");
+      rows.dataset.next = String(next + 1);
+      rows.insertAdjacentHTML(
+        "beforeend",
+        template.innerHTML.replaceAll("__i__", String(next)),
+      );
+    }
+  });
+})();

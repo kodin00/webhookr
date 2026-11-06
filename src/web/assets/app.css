@@ -213,6 +213,10 @@ main {
 }
 .form legend { padding: 0 0.4rem; color: var(--muted); font-size: 0.85rem; }
 
+/* Extra-branch rows: a nested group inside the Extra branches fieldset. */
+.form fieldset.branch-row { background: var(--bg-soft, transparent); }
+#branch-rows { margin-bottom: 0.8rem; }
+
 .form label { display: block; margin-bottom: 0.9rem; }
 .form label > span:first-child {
   display: block;

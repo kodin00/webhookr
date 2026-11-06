@@ -14,7 +14,7 @@ use crate::config::{self, ProjectConfig, PRESETS};
 use crate::executor;
 use crate::state;
 use crate::util;
-use crate::web::forms::{self, ProjectForm};
+use crate::web::forms::{self, row_key, BranchRow, ProjectForm};
 use crate::web::views;
 use crate::web::WebError;
 
@@ -50,7 +50,7 @@ pub async fn list() -> Result<Markup, WebError> {
                             @for project in &cfg.projects {
                                 tr {
                                     td { a href={ "/projects/" (project.id) } { (project.name) } }
-                                    td class="mono" { (project.branch) }
+                                    td class="mono" { (project.branch_names().join(", ")) }
                                     td { (project.preset_label()) }
                                     td class="mono" { (project.verify_mode) }
                                     td class="mono small" {
@@ -103,6 +103,14 @@ pub async fn detail(
     // Probed per view rather than cached: one `docker compose config` keeps
     // this card honest about what a rollback here would actually restore.
     let database = backup::database_for(&project).await;
+    // Every extra branch's own database, for its "Back up now" button: a
+    // target's database block (and compose file) can differ from the primary's.
+    let mut branch_databases = Vec::new();
+    for target in project.targets().into_iter().skip(1) {
+        let db = backup::database_for(&target).await;
+        branch_databases.push((target.branch.clone(), db.is_some()));
+    }
+    let targets = project.targets();
     let backups = backup::load_index(&project.id);
     let database_label = {
         let label = match &database {
@@ -137,7 +145,7 @@ pub async fn detail(
         }
 
         section class="card" {
-            h2 { "Deploy" }
+            h2 { "Deploy" @if !project.branches.is_empty() { " " span class="mono small muted" { (project.branch) } } }
             div class="actions" {
                 form method="post" action={ "/projects/" (project.id) "/update-app" } {
                     button type="submit" class="button primary" { "Pull & deploy" }
@@ -157,6 +165,58 @@ pub async fn detail(
             }
         }
 
+        @if !project.branches.is_empty() {
+            section class="card" {
+                h2 { "Branches" }
+                p class="hint" {
+                    "One checkout and one webhook URL; a delivery for each branch checks it "
+                    "out here and deploys with that branch's settings."
+                }
+                div class="table-scroll" {
+                    table {
+                        thead { tr {
+                            th { "Branch" } th { "Deployment" } th { "Compose file / command" }
+                            th { "Env file" } th { "Compose project" } th { "Runs" } th {}
+                        } }
+                        tbody {
+                            @for target in &targets {
+                                @let primary = project.is_primary_branch(&target.branch);
+                                tr {
+                                    td class="mono" {
+                                        (target.branch)
+                                        @if primary { " " span class="badge badge-none" { "primary" } }
+                                    }
+                                    td { (target.preset_label()) }
+                                    td class="mono small" {
+                                        @if target.uses_compose() { (target.compose_file) } @else { (target.command) }
+                                    }
+                                    td class="mono small" {
+                                        @if target.env_file.trim().is_empty() { "—" } @else { (target.env_file) }
+                                    }
+                                    td class="mono small" {
+                                        @if target.compose_project.trim().is_empty() { "default" } @else { (target.compose_project) }
+                                    }
+                                    td { pre class="log cmd-preview" { (config::deploy_command_preview(target)) } }
+                                    td {
+                                        div class="actions" {
+                                            form method="post"
+                                                 action={ "/projects/" (project.id) "/update-app" (branch_qs(&project, &target.branch)) } {
+                                                button type="submit" class="button small primary" { "Pull & deploy" }
+                                            }
+                                            form method="post"
+                                                 action={ "/projects/" (project.id) "/deploy" (branch_qs(&project, &target.branch)) } {
+                                                button type="submit" class="button small" { "Redeploy" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         section class="card" {
             h2 { "Configuration" }
             (views::code_field("ID", &project.id))
@@ -171,6 +231,12 @@ pub async fn detail(
                 (views::code_field("Compose file", &project.compose_file))
                 @if !project.compose_profiles.is_empty() {
                     (views::code_field("Profiles", &project.compose_profiles.join(", ")))
+                }
+                @if !project.env_file.trim().is_empty() {
+                    (views::code_field("Env file", &project.env_file))
+                }
+                @if !project.compose_project.trim().is_empty() {
+                    (views::code_field("Compose project", &project.compose_project))
                 }
             }
             div class="field" {
@@ -194,9 +260,22 @@ pub async fn detail(
                     "backups directory)."
                 }
             }
-            @if database.is_some() {
-                form method="post" action={ "/projects/" (project.id) "/backup" } {
-                    button type="submit" class="button small" { "Back up now" }
+            div class="actions" {
+                @if database.is_some() {
+                    form method="post" action={ "/projects/" (project.id) "/backup" } {
+                        button type="submit" class="button small" {
+                            "Back up now"
+                            @if !project.branches.is_empty() { " (" (project.branch) ")" }
+                        }
+                    }
+                }
+                @for (branch, has_db) in &branch_databases {
+                    @if *has_db {
+                        form method="post"
+                             action={ "/projects/" (project.id) "/backup" (branch_qs(&project, branch)) } {
+                            button type="submit" class="button small" { "Back up now (" (branch) ")" }
+                        }
+                    }
                 }
             }
             @if backups.is_empty() {
@@ -292,6 +371,7 @@ pub async fn detail(
                             a href={ "/runs/" (run.id) } title=(run.started_at) {
                                 (views::jakarta_time(&run.started_at))
                             }
+                            span class="mono small" { (views::run_branch(run, &project)) }
                             span class="muted" { (views::duration(run)) }
                             @if let Some(author) = run.author.as_deref() {
                                 span class="muted small" { (author) }
@@ -309,6 +389,40 @@ pub async fn detail(
     Ok(views::page(&project.name, body))
 }
 
+/// `?branch=<name>` for a non-primary branch, empty for the primary, so the
+/// per-branch buttons post to the same routes the primary ones always used.
+fn branch_qs(project: &ProjectConfig, branch: &str) -> String {
+    if project.is_primary_branch(branch) {
+        return String::new();
+    }
+    let encoded: String = form_urlencoded::byte_serialize(branch.trim().as_bytes()).collect();
+    format!("?branch={encoded}")
+}
+
+/// The `?branch=` query the trigger and backup routes accept. Absent means
+/// the primary branch.
+#[derive(Deserialize)]
+pub struct BranchQuery {
+    pub branch: Option<String>,
+}
+
+/// The effective config for the requested branch, or a 400 naming it.
+fn resolve_target(
+    project: &ProjectConfig,
+    branch: Option<&str>,
+) -> Result<ProjectConfig, WebError> {
+    let branch = branch
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| project.branch.trim());
+    project.target(branch).ok_or_else(|| {
+        WebError::new(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("'{}' does not deploy branch '{branch}'", project.id),
+        )
+    })
+}
+
 fn verify_label(mode: &str) -> &'static str {
     match mode {
         "token" => "Shared token (X-Webhookr-Key header)",
@@ -318,7 +432,25 @@ fn verify_label(mode: &str) -> &'static str {
 
 fn curl_example(project: &ProjectConfig, url: &str) -> String {
     match project.verify_mode.as_str() {
-        "token" => format!("curl -X POST -H 'X-Webhookr-Key: <secret>' \\\n  {url}"),
+        "token" => {
+            let mut out = format!(
+                "# {}\ncurl -X POST -H 'X-Webhookr-Key: <secret>' \\\n  {url}",
+                if project.branches.is_empty() {
+                    "Deploys the configured branch".to_string()
+                } else {
+                    format!("Primary branch ({})", project.branch)
+                }
+            );
+            for extra in &project.branches {
+                let branch: String =
+                    form_urlencoded::byte_serialize(extra.branch.trim().as_bytes()).collect();
+                out.push_str(&format!(
+                    "\n\n# Branch {}\ncurl -X POST -H 'X-Webhookr-Key: <secret>' \\\n  '{url}?branch={branch}'",
+                    extra.branch.trim()
+                ));
+            }
+            out
+        }
         _ => format!(
             "# GitHub sends this automatically once the secret is set.\n\
              # Settings -> Webhooks -> Add webhook\n\
@@ -361,6 +493,9 @@ pub async fn new_form() -> Result<Markup, WebError> {
         db_compose_file: String::new(),
         db_backups: None,
         db_keep: String::new(),
+        env_file: String::new(),
+        compose_project: String::new(),
+        bt: Default::default(),
     };
     Ok(views::page(
         "Add project",
@@ -537,6 +672,11 @@ fn project_form(
         }
         None => (false, vec![("", "no key / public repo")]),
     };
+    let branch_rows = form.branch_rows();
+    let compose_project_default = match existing_id {
+        Some(id) => format!("{id}-<branch>"),
+        None => "<slug>-<branch>".to_string(),
+    };
     html! {
         section class="page-head" { h1 { (title) } }
         @if let Some(error) = error { (views::alert("error", error)) }
@@ -621,6 +761,46 @@ fn project_form(
                     }
                 }
                 div id="deploy-fields" { (deploy_fields_markup(form)) }
+                label {
+                    span { "Env file" span class="optional" { "optional, compose presets" } }
+                    input type="text" name="env_file" class="mono" value=(form.env_file)
+                          placeholder=".env";
+                    span class="hint" {
+                        "Passed as " code class="mono" { "--env-file" }
+                        ", relative to the checkout. Empty: Compose reads the default .env."
+                    }
+                }
+                label {
+                    span { "Compose project name" span class="optional" { "optional" } }
+                    input type="text" name="compose_project" class="mono" value=(form.compose_project)
+                          placeholder="Compose default";
+                    span class="hint" {
+                        "Passed as " code class="mono" { "-p" }
+                        ". Empty: Compose's default (the checkout directory name)."
+                    }
+                }
+            }
+
+            fieldset {
+                legend { "Extra branches" }
+                span class="hint" {
+                    "Deploy more branches from this same checkout, webhook URL and secret — "
+                    "for example a sandbox branch with its own compose file and env file. A "
+                    "delivery for one of these checks the branch out, pulls it, and deploys "
+                    "with that branch's settings. Token-mode senders pick the branch with "
+                    code class="mono" { "?branch=<name>" } "."
+                }
+                div id="branch-rows" data-next=(branch_rows.len()) {
+                    @for (index, row) in branch_rows.iter().enumerate() {
+                        (branch_row(&index.to_string(), row, &compose_project_default))
+                    }
+                }
+                button type="button" class="button small" data-add-branch { "Add branch" }
+                // Cloned by ui.js; the placeholder index is swapped for a
+                // fresh number, so field names stay unique per row.
+                template id="branch-template" {
+                    (branch_row("__i__", &BranchRow::default(), &compose_project_default))
+                }
             }
 
             fieldset {
@@ -808,6 +988,95 @@ fn project_form(
     }
 }
 
+/// One extra-branch group. `index` is the row number baked into the field
+/// names (`bt<index>_<field>`); the template uses the `__i__` placeholder.
+///
+/// Every field is always shown, whatever the preset: the command applies to
+/// the custom preset, the compose file and profiles to the compose ones, and
+/// the hints say so. That keeps the row free of preset-dependent re-rendering,
+/// which a client-side add/remove list would otherwise have to coordinate.
+fn branch_row(index: &str, row: &BranchRow, compose_project_default: &str) -> Markup {
+    let key = |name: &str| row_key(index, name);
+    let preset = if row.preset.trim().is_empty() {
+        "custom"
+    } else {
+        row.preset.trim()
+    };
+    let presets: Vec<(&str, &str)> = PRESETS.iter().map(|(id, label, _)| (*id, *label)).collect();
+    let db_mode = if row.db_mode.trim().is_empty() {
+        "auto"
+    } else {
+        row.db_mode.trim()
+    };
+    html! {
+        fieldset class="branch-row" data-branch-row {
+            legend { "Branch target" }
+            label {
+                span { "Branch" }
+                input type="text" name=(key("branch")) value=(row.branch) placeholder="sandbox";
+            }
+            label {
+                span { "Deployment" }
+                (views::dropdown(&key("preset"), preset, &presets))
+            }
+            label {
+                span { "Command" span class="optional" { "custom preset" } }
+                textarea name=(key("command")) rows="2" placeholder="./deploy-sandbox.sh" { (row.command) }
+            }
+            label {
+                span { "Compose file" span class="optional" { "compose presets" } }
+                input type="text" name=(key("compose_file")) class="mono" value=(row.compose_file)
+                      placeholder="docker-compose.sandbox.yml";
+            }
+            label {
+                span { "Compose profiles" span class="optional" { "optional" } }
+                input type="text" name=(key("profiles")) value=(row.profiles) placeholder="web, worker";
+                span class="hint" { "Comma-separated." }
+            }
+            label {
+                span { "Env file" span class="optional" { "optional" } }
+                input type="text" name=(key("env_file")) class="mono" value=(row.env_file)
+                      placeholder=".env.sandbox";
+            }
+            label {
+                span { "Compose project name" span class="optional" { "optional" } }
+                input type="text" name=(key("compose_project")) class="mono" value=(row.compose_project)
+                      placeholder=(compose_project_default);
+                span class="hint" {
+                    "Empty derives a separate name from the project and branch, so this "
+                    "stack never shares (or prunes) the primary branch's containers."
+                }
+            }
+            label {
+                span { "Merge from branches" span class="optional" { "optional" } }
+                input type="text" name=(key("merge_sources")) value=(row.merge_sources)
+                      placeholder="feature, hotfix";
+                span class="hint" { "Comma-separated; empty means any merge into this branch." }
+            }
+            label {
+                span { "Database" }
+                (views::dropdown(
+                    &key("db_mode"),
+                    db_mode,
+                    &[
+                        ("auto", "Auto-detect from the compose file"),
+                        ("manual", "Manual — keeps the stored engine and service"),
+                        ("off", "Off — no backups, code-only rollbacks"),
+                    ],
+                ))
+            }
+            label {
+                span { "Database compose file" span class="optional" { "optional" } }
+                input type="text" name=(key("db_compose_file")) class="mono"
+                      value=(row.db_compose_file) placeholder="docker-compose.sandbox.yml";
+            }
+            div class="form-actions" {
+                button type="button" class="button small danger" data-remove-branch { "Remove branch" }
+            }
+        }
+    }
+}
+
 /// JSON object for htmx's `hx-vals`, so the checkout path survives quoting
 /// intact — same trick as the directory picker's select fragment.
 fn browse_files_vals(root: &str) -> String {
@@ -847,6 +1116,9 @@ pub async fn deploy_fields(Query(query): Query<PresetQuery>) -> Markup {
         db_compose_file: String::new(),
         db_backups: None,
         db_keep: String::new(),
+        env_file: String::new(),
+        compose_project: String::new(),
+        bt: Default::default(),
     };
     deploy_fields_markup(&form)
 }
@@ -997,12 +1269,18 @@ pub async fn rotate_secret(Path(id): Path<String>) -> Result<Redirect, WebError>
 
 // ----- triggers ----------------------------------------------------------
 
-pub async fn deploy(Path(id): Path<String>) -> Result<Response, WebError> {
-    trigger(&id, false).await
+pub async fn deploy(
+    Path(id): Path<String>,
+    Query(query): Query<BranchQuery>,
+) -> Result<Response, WebError> {
+    trigger(&id, false, query.branch.as_deref()).await
 }
 
-pub async fn update_app(Path(id): Path<String>) -> Result<Response, WebError> {
-    trigger(&id, true).await
+pub async fn update_app(
+    Path(id): Path<String>,
+    Query(query): Query<BranchQuery>,
+) -> Result<Response, WebError> {
+    trigger(&id, true, query.branch.as_deref()).await
 }
 
 /// Cancel the project's in-flight run, if there is one, and go watch it. A
@@ -1026,8 +1304,11 @@ pub async fn cancel(Path(id): Path<String>) -> Result<Response, WebError> {
 /// The executor's per-project lock means a second trigger while one is in
 /// flight is refused rather than queued, so surface that as a message instead
 /// of silently doing nothing.
-async fn trigger(id: &str, sync_source: bool) -> Result<Response, WebError> {
-    let (_, project) = load_project(id)?;
+async fn trigger(id: &str, sync_source: bool, branch: Option<&str>) -> Result<Response, WebError> {
+    let (_, stored) = load_project(id)?;
+    // The executor takes the effective config for one branch; the stored
+    // project (with its branch list) never goes in.
+    let project = resolve_target(&stored, branch)?;
 
     let before: std::collections::HashSet<String> =
         state::load_runs().into_iter().map(|r| r.id).collect();
@@ -1118,14 +1399,20 @@ pub async fn rollback_form(
     // failed run, a run from before commits were recorded, another project's
     // run) gets an explanation rather than a bare error — the run plainly
     // exists, so the operator followed a real link to get here.
-    if run.project_id != project.id || run.status != "success" || run.commit.is_none() {
+    let target = if run.project_id == project.id {
+        executor::target_for_run(&project, &run)
+    } else {
+        Err(anyhow::anyhow!("run belongs to another project"))
+    };
+    if target.is_err() || run.status != "success" || run.commit.is_none() {
         let body = html! {
             section class="card" {
                 h1 { "Rollback " (project.name) }
                 p {
                     "Rollback replays the commit a run deployed, so the target has to be "
-                    "a successful run of this project with a recorded commit. That run "
-                    "does not qualify, so there is nothing to roll back to."
+                    "a successful run of this project with a recorded commit, on a branch "
+                    "the project still deploys. That run does not qualify, so there is "
+                    "nothing to roll back to."
                 }
                 div class="actions" {
                     a class="button" href={ "/runs/" (run.id) } { "Back to the run" }
@@ -1140,8 +1427,13 @@ pub async fn rollback_form(
     // compose file, and the manifest says whether the dump this restore would
     // replay still exists. Backups switched off in the project's database
     // block skip detection entirely — there would be nothing to offer anyway.
-    let db = if project.database.backups {
-        backup::database_for(&project).await
+    // `target` is the effective config for the branch the run deployed, so a
+    // sandbox run is restored with sandbox settings (and its database block).
+    let Ok(target) = target else {
+        unreachable!("an unresolved target returned above")
+    };
+    let db = if target.database.backups {
+        backup::database_for(&target).await
     } else {
         None
     };
@@ -1157,6 +1449,7 @@ pub async fn rollback_form(
                 "The checkout returns to the commit this run deployed and the "
                 "deployment runs again from it. Later runs stay in the history."
             }
+            (views::code_field("Branch", &target.branch))
             (views::field("Roll back to", &short))
             (views::code_field("Commit", &sha))
             (views::field("Author", run.author.as_deref().unwrap_or("—")))
@@ -1257,6 +1550,10 @@ pub async fn rollback(
     // a usable dump exists, so a stale tick cannot restore a pruned file.
     let restore_db = params.restore_db.is_some();
 
+    // The branch the run deployed decides the settings the rollback runs with.
+    let project = executor::target_for_run(&project, &run)
+        .map_err(|error| WebError::new(StatusCode::BAD_REQUEST, error))?;
+
     let before: std::collections::HashSet<String> =
         state::load_runs().into_iter().map(|r| r.id).collect();
 
@@ -1298,8 +1595,13 @@ pub async fn rollback(
 /// and holding the request open for it would only time out at a reverse
 /// proxy. The dump lands in the backups card (and `manual.log` in the
 /// project's backups directory narrates failures).
-pub async fn backup_now(Path(id): Path<String>) -> Result<Response, WebError> {
-    let (_, project) = load_project(&id)?;
+pub async fn backup_now(
+    Path(id): Path<String>,
+    Query(query): Query<BranchQuery>,
+) -> Result<Response, WebError> {
+    let (_, stored) = load_project(&id)?;
+    // Per branch: the dump follows that target's database block.
+    let project = resolve_target(&stored, query.branch.as_deref())?;
     tokio::spawn(async move {
         if let Err(error) = executor::manual_backup(&project).await {
             eprintln!(

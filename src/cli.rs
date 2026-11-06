@@ -88,6 +88,12 @@ pub enum Commands {
         /// multiple. Empty (the default) accepts any merge.
         #[arg(long = "merge-source")]
         merge_sources: Vec<String>,
+        /// Env file relative to the project path (primary branch)
+        #[arg(long, default_value = "")]
+        env_file: String,
+        /// Compose project name (`docker compose -p`) for the primary branch
+        #[arg(long, default_value = "")]
+        compose_project: String,
     },
     /// Edit an existing project
     Edit {
@@ -119,6 +125,17 @@ pub enum Commands {
         /// multiple. Absent leaves the stored sources unchanged.
         #[arg(long = "merge-source")]
         merge_sources: Vec<String>,
+        /// Env file relative to the project path (empty string clears it)
+        #[arg(long)]
+        env_file: Option<String>,
+        /// Compose project name for the primary branch (empty string clears it)
+        #[arg(long)]
+        compose_project: Option<String>,
+    },
+    /// Manage extra branch targets deployed from one project's checkout
+    Branch {
+        #[command(subcommand)]
+        action: BranchAction,
     },
     /// Remove a project
     Remove {
@@ -148,6 +165,9 @@ pub enum Commands {
         /// Skip the Git update and deploy the checkout as-is
         #[arg(long)]
         no_pull: bool,
+        /// Branch target to deploy (default: the project's primary branch)
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// Roll the project back to a previously successful run
     Rollback {
@@ -165,11 +185,18 @@ pub enum Commands {
         /// database when stdin is not a terminal
         #[arg(long)]
         yes: bool,
+        /// Branch target to roll back (default: the primary branch, unless
+        /// `--to` names a run, which brings its own branch)
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// Dump the project's database now, outside any deploy run
     Backup {
         /// Project id
         id: String,
+        /// Branch target whose database to dump (default: primary branch)
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// Replace this binary with the latest published build
     Update {
@@ -196,6 +223,58 @@ pub enum Commands {
         /// webhooks at /webhook/<id>.
         #[arg(long)]
         admin_hostname: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BranchAction {
+    /// List a project's branches (primary first) with their effective settings
+    List {
+        /// Project id
+        project: String,
+    },
+    /// Add an extra branch target
+    Add {
+        /// Project id
+        project: String,
+        /// Branch name, e.g. sandbox
+        branch: String,
+        /// custom, compose_build, compose_pull, or compose_up
+        #[arg(long)]
+        preset: Option<String>,
+        /// Shell command for the custom preset
+        #[arg(long)]
+        command: Option<String>,
+        /// Compose file relative to the project path
+        #[arg(long)]
+        compose_file: Option<String>,
+        /// Env file relative to the project path
+        #[arg(long)]
+        env_file: Option<String>,
+        /// Compose project name (default: <project id>-<branch>)
+        #[arg(long)]
+        compose_project: Option<String>,
+        /// Comma-separated compose profiles
+        #[arg(long, value_delimiter = ',')]
+        profiles: Vec<String>,
+    },
+    /// Remove an extra branch target
+    Remove {
+        /// Project id
+        project: String,
+        /// Branch name
+        branch: String,
+    },
+    /// Set one field of an extra branch target
+    Set {
+        /// Project id
+        project: String,
+        /// Branch name
+        branch: String,
+        /// preset, command, compose_file, profiles, env_file, compose_project, or merge_sources
+        key: String,
+        /// New value (comma-separated for profiles / merge_sources; empty clears)
+        value: String,
     },
 }
 
@@ -261,6 +340,8 @@ async fn handle(cmd: Commands) -> Result<()> {
             compose_profiles,
             trigger_events,
             merge_sources,
+            env_file,
+            compose_project,
         } => cmd_add(
             name,
             id,
@@ -274,6 +355,8 @@ async fn handle(cmd: Commands) -> Result<()> {
             compose_profiles,
             trigger_events,
             merge_sources,
+            env_file,
+            compose_project,
         ),
         Commands::Edit {
             id,
@@ -288,6 +371,8 @@ async fn handle(cmd: Commands) -> Result<()> {
             compose_profiles,
             trigger_events,
             merge_sources,
+            env_file,
+            compose_project,
         } => cmd_edit(
             id,
             name,
@@ -301,13 +386,26 @@ async fn handle(cmd: Commands) -> Result<()> {
             compose_profiles,
             trigger_events,
             merge_sources,
+            env_file,
+            compose_project,
         ),
+        Commands::Branch { action } => cmd_branch(action),
         Commands::Remove { id, yes } => cmd_remove(id, yes),
         Commands::Key { id, rotate } => cmd_key(id, rotate),
         Commands::Logs { id, lines } => cmd_logs(id, lines),
-        Commands::Run { id, no_pull } => cmd_run(id, no_pull).await,
-        Commands::Rollback { id, to, no_db, yes } => cmd_rollback(id, to, no_db, yes).await,
-        Commands::Backup { id } => cmd_backup(id).await,
+        Commands::Run {
+            id,
+            no_pull,
+            branch,
+        } => cmd_run(id, no_pull, branch).await,
+        Commands::Rollback {
+            id,
+            to,
+            no_db,
+            yes,
+            branch,
+        } => cmd_rollback(id, to, no_db, yes, branch).await,
+        Commands::Backup { id, branch } => cmd_backup(id, branch).await,
         Commands::Update { check } => cmd_update(check).await,
         Commands::Version { offline } => cmd_version(offline).await,
         Commands::Cloudflare {
@@ -394,6 +492,177 @@ fn print_project(p: &ProjectConfig) {
             }
         );
     }
+    if !p.env_file.trim().is_empty() {
+        println!("  env_file:    {}", p.env_file);
+    }
+    if !p.compose_project.trim().is_empty() {
+        println!("  compose_project: {}", p.compose_project);
+    }
+    if !p.branches.is_empty() {
+        println!("  extra branches:");
+        for t in p.targets().iter().skip(1) {
+            println!("    {}", target_summary(t));
+        }
+    }
+}
+
+/// One-line summary of an effective branch target.
+fn target_summary(t: &ProjectConfig) -> String {
+    let mut parts = vec![format!("{:<14}", t.branch), t.preset_label().to_string()];
+    if t.uses_compose() {
+        parts.push(format!("compose={}", t.compose_file));
+    }
+    if !t.env_file.trim().is_empty() {
+        parts.push(format!("env={}", t.env_file));
+    }
+    parts.push(format!(
+        "project={}",
+        if t.compose_project.trim().is_empty() {
+            "-"
+        } else {
+            &t.compose_project
+        }
+    ));
+    parts.join("  ")
+}
+
+/// Resolve the effective config for `branch` (None: primary), or a clear error
+/// listing the project's branches.
+fn resolve_target(p: &ProjectConfig, branch: Option<&str>) -> Result<ProjectConfig> {
+    let wanted = branch
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| p.branch.trim());
+    p.target(wanted).with_context(|| {
+        format!(
+            "{} does not deploy branch '{wanted}'; its branches are: {}",
+            p.id,
+            p.branch_names().join(", ")
+        )
+    })
+}
+
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Apply one `branch set` key to a target. Pure so it can be unit tested;
+/// validation of the whole project happens in the caller.
+fn apply_branch_key(t: &mut config::BranchTarget, key: &str, value: &str) -> Result<()> {
+    match key {
+        "preset" | "deploy_preset" => t.deploy_preset = value.trim().to_string(),
+        "command" => t.command = value.to_string(),
+        "compose_file" | "compose-file" => t.compose_file = value.trim().to_string(),
+        "profiles" | "compose_profiles" | "compose-profiles" => {
+            t.compose_profiles = split_list(value)
+        }
+        "env_file" | "env-file" => t.env_file = value.trim().to_string(),
+        "compose_project" | "compose-project" => t.compose_project = value.trim().to_string(),
+        "merge_sources" | "merge-sources" => t.merge_sources = split_list(value),
+        other => bail!(
+            "unknown branch key '{other}'; use preset, command, compose_file, profiles, \
+             env_file, compose_project, or merge_sources"
+        ),
+    }
+    Ok(())
+}
+
+fn cmd_branch(action: BranchAction) -> Result<()> {
+    let mut cfg = config::load_config()?;
+    match action {
+        BranchAction::List { project } => {
+            let p = cfg
+                .get(&project)
+                .context(format!("unknown project id: {project}"))?;
+            println!(
+                "{} (primary)",
+                target_summary(&p.target(&p.branch).unwrap_or_else(|| p.clone()))
+            );
+            for t in p.targets().iter().skip(1) {
+                println!("{}", target_summary(t));
+            }
+            return Ok(());
+        }
+        BranchAction::Add {
+            project,
+            branch,
+            preset,
+            command,
+            compose_file,
+            env_file,
+            compose_project,
+            profiles,
+        } => {
+            let p = cfg
+                .get_mut(&project)
+                .context(format!("unknown project id: {project}"))?;
+            let mut t = config::BranchTarget::new(branch.trim().to_string());
+            if let Some(v) = preset {
+                t.deploy_preset = v;
+            }
+            if let Some(v) = command {
+                t.command = v;
+            }
+            if let Some(v) = compose_file {
+                t.compose_file = v;
+            }
+            if let Some(v) = env_file {
+                t.env_file = v;
+            }
+            if let Some(v) = compose_project {
+                t.compose_project = v;
+            }
+            t.compose_profiles = profiles;
+            p.branches.push(t);
+            p.validate()?;
+            println!("added branch to {project}");
+        }
+        BranchAction::Remove { project, branch } => {
+            let p = cfg
+                .get_mut(&project)
+                .context(format!("unknown project id: {project}"))?;
+            let before = p.branches.len();
+            p.branches.retain(|t| t.branch.trim() != branch.trim());
+            if p.branches.len() == before {
+                bail!(
+                    "{project} has no extra branch '{branch}' (the primary branch is changed \
+                     with `webhookr edit`); extra branches: {}",
+                    p.branches
+                        .iter()
+                        .map(|t| t.branch.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            p.validate()?;
+            println!("removed branch '{branch}' from {project}");
+        }
+        BranchAction::Set {
+            project,
+            branch,
+            key,
+            value,
+        } => {
+            let p = cfg
+                .get_mut(&project)
+                .context(format!("unknown project id: {project}"))?;
+            let t = p
+                .branches
+                .iter_mut()
+                .find(|t| t.branch.trim() == branch.trim())
+                .with_context(|| format!("{project} has no extra branch '{branch}'"))?;
+            apply_branch_key(t, &key, &value)?;
+            p.validate()?;
+            println!("updated '{branch}' of {project}: {key}");
+        }
+    }
+    config::save_config(&cfg)?;
+    Ok(())
 }
 
 fn display_or_dash(value: &str) -> &str {
@@ -480,6 +749,8 @@ fn cmd_add(
     compose_profiles: Vec<String>,
     trigger_events: Vec<String>,
     merge_sources: Vec<String>,
+    env_file: String,
+    compose_project: String,
 ) -> Result<()> {
     let name = required(name, "name")?;
     let path = required(path, "path")?;
@@ -508,6 +779,8 @@ fn cmd_add(
     project.compose_profiles = compose_profiles;
     project.trigger_events = trigger_events;
     project.merge_sources = merge_sources;
+    project.env_file = env_file;
+    project.compose_project = compose_project;
     project.validate()?;
 
     let mut cfg = config::load_config()?;
@@ -540,6 +813,8 @@ fn cmd_edit(
     compose_profiles: Vec<String>,
     trigger_events: Vec<String>,
     merge_sources: Vec<String>,
+    env_file: Option<String>,
+    compose_project: Option<String>,
 ) -> Result<()> {
     let mut cfg = config::load_config()?;
     {
@@ -578,6 +853,12 @@ fn cmd_edit(
         }
         if !merge_sources.is_empty() {
             p.merge_sources = merge_sources;
+        }
+        if let Some(v) = env_file {
+            p.env_file = v;
+        }
+        if let Some(v) = compose_project {
+            p.compose_project = v;
         }
         p.validate()?;
     }
@@ -645,9 +926,10 @@ fn cmd_logs(id: String, lines: usize) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_run(id: String, no_pull: bool) -> Result<()> {
+async fn cmd_run(id: String, no_pull: bool, branch: Option<String>) -> Result<()> {
     let cfg = config::load_config()?;
     let p = cfg.get(&id).context(format!("unknown project id: {id}"))?;
+    let p = &resolve_target(p, branch.as_deref())?;
     let record = if no_pull {
         executor::deploy_project(p).await?
     } else {
@@ -669,15 +951,40 @@ async fn cmd_run(id: String, no_pull: bool) -> Result<()> {
 /// a y/N prompt on a TTY (skippable with `--yes`), and a refusal up front
 /// when the dump it would load does not exist: the executor would fail at
 /// that step only after already rewriting the checkout.
-async fn cmd_rollback(id: String, to: Option<String>, no_db: bool, yes: bool) -> Result<()> {
+async fn cmd_rollback(
+    id: String,
+    to: Option<String>,
+    no_db: bool,
+    yes: bool,
+    branch: Option<String>,
+) -> Result<()> {
     let cfg = config::load_config()?;
-    let p = cfg.get(&id).context(format!("unknown project id: {id}"))?;
+    let project = cfg.get(&id).context(format!("unknown project id: {id}"))?;
+    let p = project;
+    // Branch scope for the candidate list: an explicit `--branch`, else the
+    // primary branch when no `--to` is given (HEAD comparison only makes sense
+    // within one branch). `--to <run>` without `--branch` takes the run's own.
+    let scope: Option<String> = match (&branch, &to) {
+        (Some(b), _) => Some(resolve_target(project, Some(b))?.branch),
+        (None, None) => Some(project.branch.trim().to_string()),
+        (None, Some(_)) => None,
+    };
 
     // Only successful runs with a recorded commit can be replayed. The vec
     // keeps `load_runs`'s newest-first order, so "first match" is "newest".
     let candidates: Vec<state::RunRecord> = state::load_runs()
         .into_iter()
         .filter(|r| r.project_id == p.id && r.status == "success" && r.commit.is_some())
+        .filter(|r| {
+            scope.as_deref().is_none_or(|s| {
+                r.branch
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .unwrap_or_else(|| p.branch.trim())
+                    == s
+            })
+        })
         .collect();
 
     let want = to.as_deref().map(|t| t.trim()).filter(|t| !t.is_empty());
@@ -744,6 +1051,9 @@ async fn cmd_rollback(id: String, to: Option<String>, no_db: bool, yes: bool) ->
     // The data half: only when the operator hasn't refused it, the project
     // takes pre-deploy backups, and a database is actually detectable.
     // Anything less is a code-only rollback.
+    // The effective config is the one for the branch the target run deployed.
+    let eff = executor::target_for_run(project, &target)?;
+    let p = &eff;
     let db = if !no_db && p.database.backups {
         backup::database_for(p).await
     } else {
@@ -828,9 +1138,10 @@ async fn cmd_rollback(id: String, to: Option<String>, no_db: bool, yes: bool) ->
 /// Dump a project's database on demand — the same dump a pre-deploy backup
 /// takes, but outside any run. Useful before hand-edited schema changes, or
 /// to seed history for a project whose deploys predate backups existing.
-async fn cmd_backup(id: String) -> Result<()> {
+async fn cmd_backup(id: String, branch: Option<String>) -> Result<()> {
     let cfg = config::load_config()?;
     let p = cfg.get(&id).context(format!("unknown project id: {id}"))?;
+    let p = &resolve_target(p, branch.as_deref())?;
     let backup = executor::manual_backup(p).await?;
     println!("backed up: {}", backup.file);
     println!("size:      {} bytes", backup.size);
@@ -1013,3 +1324,47 @@ fn cmd_cloudflare(
 }
 
 use crate::config::webhook_url;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_keys_apply() {
+        let mut t = config::BranchTarget::new("sandbox".into());
+        apply_branch_key(&mut t, "preset", "compose_up").unwrap();
+        apply_branch_key(&mut t, "compose_file", "docker-compose.sandbox.yml").unwrap();
+        apply_branch_key(&mut t, "env-file", ".env.sandbox").unwrap();
+        apply_branch_key(&mut t, "profiles", "a, b,,").unwrap();
+        apply_branch_key(&mut t, "merge_sources", "feat/x").unwrap();
+        assert_eq!(t.deploy_preset, "compose_up");
+        assert_eq!(t.compose_file, "docker-compose.sandbox.yml");
+        assert_eq!(t.env_file, ".env.sandbox");
+        assert_eq!(t.compose_profiles, vec!["a", "b"]);
+        assert_eq!(t.merge_sources, vec!["feat/x"]);
+        apply_branch_key(&mut t, "profiles", "").unwrap();
+        assert!(t.compose_profiles.is_empty());
+        assert!(apply_branch_key(&mut t, "nope", "x").is_err());
+    }
+
+    #[test]
+    fn resolve_target_lists_branches_on_unknown() {
+        let mut p = ProjectConfig::new(
+            "app".into(),
+            "App".into(),
+            "/tmp/app".into(),
+            "develop".into(),
+            "true".into(),
+            "s".into(),
+            "github".into(),
+        );
+        p.branches.push(config::BranchTarget::new("sandbox".into()));
+        assert_eq!(resolve_target(&p, None).unwrap().branch, "develop");
+        assert_eq!(
+            resolve_target(&p, Some("sandbox")).unwrap().branch,
+            "sandbox"
+        );
+        let err = resolve_target(&p, Some("nope")).unwrap_err().to_string();
+        assert!(err.contains("develop, sandbox"), "{err}");
+    }
+}
