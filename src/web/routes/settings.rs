@@ -237,15 +237,16 @@ fn settings_body(
                 div class="key-entry" {
                     (views::field("Label", &key.label))
                     (views::field("Host", &key.host))
-                    (views::field("Token", "stored"))
-                    p {
-                        button type="button" class="button"
+                    // The token itself is never echoed back — presence only.
+                    (views::field("Token", "stored — leave blank to keep it"))
+                    div class="actions" {
+                        button type="button" class="button small"
                                hx-post=(format!("/settings/github-keys/{}/test", key.id))
                                hx-target=(format!("#test-{}", key.id)) { "Test" }
                         span id=(format!("test-{}", key.id)) {}
                         form method="post"
                              action=(format!("/settings/github-keys/{}/delete", key.id)) {
-                            button type="submit" class="button"
+                            button type="submit" class="button small danger"
                                    hx-confirm="Delete this GitHub account?" { "Delete" }
                         }
                     }
