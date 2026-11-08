@@ -181,7 +181,12 @@ pub async fn detail(Path(run_id): Path<String>) -> Result<Markup, WebError> {
         section class="card" {
             div class="field" {
                 span class="field-label" { "Status" }
-                span class="field-value" { (run.status) (rollback_badge(&run)) }
+                span class="field-value" { (views::status_badge(Some(&run))) (rollback_badge(&run)) }
+            }
+            div class="field" {
+                span class="field-label" { "Run id" }
+                code id="run-id" class="field-value mono" { (run.id) }
+                (views::copy_button("run-id", "Copy"))
             }
             (views::field("Project", &run.project_id))
             @match crate::config::load_config().ok().and_then(|cfg| cfg.get(&run.project_id).cloned()) {
