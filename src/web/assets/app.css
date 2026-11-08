@@ -1,70 +1,164 @@
 /* webhookr admin UI — hand-written, no framework, no build step. */
 
 :root {
-  --bg: #0f1116;
-  --panel: #171a21;
-  --panel-2: #1e222b;
-  --border: #2a2f3a;
-  --text: #e6e8ee;
-  --muted: #949bab;
+  color-scheme: dark light;
+  --bg: #0d1017;
+  --panel: #161a22;
+  --panel-2: #1d222d;
+  /* Translucent wash for hover states and nested blocks; sits over whatever
+     surface it lands on, so it works on panels, cards and inputs alike. */
+  --bg-soft: rgb(148 163 190 / 0.07);
+  --border: #262c39;
+  --border-strong: #363e4f;
+  --text: #e8eaf0;
+  --muted: #98a0b3;
   --accent: #5aa9ff;
-  --ok: #3fbf7f;
-  --fail: #ff6b6b;
-  --warn: #f0b34a;
+  /* Text drawn on the accent fill; dark ink on a light accent reads far
+     better than white on it (same pairing GitHub's dark UI uses). */
+  --accent-contrast: #0b1220;
+  --ok: #4ade80;
+  --fail: #f87171;
+  --warn: #fbbf24;
   --run: #5aa9ff;
-  --radius: 8px;
+  /* Focus ring tint: the accent at low alpha, so a ring never outshines
+     the control it wraps. */
+  --ring: rgb(90 169 255 / 0.28);
+  --radius: 10px;
+  --radius-s: 7px;
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.25), 0 0 0 1px rgb(0 0 0 / 0.06);
+  --shadow-2: 0 10px 28px rgb(0 0 0 / 0.35);
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f6f7f9;
+    color-scheme: light;
+    --bg: #f4f6f9;
     --panel: #ffffff;
-    --panel-2: #f0f2f5;
+    --panel-2: #eef1f6;
+    --bg-soft: rgb(24 32 56 / 0.05);
     --border: #d9dee6;
-    --text: #1b1f27;
-    --muted: #5c6474;
+    --border-strong: #b9c2cf;
+    --text: #1a2030;
+    --muted: #5b6474;
     --accent: #1f6feb;
+    --accent-contrast: #ffffff;
+    /* Status colours re-tinted for a white ground: the dark-theme shades
+       wash out and fail contrast on light backgrounds. */
+    --ok: #187f4b;
+    --fail: #d43f3f;
+    --warn: #9a6a08;
+    --run: #1f6feb;
+    --ring: rgb(31 111 235 / 0.18);
+    --shadow-1: 0 1px 2px rgb(16 24 40 / 0.06), 0 0 0 1px rgb(16 24 40 / 0.04);
+    --shadow-2: 0 10px 28px rgb(16 24 40 / 0.14);
   }
 }
 
 * { box-sizing: border-box; }
 
+/* Thin themed scrollbars on every pane (logs, tables, dropdown menus). */
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Cross-document view transitions, where the browser supports them: page
+   navigations cross-fade instead of blinking white. */
+@media (prefers-reduced-motion: no-preference) {
+  @view-transition { navigation: auto; }
+}
+
 body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
+
+h1, h2, h3 { font-weight: 600; }
 
 /* ----- layout ----------------------------------------------------------- */
 
 .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
   display: flex;
   align-items: center;
   gap: 1.5rem;
-  padding: 0.75rem 1.25rem;
+  padding: 0.7rem 1.25rem;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
 }
+/* Blur the page behind the bar while it stays pinned, when the browser can;
+   the solid colour above is the fallback. */
+@supports (backdrop-filter: blur(10px)) {
+  .topbar {
+    background: rgb(22 26 34 / 0.82);
+    backdrop-filter: blur(10px) saturate(1.3);
+  }
+  @media (prefers-color-scheme: light) {
+    .topbar { background: rgb(255 255 255 / 0.82); }
+  }
+}
 
 .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
   font-weight: 700;
   letter-spacing: -0.02em;
   color: var(--text);
   text-decoration: none;
   font-size: 1.05rem;
 }
+/* A small accent tile beside the wordmark; pure CSS, no image asset. */
+.brand::before {
+  content: "";
+  width: 0.62rem;
+  height: 0.62rem;
+  border-radius: 5px;
+  background: linear-gradient(
+    135deg,
+    var(--accent),
+    color-mix(in srgb, var(--accent) 65%, #fff)
+  );
+}
 
-.topbar nav { display: flex; gap: 1rem; flex-wrap: wrap; }
-.topbar nav a { color: var(--muted); text-decoration: none; }
-.topbar nav a:hover { color: var(--text); }
+.topbar nav { display: flex; gap: 0.25rem; flex-wrap: wrap; }
+.topbar nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.28rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.92rem;
+  font-weight: 500;
+  transition: color 0.12s ease, background-color 0.12s ease;
+}
+.topbar nav a:hover { color: var(--text); background: var(--bg-soft); }
+.topbar nav a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Set by ui.js on the link matching the current path. */
+.topbar nav a.active {
+  color: var(--text);
+  background: rgb(90 169 255 / 0.14);
+}
 
 main {
   max-width: 60rem;
   margin: 0 auto;
-  padding: 1.5rem 1.25rem 3rem;
+  padding: 1.75rem 1.25rem 3rem;
 }
 
 .footer {
@@ -86,12 +180,16 @@ main {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  margin-bottom: 1rem;
+  margin-bottom: 1.25rem;
   flex-wrap: wrap;
 }
 
-.page-head h1 { margin: 0; font-size: 1.4rem; }
-.head-actions { display: flex; gap: 0.5rem; }
+.page-head h1 {
+  margin: 0;
+  font-size: 1.45rem;
+  letter-spacing: -0.02em;
+}
+.head-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
 /* ----- cards ------------------------------------------------------------ */
 
@@ -99,23 +197,40 @@ main {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 1.1rem 1.25rem;
-  margin-bottom: 1.1rem;
+  box-shadow: var(--shadow-1);
+  padding: 1.15rem 1.3rem;
+  margin-bottom: 1.15rem;
 }
 
-.card h2 { margin: 0 0 0.85rem; font-size: 1rem; letter-spacing: 0.01em; }
-.card h1 { margin: 0 0 0.75rem; font-size: 1.3rem; }
+.card h2 {
+  margin: 0 0 0.85rem;
+  font-size: 0.98rem;
+  letter-spacing: 0.01em;
+}
+.card h1 { margin: 0 0 0.75rem; font-size: 1.3rem; letter-spacing: -0.01em; }
 .empty { text-align: center; }
-.warn-card { border-color: var(--warn); }
+.warn-card { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
   gap: 1rem;
-  margin-bottom: 1.1rem;
+  margin-bottom: 1.15rem;
 }
 
-.project-card { margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+.project-card {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease,
+    transform 0.15s ease;
+}
+.project-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-2);
+  transform: translateY(-1px);
+}
 .project-card-head {
   display: flex;
   align-items: center;
@@ -147,47 +262,112 @@ main {
   padding: 0.4rem 0;
   border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
+  align-items: baseline;
 }
 .field:last-child { border-bottom: 0; }
 .field-label { color: var(--muted); min-width: 9rem; font-size: 0.85rem; }
 .field-value { overflow-wrap: anywhere; flex: 1; }
+/* An action beside a value (the Copy button on the webhook URL) hugs the
+   end of the value instead of stretching with the flex row. */
+.field .button { flex: none; margin-left: auto; }
 
 /* ----- badges ----------------------------------------------------------- */
 
 .badge {
-  display: inline-block;
-  padding: 0.1rem 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.34rem;
+  padding: 0.12rem 0.55rem;
   border-radius: 999px;
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   font-weight: 600;
+  letter-spacing: 0.01em;
+  /* Fallback border/background for browsers without color-mix, then the
+     tinted pill when it is supported. */
   border: 1px solid currentColor;
+  border-color: color-mix(in srgb, currentColor 35%, transparent);
+  background: color-mix(in srgb, currentColor 9%, transparent);
   white-space: nowrap;
 }
 .badge-ok { color: var(--ok); }
 .badge-fail { color: var(--fail); }
 .badge-warn { color: var(--warn); }
 .badge-run { color: var(--run); }
-.badge-none { color: var(--muted); }
+.badge-none {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--border);
+}
+
+/* Status dot for the four outcome colours; informational badges (never
+   run, rollback, primary) stay dot-free so they read as labels, not states. */
+.badge-ok::before,
+.badge-fail::before,
+.badge-warn::before,
+.badge-run::before {
+  content: "";
+  flex: none;
+  width: 0.34rem;
+  height: 0.34rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+/* A run in progress breathes. */
+.badge-run::before {
+  animation: badge-pulse 2s ease-in-out infinite;
+}
+@keyframes badge-pulse {
+  50% { opacity: 0.35; }
+}
 
 /* ----- buttons ---------------------------------------------------------- */
 
 .button {
-  display: inline-block;
-  padding: 0.4rem 0.8rem;
-  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.42rem 0.85rem;
+  border-radius: var(--radius-s);
   border: 1px solid var(--border);
   background: var(--panel-2);
   color: var(--text);
   font: inherit;
   font-size: 0.88rem;
+  font-weight: 500;
   text-decoration: none;
   cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease,
+    color 0.12s ease, filter 0.12s ease, transform 0.05s ease;
 }
-.button:hover { border-color: var(--accent); }
-.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.button.danger { color: var(--fail); }
-.button.danger:hover { border-color: var(--fail); }
+.button:hover {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+}
+.button:active { transform: translateY(1px); }
+.button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+  font-weight: 600;
+}
+.button.primary:hover { filter: brightness(1.08); }
+.button.danger {
+  color: var(--fail);
+  border-color: color-mix(in srgb, var(--fail) 32%, var(--border));
+}
+.button.danger:hover {
+  background: color-mix(in srgb, var(--fail) 10%, transparent);
+  border-color: var(--fail);
+}
 .button.small { padding: 0.2rem 0.55rem; font-size: 0.8rem; }
+/* Transient state set by ui.js after a successful clipboard write. */
+.button.copied {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+}
 
 .actions, .form-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
 .actions form { margin: 0; }
@@ -202,6 +382,7 @@ main {
   text-align: left;
 }
 .link:hover { text-decoration: underline; }
+.link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
 
 /* ----- forms ------------------------------------------------------------ */
 
@@ -211,10 +392,10 @@ main {
   padding: 1rem 1.1rem;
   margin: 0 0 1.1rem;
 }
-.form legend { padding: 0 0.4rem; color: var(--muted); font-size: 0.85rem; }
+.form legend { padding: 0 0.4rem; color: var(--muted); font-size: 0.85rem; font-weight: 600; }
 
 /* Extra-branch rows: a nested group inside the Extra branches fieldset. */
-.form fieldset.branch-row { background: var(--bg-soft, transparent); }
+.form fieldset.branch-row { background: var(--bg-soft); }
 #branch-rows { margin-bottom: 0.8rem; }
 
 .form label { display: block; margin-bottom: 0.9rem; }
@@ -231,17 +412,27 @@ main {
   margin-left: 0.4rem;
 }
 
-input[type="text"], input[type="password"], textarea {
+input[type="text"], input[type="password"], input[type="number"], input[type="url"], textarea {
   width: 100%;
   padding: 0.45rem 0.6rem;
-  border-radius: 6px;
+  border-radius: var(--radius-s);
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
   font: inherit;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
 textarea { font-family: var(--mono); font-size: 0.85rem; resize: vertical; }
-input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Text-entry controls always match :focus-visible, so this covers mouse
+   and keyboard alike; the ring rides on box-shadow so the layout never
+   shifts the way an outline swap can. */
+input:focus-visible, textarea:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+/* The password inputs never round-trip their secret; kill the browser's
+   reveal/clear affordances' inconsistency by keeping the native ones. */
 
 .input-row { display: flex; gap: 0.4rem; align-items: center; }
 .input-row input { flex: 1; }
@@ -273,19 +464,21 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
   margin: 0;
   padding: 0.45rem 0.6rem;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-s);
   background: var(--bg);
   color: var(--text);
   font-size: 0.95rem;
   cursor: pointer;
   list-style: none;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
 /* Chrome still draws its own disclosure triangle over summaries. */
 .select-menu summary::-webkit-details-marker { display: none; }
-.select-menu summary:hover { border-color: var(--accent); }
+.select-menu summary:hover { border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
 .select-menu summary:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--ring);
 }
 /* Caret: a rotated corner of borders — no image, no inline style. */
 .select-caret {
@@ -308,8 +501,9 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
   margin: 0;
   padding: 0.25rem;
   background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-s);
+  box-shadow: var(--shadow-2);
   max-height: 16rem;
   overflow-y: auto;
 }
@@ -319,12 +513,13 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
   gap: 0.5rem;
   margin: 0;
   padding: 0.35rem 0.5rem;
-  border-radius: 4px;
+  border-radius: 5px;
   color: var(--text);
   font-size: 0.9rem;
   cursor: pointer;
+  transition: background-color 0.1s ease;
 }
-.select-options label:hover { background: var(--bg); }
+.select-options label:hover { background: var(--bg-soft); }
 /* The real radio stays in the tab order but out of sight; its state and
    focus are mirrored onto the visible span beside it. */
 .select-options input {
@@ -370,10 +565,13 @@ label.checkbox {
   border: 1px solid var(--border);
   border-radius: 4px;
   background: var(--bg);
+  transition: background-color 0.12s ease, border-color 0.12s ease;
 }
-label.checkbox:hover .checkbox-box { border-color: var(--accent); }
-/* The check is a rotated corner of borders; white on the accent fill matches
-   .button.primary, the app's existing white-on-accent pairing. */
+label.checkbox:hover .checkbox-box {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+}
+/* The check is a rotated corner of borders; ink on the accent fill matches
+   .button.primary's accent-contrast pairing. */
 .checkbox .checkbox-box::after {
   content: "";
   position: absolute;
@@ -381,8 +579,8 @@ label.checkbox:hover .checkbox-box { border-color: var(--accent); }
   top: 0.14rem;
   width: 0.3rem;
   height: 0.55rem;
-  border-right: 2px solid #fff;
-  border-bottom: 2px solid #fff;
+  border-right: 2px solid var(--accent-contrast);
+  border-bottom: 2px solid var(--accent-contrast);
   transform: rotate(45deg);
   opacity: 0;
 }
@@ -399,19 +597,20 @@ label.checkbox:hover .checkbox-box { border-color: var(--accent); }
 /* ----- alerts ----------------------------------------------------------- */
 
 .alert {
-  padding: 0.6rem 0.8rem;
-  border-radius: 6px;
+  padding: 0.6rem 0.85rem;
+  border-radius: var(--radius-s);
   border: 1px solid;
   margin-bottom: 1rem;
   overflow-wrap: anywhere;
+  background: color-mix(in srgb, currentColor 7%, transparent);
 }
-.alert-error { color: var(--fail); border-color: var(--fail); }
-.alert-ok { color: var(--ok); border-color: var(--ok); }
+.alert-error { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 45%, transparent); }
+.alert-ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
 .error { color: var(--fail); }
 
 /* ----- tables ----------------------------------------------------------- */
 
-.table-scroll { overflow-x: auto; }
+.table-scroll { overflow-x: auto; border-radius: var(--radius-s); }
 table { width: 100%; border-collapse: collapse; }
 th, td {
   text-align: left;
@@ -419,9 +618,19 @@ th, td {
   border-bottom: 1px solid var(--border);
   vertical-align: top;
 }
-th { color: var(--muted); font-size: 0.8rem; font-weight: 600; }
+th {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
 td a { color: var(--accent); text-decoration: none; }
 td a:hover { text-decoration: underline; }
+/* Rows lightening under the pointer makes wide tables (runs, branches,
+   backups) scannable column-wise without grid lines. */
+tbody tr { transition: background-color 0.1s ease; }
+tbody tr:hover { background: var(--bg-soft); }
 
 .run-list { list-style: none; margin: 0; padding: 0; }
 .run-list li {
@@ -434,6 +643,16 @@ td a:hover { text-decoration: underline; }
 }
 .run-list li:last-child { border-bottom: 0; }
 .run-list a { color: var(--accent); text-decoration: none; font-family: var(--mono); font-size: 0.82rem; }
+.run-list a:hover { text-decoration: underline; }
+
+/* A stored GitHub key on Settings had markup but no styling; boxed like a
+   mini-card so entries read as one unit instead of stacked fields. */
+.key-entry {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  padding: 0.6rem 0.9rem;
+  margin-bottom: 0.9rem;
+}
 
 /* ----- logs ------------------------------------------------------------- */
 
@@ -463,17 +682,20 @@ td a:hover { text-decoration: underline; }
 .log {
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-s);
   padding: 0.8rem;
   overflow-x: auto;
   max-height: 32rem;
   overflow-y: auto;
   font-family: var(--mono);
   font-size: 0.8rem;
-  line-height: 1.45;
+  line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   margin: 0;
+  /* Room for the scrollbar inside the rounded border, so a vertical bar
+     never overlaps the last glyph. */
+  scrollbar-gutter: stable;
 }
 
 /* ----- directory browser ------------------------------------------------ */
@@ -495,7 +717,12 @@ td a:hover { text-decoration: underline; }
   max-height: 16rem;
   overflow-y: auto;
 }
-.browser-list li { padding: 0.1rem 0; }
+.browser-list li {
+  padding: 0.15rem 0.4rem;
+  border-radius: 5px;
+  transition: background-color 0.1s ease;
+}
+.browser-list li:hover { background: var(--bg-soft); }
 /* A file row in the compose picker: name on the left, action on the right. */
 .browser-file {
   display: flex;
@@ -506,7 +733,14 @@ td a:hover { text-decoration: underline; }
   flex-wrap: wrap;
 }
 
-details summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; margin: 0.5rem 0; }
+details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0.5rem 0;
+  transition: color 0.12s ease;
+}
+details summary:hover { color: var(--text); }
 
 /* ----- htmx indicators -------------------------------------------------- */
 /* htmx normally injects these as an inline <style>; we ship them here so the
@@ -519,3 +753,30 @@ details summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; marg
 .cmd-preview { max-height: none; margin: 0; white-space: pre-wrap; }
 #cmd-preview-wrap { margin-top: 0.75rem; }
 #cmd-preview-wrap .field-label { display: block; margin-bottom: 0.3rem; font-size: 0.85rem; }
+
+/* ----- small screens ----------------------------------------------------- */
+
+@media (max-width: 640px) {
+  body { font-size: 14px; }
+  main { padding: 1.1rem 0.9rem 2.5rem; }
+  .topbar { gap: 0.75rem; padding: 0.6rem 0.9rem; }
+  .page-head h1 { font-size: 1.25rem; }
+  .card { padding: 1rem; }
+  /* Full-width labels put every value on its own line, where the wrap
+     actually reads. */
+  .field-label { min-width: 100%; }
+  .button { padding: 0.5rem 0.9rem; }
+  .button.small { padding: 0.3rem 0.6rem; }
+}
+
+/* ----- reduced motion ---------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

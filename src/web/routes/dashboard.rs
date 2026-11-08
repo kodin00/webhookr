@@ -41,9 +41,17 @@ pub async fn index() -> Result<Markup, WebError> {
 
         section class="card" {
             h2 { "Listener" }
-            (views::code_field("Webhooks", &cfg.listen_addr))
+            div class="field" {
+                span class="field-label" { "Webhooks" }
+                code id="listen-webhooks" class="field-value mono" { (cfg.listen_addr) }
+                (views::copy_button("listen-webhooks", "Copy"))
+            }
             @if cfg.web.enabled {
-                (views::code_field("Admin UI", &cfg.web.listen_addr))
+                div class="field" {
+                    span class="field-label" { "Admin UI" }
+                    code id="listen-admin" class="field-value mono" { (cfg.web.listen_addr) }
+                    (views::copy_button("listen-admin", "Copy"))
+                }
             }
             @match &cfg.cloudflare {
                 Some(tunnel) => {
