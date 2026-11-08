@@ -492,11 +492,10 @@ fn curl_example(project: &ProjectConfig, url: &str) -> String {
 /// Fragment: the plaintext secret, swapped in on demand.
 pub async fn reveal_secret(Path(id): Path<String>) -> Result<Markup, WebError> {
     let (_, project) = load_project(&id)?;
+    // Only the span: the Copy button beside it lives on the page already and
+    // targets #secret by id, so it keeps working through the swap.
     Ok(html! {
         span id="secret" class="mono selectable" { (project.secret) }
-        // Rides along with the swap so the Copy button placed beside the
-        // masked placeholder keeps working after Reveal replaces its target.
-        (views::copy_button("secret", "Copy"))
     })
 }
 
