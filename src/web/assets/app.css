@@ -282,7 +282,9 @@ main {
   font-size: 0.72rem;
   font-weight: 600;
   letter-spacing: 0.01em;
-  border: 1px solid rgb(255 255 255 / 0);
+  /* Fallback border/background for browsers without color-mix, then the
+     tinted pill when it is supported. */
+  border: 1px solid currentColor;
   border-color: color-mix(in srgb, currentColor 35%, transparent);
   background: color-mix(in srgb, currentColor 9%, transparent);
   white-space: nowrap;
