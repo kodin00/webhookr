@@ -174,6 +174,30 @@ pub fn mark_interrupted_runs() -> Result<()> {
     Ok(())
 }
 
+/// Force-close one run as `cancelled` when no in-flight process owns it.
+///
+/// For a run this daemon did not start (a CLI run in another process, or a
+/// record orphaned by a crash before `mark_interrupted_runs` saw it) there is
+/// no cancel signal to trip, so the only thing a web-UI cancel can do is close
+/// the record. A genuinely still-running CLI run self-heals: its own
+/// `finalize` overwrites the record by id when it finishes.
+pub fn force_cancel_run(run_id: &str) -> Result<()> {
+    let _guard = RUNS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut runs = load_runs();
+    let mut changed = false;
+    for run in runs.iter_mut().filter(|r| r.id == run_id && r.status == "running") {
+        run.status = "cancelled".to_string();
+        run.finished_at = Some(crate::util::now_iso());
+        run.message = "cancelled from the web UI (run started elsewhere or was orphaned)"
+            .to_string();
+        changed = true;
+    }
+    if changed {
+        save_runs_inner(&runs)?;
+    }
+    Ok(())
+}
+
 /// Latest run for a project (if any).
 pub fn latest_run(project_id: &str) -> Option<RunRecord> {
     load_runs().into_iter().find(|r| r.project_id == project_id)

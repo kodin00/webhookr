@@ -279,10 +279,15 @@ pub async fn raw(Path(run_id): Path<String>) -> Result<Response, WebError> {
         .into_response())
 }
 
-/// Cancel an in-flight run. Best-effort: a run that already ended has no token
-/// to trip, and the run page will simply show its terminal status, so there is
-/// nothing to fail on here.
+/// Cancel an in-flight run. When this daemon owns the run, its cancel signal is
+/// tripped and the run marks itself `cancelled`. When it does not (a CLI run in
+/// another process, or a record orphaned by a crash), force-close the record
+/// instead — otherwise the button would silently do nothing and the run would
+/// sit as `running` forever. A still-running CLI run self-heals by overwriting
+/// the record when its own `finalize` lands.
 pub async fn cancel(Path(run_id): Path<String>) -> Result<Response, WebError> {
-    executor::cancel_run(&run_id);
+    if !executor::cancel_run(&run_id) {
+        crate::state::force_cancel_run(&run_id)?;
+    }
     Ok(Redirect::to(&format!("/runs/{run_id}")).into_response())
 }
