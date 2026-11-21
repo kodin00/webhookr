@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>webhookr: self-hosted webhook deploy runner</title>
+  <meta name="description" content="webhookr is a self-hosted webhook runner. When a GitHub webhook fires, it pulls the configured branch and runs your deploy command, logging everything.">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#09090b">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <script>
+    /* Set the theme before first paint so there is no flash of the wrong one. */
+    (function () {
+      var root = document.documentElement;
+      var theme = null;
+      try { theme = localStorage.getItem("webhookr-theme"); } catch (e) {}
+      if (theme !== "light" && theme !== "dark") {
+        theme = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      }
+      root.setAttribute("data-theme", theme);
+      root.classList.add("js");
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute("content", theme === "light" ? "#ffffff" : "#09090b");
+    })();
+  </script>
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/main.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="index.html">
+        <span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 7.5l4.5 4.5L8 16.5M14 16.5h3"/></svg></span>
+        webhookr
+      </a>
+      <nav class="site-nav" id="site-nav" aria-label="Main">
+        <a href="index.html#features">Features</a>
+        <a href="index.html#how-it-works">How it works</a>
+        <a href="index.html#quick-start">Quick start</a>
+        <a href="docs.html">Docs</a>
+        <a href="https://github.com/kodin00/webhookr">GitHub <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg></a>
+      </nav>
+      <div class="header-actions">
+        <button class="icon-btn theme-toggle" type="button" aria-label="Switch to light theme">
+          <svg class="icon i-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          <svg class="icon i-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>
+        </button>
+        <button class="icon-btn nav-toggle" type="button" aria-controls="site-nav" aria-expanded="false" aria-label="Menu">
+          <svg class="icon i-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+          <svg class="icon i-close" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="container hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="dot" aria-hidden="true"></span>Self-hosted webhook deploy runner</p>
+          <h1>Deploy on every push, <span class="grad">from your own server.</span></h1>
+          <p class="lead">webhookr is a self-hosted webhook runner. Point a GitHub (or generic) webhook at it. When the webhook fires, it does a <code>git pull</code> on the configured branch and runs your deploy command, logging everything so you can tail it later.</p>
+
+          <div class="cmd">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code id="install-cmd">curl -fsSL https://github.com/kodin00/webhookr/releases/latest/download/install.sh | sh</code>
+            <button class="copy-btn" type="button" data-copy-target="#install-cmd" aria-label="Copy install command"><svg class="icon i-copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg><svg class="icon i-check" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <p class="note">Installs the Linux x86_64 binary to <code>/usr/local/bin/webhookr</code>, verifies its checksum, and sets up a <code>webhookr</code> systemd service that starts on boot and restarts on failure.</p>
+
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="docs.html">Read the docs <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></a>
+            <a class="btn" href="https://github.com/kodin00/webhookr">View on GitHub</a>
+          </div>
+        </div>
+
+        <figure class="term" style="margin:0" role="group" aria-label="Example terminal session: webhookr add, then webhookr status">
+          <div class="term-head" aria-hidden="true">
+            <i></i><i></i><i></i>
+            <span class="term-title">~ webhookr</span>
+          </div>
+<pre class="term-body" data-no-copy tabindex="0"><span class="ln" style="--i:0"><span class="p">$ </span><span class="c">webhookr add</span> <span class="o">\</span></span><span class="ln" style="--i:1">    <span class="f">--name</span> <span class="s">"My Site"</span> <span class="o">\</span></span><span class="ln" style="--i:2">    <span class="f">--path</span> /srv/my-site <span class="o">\</span></span><span class="ln" style="--i:3">    <span class="f">--repository</span> https://github.com/me/my-site.git <span class="o">\</span></span><span class="ln" style="--i:4">    <span class="f">--branch</span> main <span class="o">\</span></span><span class="ln" style="--i:5">    <span class="f">--preset</span> compose_build <span class="o">\</span></span><span class="ln" style="--i:6">    <span class="f">--compose-file</span> compose.production.yaml</span><span class="ln o" style="--i:7">secret:  <span class="k">&lt;generated, printed once&gt;</span></span><span class="ln o" style="--i:8">webhook: http://&lt;vps-ip&gt;:9000/hooks/my-site</span><span class="ln gap" style="--i:9"></span><span class="ln" style="--i:10"><span class="p">$ </span><span class="c">webhookr status</span></span><span class="ln o" style="--i:11">my-site  <span class="k">compose_build</span>  http://&lt;vps-ip&gt;:9000/hooks/my-site</span><span class="ln o" style="--i:12">last run: <span class="ok">success</span> (push by alice)</span><span class="ln gap" style="--i:13"></span><span class="ln" style="--i:14"><span class="p">$ </span><span class="cursor" aria-hidden="true"></span></span></pre>
+        </figure>
+      </div>
+    </section>
+
+    <section class="section" id="features">
+      <div class="container">
+        <h2 class="reveal">Features</h2>
+        <p class="section-intro reveal">Manage projects from a terminal UI, a CLI, or an optional browser dashboard.</p>
+        <ul class="grid">
+          <li class="card card-lg reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M13 3L5 14h6l-1 7 8-11h-6l1-7z"/></svg></span>
+            <h3>Webhook-triggered deploys</h3>
+            <p>Each project maps a URL slug to a Git checkout plus a deployment preset or custom shell command. Deliveries are verified against a per-project secret.</p>
+          </li>
+          <li class="card reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3zM12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg></span>
+            <h3>Docker Compose presets</h3>
+            <p>Built-in <code>compose_build</code>, <code>compose_pull</code> and <code>compose_up</code> presets, or a <code>custom</code> shell command.</p>
+          </li>
+          <li class="card reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M12 4v10M8 10l4 4 4-4M5 19h14"/></svg></span>
+            <h3>Automatic clone</h3>
+            <p>Give it a repository URL and it clones the branch for you. Private repositories work over HTTPS with an access token.</p>
+          </li>
+          <li class="card card-lg reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 2.6-6.4M3 4v5h5"/></svg></span>
+            <h3>Rollback with database restore</h3>
+            <p>Every deploy records its commit. Redeploy any past successful run, restoring the database dump from just before it when the project has a database.</p>
+          </li>
+          <li class="card reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="9" r="2"/><path d="M6 7v10M18 11a5 5 0 0 1-5 5H6"/></svg></span>
+            <h3>Multi-branch deploys</h3>
+            <p>Deploy several branches from one repository, each with its own preset, compose file, env file and database settings.</p>
+          </li>
+          <li class="card reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/></svg></span>
+            <h3>Live logs</h3>
+            <p>Run history and per-run logs stream to disk as commands produce them, so a long <code>docker compose build</code> can be followed while it runs.</p>
+          </li>
+          <li class="card reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></span>
+            <h3>TUI, CLI and web admin UI</h3>
+            <p>An interactive terminal UI, a scriptable CLI, and an optional server-rendered browser dashboard with no build step and no CDN.</p>
+          </li>
+          <li class="card card-md reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/></svg></span>
+            <h3>GitHub commit status</h3>
+            <p>Optionally report each deploy as pending, success, failure or error on the commit, with a link to the run log.</p>
+          </li>
+          <li class="card card-md reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M21 3L10 14M21 3l-6.5 18-4-7-7-4L21 3z"/></svg></span>
+            <h3>Telegram notifications</h3>
+            <p>Post a message when a deploy starts, succeeds or fails, through a bot you own.</p>
+          </li>
+          <li class="card reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M7 18a4 4 0 0 1-.6-7.96A6 6 0 0 1 18 9.5 4.5 4.5 0 0 1 17.5 18H7z"/></svg></span>
+            <h3>Cloudflare Tunnel</h3>
+            <p>Publish the webhook endpoint and admin UI on a real HTTPS hostname without opening ports.</p>
+          </li>
+          <li class="card reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M4 5h16l-6 8v6l-4-2v-4L4 5z"/></svg></span>
+            <h3>Branch-aware triggers</h3>
+            <p>Deploy on pushes, PR merges, or both. A push to another branch does not trigger a redundant deploy.</p>
+          </li>
+          <li class="card reveal">
+            <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span>
+            <h3>One run at a time</h3>
+            <p>A trigger that arrives while a project is deploying is refused rather than queued, so two pushes cannot race <code>git pull</code>.</p>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section" id="how-it-works">
+      <div class="container">
+        <h2 class="reveal">How it works</h2>
+        <ol class="steps">
+          <li class="reveal">
+            <strong>A webhook arrives.</strong>
+            GitHub sends a delivery to <code>/hooks/&lt;id&gt;</code>. webhookr checks the <code>X-Hub-Signature-256</code> header against the project's secret before running anything. Non-GitHub senders can use <code>token</code> mode instead.
+          </li>
+          <li class="reveal">
+            <strong>Source is updated.</strong>
+            <code>git fetch</code>, <code>checkout</code> and <code>pull</code> run on the configured branch. If the checkout does not exist yet, it is cloned from the repository URL.
+          </li>
+          <li class="reveal">
+            <strong>Your deploy runs.</strong>
+            The Compose preset or custom command runs from the project directory. The run, its trigger, and its log are recorded.
+          </li>
+          <li class="reveal">
+            <strong>You see the result.</strong>
+            Follow the log in the TUI, CLI or web UI, and optionally get a GitHub commit status or Telegram message.
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="section" id="quick-start">
+      <div class="container">
+        <h2 class="reveal">Quick start</h2>
+        <p class="section-intro reveal">After installing, register a project and start the daemon.</p>
+<pre data-lang="sh"><code># 1. Register a project (prompts for anything you don't pass)
+webhookr add \
+  --name "My Site" \
+  --path /srv/my-site \
+  --repository https://github.com/me/my-site.git \
+  --branch main \
+  --preset compose_build \
+  --compose-file compose.production.yaml
+
+# 2. Get the secret + webhook URL (printed on add, or via:)
+webhookr key --id my-site
+
+# 3. Start the daemon (systemd recommended for production)
+webhookr serve
+# ...or launch the interactive TUI
+webhookr</code></pre>
+        <p>Then add the webhook in your GitHub repository under <strong>Settings → Webhooks</strong>. The full steps are in <a href="docs.html#github-webhook">GitHub webhook setup</a>.</p>
+        <p class="cta-row"><a class="btn btn-primary" href="docs.html">Continue to the documentation <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <a class="brand" href="index.html">
+        <span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 7.5l4.5 4.5L8 16.5M14 16.5h3"/></svg></span>
+        webhookr
+      </a>
+      <div class="footer-links">
+        <p><a href="https://github.com/kodin00/webhookr">github.com/kodin00/webhookr</a></p>
+        <p><a href="docs.html">Documentation</a></p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
