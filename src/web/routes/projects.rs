@@ -338,7 +338,13 @@ pub async fn detail(
 
         section class="card" {
             h2 { "Webhook" }
-            (views::code_field("URL", &hook_url))
+            div class="field" {
+                span class="field-label" { "URL" }
+                code id="hook-url" class="field-value mono" { (hook_url) }
+                // The one value an operator pastes straight into GitHub's
+                // webhook form; a copy button saves a manual selection.
+                (views::copy_button("hook-url", "Copy"))
+            }
             (views::field("Verification", verify_label(&project.verify_mode)))
             (views::field("Triggers", &project.triggers_label()))
 
@@ -363,6 +369,10 @@ pub async fn detail(
                     button class="button small"
                         hx-get={ "/f/projects/" (project.id) "/secret" }
                         hx-target="#secret" hx-swap="outerHTML" { "Reveal" }
+                    // Grabs whatever #secret holds: dots while hidden, the
+                    // secret itself once revealed. A copy of the dots is
+                    // harmless; copying the real secret needs the reveal.
+                    (views::copy_button("secret", "Copy"))
                 }
             }
 
@@ -482,7 +492,11 @@ fn curl_example(project: &ProjectConfig, url: &str) -> String {
 /// Fragment: the plaintext secret, swapped in on demand.
 pub async fn reveal_secret(Path(id): Path<String>) -> Result<Markup, WebError> {
     let (_, project) = load_project(&id)?;
-    Ok(html! { span id="secret" class="mono selectable" { (project.secret) } })
+    // Only the span: the Copy button beside it lives on the page already and
+    // targets #secret by id, so it keeps working through the swap.
+    Ok(html! {
+        span id="secret" class="mono selectable" { (project.secret) }
+    })
 }
 
 // ----- create & edit -----------------------------------------------------

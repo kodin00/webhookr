@@ -157,6 +157,18 @@ pub fn code_field(label: &str, value: &str) -> Markup {
     }
 }
 
+/// A "Copy" button that grabs another element's text via ui.js.
+///
+/// `target_id` is the id of the element whose text the operator wants in
+/// their clipboard (a webhook URL, a secret, a dump path). The real copying
+/// lives in ui.js — the CSP forbids inline handlers, and one document-level
+/// listener serves every button on every page.
+pub fn copy_button(target_id: &str, label: &str) -> Markup {
+    html! {
+        button type="button" class="button small" data-copy=(target_id) { (label) }
+    }
+}
+
 /// A themed single-choice dropdown: a `<details>` menu of radios, so the value
 /// POSTs natively with the form — no JavaScript needed to submit.
 ///

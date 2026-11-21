@@ -40,6 +40,79 @@
   });
 })();
 
+// Highlight the topbar link matching the current path. The server cannot do
+// this per page because every route renders through one shared views::page.
+(() => {
+  const here = window.location.pathname;
+  // "/" only highlights itself; the others also match their subtrees, so
+  // a run page keeps Projects/Runs lit as appropriate. Longest prefix wins
+  // when two could match ("/projects/new" lights Projects, not something
+  // shorter).
+  const nav = document.querySelector(".topbar nav");
+  if (!nav) return;
+  let best = null;
+  for (const link of nav.querySelectorAll("a")) {
+    const path = new URL(link.href, window.location.origin).pathname;
+    const matches =
+      path === "/" ? here === "/" : here === path || here.startsWith(`${path}/`);
+    if (matches && (!best || path.length > best.path.length)) {
+      best = { link, path };
+    }
+  }
+  if (best) best.link.classList.add("active");
+})();
+
+// Copy-to-clipboard buttons. Any element with [data-copy] names the id of
+// the element holding the text; the button's own label is restored after a
+// moment. The project secret, webhook URL and backup file paths are the
+// values an operator actually pastes elsewhere.
+(() => {
+  const restore = (button, label, ms) => {
+    setTimeout(() => {
+      button.textContent = label;
+      button.classList.remove("copied");
+    }, ms);
+  };
+
+  document.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) return;
+    const button = event.target.closest("[data-copy]");
+    if (!button) return;
+    const source = document.getElementById(button.dataset.copy);
+    const text = source?.textContent ?? "";
+    if (!text) return;
+
+    const label = button.textContent;
+    const done = () => {
+      button.textContent = "Copied";
+      button.classList.add("copied");
+      restore(button, label, 1600);
+    };
+    // Clipboard requires a secure context; the tunnel hostnames qualify,
+    // a plain loopback development port usually does too.
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done, () => {});
+      return;
+    }
+    // Fallback for an insecure origin: the text has to come from a real
+    // selection, so park it in a temporary textarea next to the button.
+    const scratch = document.createElement("textarea");
+    scratch.value = text;
+    scratch.setAttribute("readonly", "");
+    scratch.style.position = "fixed";
+    scratch.style.opacity = "0";
+    button.after(scratch);
+    scratch.select();
+    try {
+      document.execCommand("copy");
+      done();
+    } catch {
+      /* best effort only */
+    }
+    scratch.remove();
+  });
+})();
+
 // Extra-branch rows on the project form. The server renders one row per
 // stored branch plus a <template> with an `__i__` placeholder in every field
 // name; adding a row clones the template under a fresh number, removing one
