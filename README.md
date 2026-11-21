@@ -1,5 +1,7 @@
 # webhookr
 
+**Website and docs: https://kodin00.github.io/webhookr/**
+
 A self-hosted webhook runner. Point a GitHub (or generic) webhook at it, and
 when a webhook fires, webhookr does a `git pull` on the configured branch and
 runs your deploy command — logging everything so you can tail it later.
